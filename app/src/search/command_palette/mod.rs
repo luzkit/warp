@@ -1,5 +1,7 @@
 pub mod conversations;
 mod data_sources;
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+mod detached_sessions;
 mod files;
 mod filter_chip_renderer;
 pub mod launch_config;

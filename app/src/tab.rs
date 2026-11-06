@@ -56,6 +56,8 @@ use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::{
     TabCloseButtonPosition, TabSettings, VerticalTabsDisplayGranularity,
 };
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+use crate::workspace::{DETACH_SESSION_BINDING_NAME, PersistentTerminalAction};
 use crate::workspace::{
     PaneViewLocator, TabBarDropTargetData, TabBarLocation, TabContextMenuAnchor, WorkspaceAction,
 };
@@ -459,6 +461,8 @@ impl TabData {
             self.session_sharing_menu_items(index, ctx),
             self.copy_metadata_menu_items(pane_name_target, ctx),
             self.modify_tab_menu_items(index, can_move_left, can_move_right, pane_name_target, ctx),
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            self.persistent_session_menu_items(pane_name_target, ctx),
             self.close_tab_menu_items(index, tabs_len, ctx),
             Self::save_config_menu_items(index),
             self.color_option_menu_items(index, terminal_colors),
@@ -477,6 +481,50 @@ impl TabData {
             menu_items.extend(section_items);
         }
         menu_items
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    fn persistent_session_menu_items(
+        &self,
+        pane_name_target: Option<PaneNameMenuTarget>,
+        ctx: &AppContext,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        let group = self.pane_group.as_ref(ctx);
+        let locator = pane_name_target.map_or_else(
+            || PaneViewLocator {
+                pane_group_id: self.pane_group.id(),
+                pane_id: group.focused_pane_id(ctx),
+            },
+            |target| target.locator,
+        );
+        if locator.pane_group_id != self.pane_group.id()
+            || !group.persistent_session_is_attached(locator.pane_id, ctx)
+        {
+            return Vec::new();
+        }
+
+        vec![
+            MenuItemFields::new("Rename Session…")
+                .with_on_select_action(WorkspaceAction::PersistentTerminal(
+                    PersistentTerminalAction::Rename(locator),
+                ))
+                .into_item(),
+            MenuItemFields::new("Detach Session")
+                .with_disabled(!group.persistent_session_can_retain(locator.pane_id, ctx))
+                .with_key_shortcut_label(keybinding_name_to_display_string(
+                    DETACH_SESSION_BINDING_NAME,
+                    ctx,
+                ))
+                .with_on_select_action(WorkspaceAction::PersistentTerminal(
+                    PersistentTerminalAction::Detach(Some(locator)),
+                ))
+                .into_item(),
+            MenuItemFields::new("End Session…")
+                .with_on_select_action(WorkspaceAction::PersistentTerminal(
+                    PersistentTerminalAction::ConfirmTermination(locator),
+                ))
+                .into_item(),
+        ]
     }
 
     fn session_sharing_menu_items(

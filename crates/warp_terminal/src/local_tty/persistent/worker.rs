@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::fs::{self, File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -10,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, ensure};
+use bincode::Options as _;
 use command::blocking::Command;
 use instant::Instant;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -17,16 +19,22 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getsid};
 use uuid::Uuid;
 
+use super::checkpoint::Collector;
 use super::{
-    Request, Response, Runtime, Session, SessionState, Startup, read_frame, validate_history_bytes,
+    MAX_NATIVE_PREFIX_BYTES, NativeShell, RawStartup, Request, Response, Runtime, STARTUP_TIMEOUT,
+    Session, SessionState, Startup, checkpoint_codec, read_frame, validate_history_bytes,
     validate_name, validate_peer, write_frame,
 };
 use crate::SizeInfo;
-use crate::local_tty::unix::{ToWinsize, spawn_command_in_pty};
+use crate::focus_env::TERMINAL_SESSION_UUID_ENV;
+use crate::local_tty::shell::ShellStarter;
+use crate::local_tty::spawner::PtySpawnInfo;
+use crate::local_tty::unix::{ToWinsize, spawn, spawn_command_in_pty};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_millis(300);
 const POLL_TIMEOUT_MS: i32 = 100;
 const EXIT_RETENTION: Duration = Duration::from_secs(60);
+const UNRETAINED_EXIT_RETENTION: Duration = Duration::from_secs(2);
 const KILL_GRACE: Duration = Duration::from_millis(250);
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 const PTY_READS_PER_TICK: usize = 8;
@@ -106,33 +114,86 @@ impl Drop for BoundSocket {
 }
 
 pub(super) fn run(runtime: &Runtime, id: Uuid, startup: Startup) -> Result<()> {
-    validate_name(startup.name.as_deref())?;
-    validate_history_bytes(startup.history_bytes)?;
-    ensure!(
-        startup.shell.is_absolute(),
-        "Persistent terminal shell must be an absolute path"
-    );
-
-    let socket_path = runtime.socket_path(id);
+    let socket_path = runtime.startup_socket_path(id, &startup);
     let listener = UnixListener::bind(&socket_path)?;
     let _socket = BoundSocket::new(socket_path.clone())?;
     fs::set_permissions(socket_path, Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
 
-    let pty = PtyProcess::spawn(&startup)?;
+    let (spawned, native_shell, name, history_bytes) = match startup {
+        Startup::Raw(startup) => {
+            validate_name(startup.name.as_deref())?;
+            validate_history_bytes(startup.history_bytes)?;
+            let spawned = spawn_raw(&startup)?;
+            (spawned, None, startup.name, startup.history_bytes)
+        }
+        Startup::Native(startup) => {
+            validate_name(startup.name.as_deref())?;
+            validate_history_bytes(startup.history_bytes)?;
+            let mut options = startup.options;
+            validate_size(&options.size)?;
+            ensure!(
+                matches!(options.shell_starter, ShellStarter::Direct(_)),
+                "Persistent native terminals require a local shell executable"
+            );
+            let native_shell = NativeShell {
+                session_id: options.shell_starter.session_id(),
+                shell_type: options.shell_starter.shell_type(),
+                launch_data: options.shell_starter.launch_data(),
+                pane_uuid: options
+                    .env_vars
+                    .get(OsStr::new(TERMINAL_SESSION_UUID_ENV))
+                    .and_then(|uuid| uuid.to_str())
+                    .and_then(|uuid| Uuid::parse_str(uuid).ok()),
+            };
+            // The worker was exec'd with all inherited non-stdio descriptors marked close-on-exec.
+            options.close_fds = false;
+            (
+                spawn(options)?,
+                Some(native_shell),
+                startup.name,
+                startup.history_bytes,
+            )
+        }
+    };
+    let pty = PtyProcess::new(spawned)?;
+    let retained = native_shell.is_none();
     let mut worker = Worker {
         id,
-        name: startup.name,
+        name,
+        checkpoint: native_shell.as_ref().map(Collector::new),
+        native_shell,
+        retained,
         pid: pty.child.id(),
         listener,
         pty: Some(pty),
         client: None,
         input: VecDeque::new(),
-        history: History::new(startup.history_bytes),
-        retire_at: None,
+        history: History::new(history_bytes, !retained),
+        retire_at: (!retained).then(|| Instant::now() + STARTUP_TIMEOUT),
         stopping: false,
     };
     worker.run()
+}
+
+fn spawn_raw(startup: &RawStartup) -> Result<PtySpawnInfo> {
+    ensure!(
+        startup.shell.is_absolute(),
+        "Persistent terminal shell must be an absolute path"
+    );
+    validate_size(&startup.size)?;
+    let mut command = Command::new(&startup.shell);
+    command
+        .env("TERM", "xterm-256color")
+        .env("TERM_PROGRAM", "WarpTerminal")
+        .env("COLORTERM", "truecolor")
+        .env("SHELL", &startup.shell);
+    if let Some(directory) = &startup.directory {
+        command.current_dir(directory);
+    } else if let Some(home) = std::env::var_os("HOME") {
+        command.current_dir(Path::new(&home));
+    }
+    spawn_command_in_pty(command, &startup.size, false)
 }
 
 struct PtyProcess {
@@ -141,20 +202,7 @@ struct PtyProcess {
 }
 
 impl PtyProcess {
-    fn spawn(startup: &Startup) -> Result<Self> {
-        validate_size(&startup.size)?;
-        let mut command = Command::new(&startup.shell);
-        command
-            .env("TERM", "xterm-256color")
-            .env("TERM_PROGRAM", "WarpTerminal")
-            .env("COLORTERM", "truecolor")
-            .env("SHELL", &startup.shell);
-        if let Some(directory) = &startup.directory {
-            command.current_dir(directory);
-        } else if let Some(home) = std::env::var_os("HOME") {
-            command.current_dir(Path::new(&home));
-        }
-        let spawned = spawn_command_in_pty(command, &startup.size, false)?;
+    fn new(spawned: PtySpawnInfo) -> Result<Self> {
         let master = unsafe { File::from_raw_fd(spawned.result.leader_fd) };
         let fd = master.as_raw_fd();
         let pty = Self {
@@ -250,6 +298,9 @@ struct Client {
 struct Worker {
     id: Uuid,
     name: Option<String>,
+    native_shell: Option<NativeShell>,
+    checkpoint: Option<Collector>,
+    retained: bool,
     pid: u32,
     listener: UnixListener,
     pty: Option<PtyProcess>,
@@ -268,6 +319,15 @@ impl Worker {
                 .is_none_or(|deadline| Instant::now() < deadline)
         {
             let master = self.pty.as_ref().and_then(|pty| pty.master.as_ref());
+            let master_events = if self.output_read_limit() == 0 {
+                0
+            } else {
+                libc::POLLIN
+            } | if self.input.is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            };
             let mut descriptors = [
                 libc::pollfd {
                     fd: self.listener.as_raw_fd(),
@@ -275,13 +335,12 @@ impl Worker {
                     revents: 0,
                 },
                 libc::pollfd {
-                    fd: master.map_or(-1, AsRawFd::as_raw_fd),
-                    events: libc::POLLIN
-                        | if self.input.is_empty() {
-                            0
-                        } else {
-                            libc::POLLOUT
-                        },
+                    fd: if master_events == 0 {
+                        -1
+                    } else {
+                        master.map_or(-1, AsRawFd::as_raw_fd)
+                    },
+                    events: master_events,
                     revents: 0,
                 },
                 libc::pollfd {
@@ -363,8 +422,8 @@ impl Worker {
                 return;
             }
         };
-        if matches!(request, Request::Attach) {
-            self.attach(stream);
+        if matches!(request, Request::Attach | Request::AttachWithCheckpoint) {
+            self.attach(stream, matches!(request, Request::AttachWithCheckpoint));
         } else {
             let response = self.respond(request);
             let _ = write_frame(&mut ControlIo::new(&mut stream), &response);
@@ -380,6 +439,15 @@ impl Worker {
                 }
                 self.name = name;
                 Response::Status(self.status())
+            }
+            Request::Retain => {
+                if !self.retained && self.status().state != SessionState::Attached {
+                    return Response::Error(
+                        "Persistent terminal must be attached before retaining it".to_owned(),
+                    );
+                }
+                self.retained = true;
+                Response::Ok
             }
             Request::Terminate => {
                 if let Some(pty) = &mut self.pty
@@ -401,7 +469,9 @@ impl Worker {
                     Err(err) => Response::Error(err.to_string()),
                 }
             }
-            Request::Attach => unreachable!("Attachment needs to take ownership of its stream"),
+            Request::Attach | Request::AttachWithCheckpoint => {
+                unreachable!("Attachment needs to take ownership of its stream")
+            }
         }
     }
 
@@ -417,10 +487,11 @@ impl Worker {
             name: self.name.clone(),
             pid: Some(self.pid),
             state,
+            retained: self.retained,
         }
     }
 
-    fn attach(&mut self, mut stream: UnixStream) {
+    fn attach(&mut self, mut stream: UnixStream, include_checkpoint: bool) {
         let error = match self.status().state {
             SessionState::Attached => Some("Persistent terminal is already attached"),
             SessionState::Terminated => Some("Persistent terminal has exited"),
@@ -434,20 +505,45 @@ impl Worker {
             );
             return;
         }
-        let response = Response::Attached {
-            pid: self.pid,
-            replay_len: self.history.bytes.len(),
-            truncated: self.history.truncated,
+        let checkpoint = include_checkpoint
+            .then(|| self.checkpoint.as_ref()?.snapshot())
+            .flatten()
+            .and_then(|checkpoint| checkpoint_codec().serialize(&checkpoint).ok())
+            .unwrap_or_default();
+        let startup_replay = self.history.evicted_startup();
+        let response = match &self.native_shell {
+            Some(shell) => Response::NativeAttached {
+                pid: self.pid,
+                replay_len: self.history.bytes.len(),
+                truncated: self.history.truncated,
+                retained: self.retained,
+                shell: shell.clone(),
+                startup_replay_len: startup_replay.len(),
+                replay_gap: Some(
+                    self.history.recorded - self.history.bytes.len() > startup_replay.len(),
+                ),
+                checkpoint_len: include_checkpoint.then_some(checkpoint.len()),
+                replay_offset: include_checkpoint
+                    .then_some((self.history.recorded - self.history.bytes.len()) as u64),
+            },
+            None => Response::Attached {
+                pid: self.pid,
+                replay_len: self.history.bytes.len(),
+                truncated: self.history.truncated,
+            },
         };
         let (first, second) = self.history.bytes.as_slices();
         let mut writer = ControlIo::new(&mut stream);
         if write_frame(&mut writer, &response).is_ok()
+            && writer.write_all(&checkpoint).is_ok()
+            && writer.write_all(startup_replay).is_ok()
             && writer.write_all(first).is_ok()
             && writer.write_all(second).is_ok()
             && stream.set_read_timeout(None).is_ok()
             && stream.set_write_timeout(None).is_ok()
             && stream.set_nonblocking(true).is_ok()
         {
+            self.retire_at = None;
             self.client = Some(Client {
                 stream,
                 output: VecDeque::new(),
@@ -456,7 +552,12 @@ impl Worker {
     }
 
     fn detach(&mut self) {
-        self.client = None;
+        if self.client.take().is_some()
+            && !self.retained
+            && self.pty.as_ref().is_some_and(|pty| pty.master.is_some())
+        {
+            self.stopping = true;
+        }
         self.input.clear();
     }
 
@@ -493,16 +594,23 @@ impl Worker {
     fn read_output(&mut self) -> bool {
         let mut bytes = [0; IO_CHUNK_BYTES];
         for _ in 0..PTY_READS_PER_TICK {
+            let read_limit = self.output_read_limit();
+            if read_limit == 0 {
+                return false;
+            }
             let Some(master) = self.pty.as_mut().and_then(|pty| pty.master.as_mut()) else {
                 return true;
             };
-            match master.read(&mut bytes) {
+            match master.read(&mut bytes[..read_limit]) {
                 Ok(0) => {
                     self.close_master();
                     return true;
                 }
                 Ok(n) => {
                     self.history.record(&bytes[..n]);
+                    if let Some(checkpoint) = &mut self.checkpoint {
+                        checkpoint.record(&bytes[..n]);
+                    }
                     if let Some(client) = &mut self.client {
                         if client.output.len() + n <= MAX_QUEUED_OUTPUT {
                             client.output.extend(&bytes[..n]);
@@ -520,6 +628,16 @@ impl Worker {
             }
         }
         false
+    }
+
+    fn output_read_limit(&self) -> usize {
+        // Active native shells follow the ordinary PTY flow-control contract.
+        if self.native_shell.is_some()
+            && let Some(client) = &self.client
+        {
+            return (MAX_QUEUED_OUTPUT - client.output.len()).min(IO_CHUNK_BYTES);
+        }
+        IO_CHUNK_BYTES
     }
 
     fn send_output(&mut self) {
@@ -560,7 +678,12 @@ impl Worker {
         {
             self.pty = None;
             self.input.clear();
-            self.retire_at = Some(Instant::now() + EXIT_RETENTION);
+            let retention = if self.retained {
+                EXIT_RETENTION
+            } else {
+                UNRETAINED_EXIT_RETENTION
+            };
+            self.retire_at = Some(Instant::now() + retention);
             self.send_output();
         }
         Ok(())
@@ -578,22 +701,35 @@ struct History {
     bytes: VecDeque<u8>,
     limit: usize,
     truncated: bool,
+    startup: Vec<u8>,
+    startup_limit: usize,
+    recorded: usize,
 }
 
 impl History {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, native: bool) -> Self {
         Self {
             bytes: VecDeque::new(),
             limit,
             truncated: false,
+            startup: Vec::new(),
+            startup_limit: if native { MAX_NATIVE_PREFIX_BYTES } else { 0 },
+            recorded: 0,
         }
     }
 
     fn record(&mut self, bytes: &[u8]) {
+        let startup_bytes = bytes.len().min(self.startup_limit - self.startup.len());
+        self.startup.extend_from_slice(&bytes[..startup_bytes]);
+        self.recorded = self.recorded.saturating_add(bytes.len());
         let bytes_to_keep = bytes.len().min(self.limit);
         let evict = (self.bytes.len() + bytes_to_keep).saturating_sub(self.limit);
         self.truncated |= evict != 0 || bytes_to_keep < bytes.len();
         self.bytes.drain(..evict);
         self.bytes.extend(&bytes[bytes.len() - bytes_to_keep..]);
+    }
+
+    fn evicted_startup(&self) -> &[u8] {
+        &self.startup[..self.startup.len().min(self.recorded - self.bytes.len())]
     }
 }

@@ -8,22 +8,6 @@ use warp_core::channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpSer
 
 // Simple wrapper around warp::run() for Warp OSS builds.
 fn main() -> Result<()> {
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
-    {
-        use warp_terminal::local_tty::persistent::{WORKER_ARG, run_worker};
-
-        let mut args = std::env::args_os().skip(1);
-        if args.next().as_deref() == Some(std::ffi::OsStr::new(WORKER_ARG)) {
-            let (Some(path), Some(id), None) = (args.next(), args.next(), args.next()) else {
-                anyhow::bail!("Invalid persistent PTY worker arguments");
-            };
-            let id = id
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("Invalid session ID"))?;
-            return run_worker(path.into(), uuid::Uuid::parse_str(id)?);
-        }
-    }
-
     let mut state = ChannelState::new(
         Channel::Oss,
         ChannelConfig {
@@ -41,6 +25,24 @@ fn main() -> Result<()> {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
     ChannelState::set(state);
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    {
+        use warp_terminal::local_tty::persistent::{WORKER_ARG, run_worker};
+
+        let mut args = std::env::args_os().skip(1);
+        if args.next().as_deref() == Some(std::ffi::OsStr::new(WORKER_ARG)) {
+            let (Some(path), Some(id), None) = (args.next(), args.next(), args.next()) else {
+                anyhow::bail!("Invalid persistent PTY worker arguments");
+            };
+            let id = id
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Invalid session ID"))?;
+            warp::features::init_feature_flags();
+            warp::terminal::platform::init()?;
+            return run_worker(path.into(), uuid::Uuid::parse_str(id)?);
+        }
+    }
 
     warp::run()
 }

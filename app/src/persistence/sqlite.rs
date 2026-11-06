@@ -1237,27 +1237,16 @@ fn save_pane_state(
 
     match &snapshot.contents {
         LeafContents::PersistentTerminal {
-            id: session_id,
-            is_active,
-        } => {
-            let terminal = model::NewTerminalPane {
-                id,
-                uuid: session_id.as_bytes().to_vec(),
-                cwd: None,
-                is_active: *is_active,
-                shell_launch_data: None,
-                input_config: None,
-                llm_model_override: None,
-                active_profile_id: None,
-                conversation_ids: None,
-                active_conversation_id: None,
-                is_persistent: true,
-            };
-            diesel::insert_into(schema::terminal_panes::dsl::terminal_panes)
-                .values(terminal)
-                .execute(conn)?;
+            snapshot: terminal_snapshot,
+            ..
         }
-        LeafContents::Terminal(terminal_snapshot) => {
+        | LeafContents::Terminal(terminal_snapshot) => {
+            let persistent_id =
+                if let LeafContents::PersistentTerminal { id, .. } = &snapshot.contents {
+                    Some(id)
+                } else {
+                    None
+                };
             let conversation_ids = if terminal_snapshot.conversation_ids_to_restore.is_empty() {
                 None
             } else {
@@ -1271,7 +1260,10 @@ fn save_pane_state(
 
             let terminal = model::NewTerminalPane {
                 id,
-                uuid: terminal_snapshot.uuid.clone(),
+                uuid: persistent_id.map_or_else(
+                    || terminal_snapshot.uuid.clone(),
+                    |id| id.as_bytes().to_vec(),
+                ),
                 cwd: terminal_snapshot.cwd.clone(),
                 is_active: terminal_snapshot.is_active,
                 shell_launch_data: terminal_snapshot
@@ -1291,7 +1283,7 @@ fn save_pane_state(
                 active_conversation_id: terminal_snapshot
                     .active_conversation_id
                     .map(|id| id.to_string()),
-                is_persistent: false,
+                is_persistent: persistent_id.is_some(),
             };
 
             diesel::insert_into(schema::terminal_panes::dsl::terminal_panes)
@@ -2244,42 +2236,44 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         .select(model::TerminalPane::as_select())
                         .first(conn)?;
 
-                    if terminal_pane.is_persistent {
-                        LeafContents::PersistentTerminal {
-                            id: uuid::Uuid::from_slice(&terminal_pane.uuid)?,
-                            is_active: terminal_pane.is_active,
-                        }
+                    let persistent_session_id = terminal_pane
+                        .is_persistent
+                        .then(|| uuid::Uuid::from_slice(&terminal_pane.uuid))
+                        .transpose()?;
+                    let shell_launch_data: Option<ShellLaunchData> = terminal_pane
+                        .shell_launch_data
+                        .and_then(|shell_str| serde_json::from_str(&shell_str).ok());
+                    let input_config = terminal_pane
+                        .input_config
+                        .and_then(|config_str| serde_json::from_str(&config_str).ok());
+                    let active_profile_id = terminal_pane
+                        .active_profile_id
+                        .and_then(|profile_str| serde_json::from_str(&profile_str).ok());
+                    // Don't provide a fallback here - let the higher-level code with AppContext handle it
+
+                    let conversation_ids_to_restore =
+                        parse_conversation_ids(&terminal_pane.conversation_ids);
+
+                    let active_conversation_id = terminal_pane
+                        .active_conversation_id
+                        .and_then(|id_str| AIConversationId::try_from(id_str).ok());
+
+                    let snapshot = TerminalPaneSnapshot {
+                        uuid: terminal_pane.uuid,
+                        cwd: terminal_pane.cwd,
+                        is_active: terminal_pane.is_active,
+                        is_read_only: false,
+                        shell_launch_data,
+                        input_config,
+                        llm_model_override: terminal_pane.llm_model_override,
+                        active_profile_id,
+                        conversation_ids_to_restore,
+                        active_conversation_id,
+                    };
+                    if let Some(id) = persistent_session_id {
+                        LeafContents::PersistentTerminal { id, snapshot }
                     } else {
-                        let shell_launch_data: Option<ShellLaunchData> = terminal_pane
-                            .shell_launch_data
-                            .and_then(|shell_str| serde_json::from_str(&shell_str).ok());
-                        let input_config = terminal_pane
-                            .input_config
-                            .and_then(|config_str| serde_json::from_str(&config_str).ok());
-                        let active_profile_id = terminal_pane
-                            .active_profile_id
-                            .and_then(|profile_str| serde_json::from_str(&profile_str).ok());
-                        // Don't provide a fallback here - let the higher-level code with AppContext handle it
-
-                        let conversation_ids_to_restore =
-                            parse_conversation_ids(&terminal_pane.conversation_ids);
-
-                        let active_conversation_id = terminal_pane
-                            .active_conversation_id
-                            .and_then(|id_str| AIConversationId::try_from(id_str).ok());
-
-                        LeafContents::Terminal(TerminalPaneSnapshot {
-                            uuid: terminal_pane.uuid,
-                            cwd: terminal_pane.cwd,
-                            is_active: terminal_pane.is_active,
-                            is_read_only: false,
-                            shell_launch_data,
-                            input_config,
-                            llm_model_override: terminal_pane.llm_model_override,
-                            active_profile_id,
-                            conversation_ids_to_restore,
-                            active_conversation_id,
-                        })
+                        LeafContents::Terminal(snapshot)
                     }
                 }
                 NOTEBOOK_PANE_KIND => {

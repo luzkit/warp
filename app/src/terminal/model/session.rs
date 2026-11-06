@@ -156,6 +156,8 @@ pub enum SessionsEvent {
     SessionInitialized { session_id: SessionId },
     /// A new session was successfully bootstrapped.
     SessionBootstrapped(Box<SessionBootstrappedEvent>),
+    /// An existing shell session was restored without bootstrapping it again.
+    SessionRestored { session_id: SessionId },
     /// The environment variables were updated.
     EnvironmentVariablesUpdated { session_id: SessionId },
 }
@@ -362,57 +364,7 @@ impl Sessions {
 
         let session_id = session_info.session_id;
 
-        let (in_band_command_output_tx, in_band_command_output_rx) = async_channel::unbounded();
-        let command_executor = if let Some(executor) = &self.executor_for_all_sessions {
-            // Explicitly drop the receiver to match the other branch, where
-            // it gets consumed through the function call.
-            let _ = in_band_command_output_rx;
-            executor.clone()
-        } else {
-            let parent_session_info = session_info
-                .spawning_session_id
-                .as_ref()
-                .and_then(|session_id| self.sessions.get(session_id))
-                .map(|session| &session.info);
-            command_executor::new_command_executor_for_session(
-                &session_info,
-                &self.executor_command_tx,
-                in_band_command_output_rx,
-                parent_session_info,
-                ctx,
-            )
-        };
-        if !in_band_command_output_tx.is_closed() {
-            // If the receiving side of the channel was stored somewhere (and
-            // not just dropped), store the sending side of the channel so we
-            // can proxy output to it.
-            self.in_band_command_output_tx_map
-                .insert(session_info.session_id, in_band_command_output_tx);
-        }
-
-        let session = Session::new(session_info.clone(), command_executor);
-
-        log::info!("Shell is bootstrapped with session_id {:?}", session.id());
-        log::debug!("Session details: {session:?}");
-
-        let session = Arc::new(session);
-        self.sessions.insert(session.id(), session.clone());
-
-        // For warpified-remote sessions, pick up the current host_id from
-        // the manager so session.remote_host_id() is populated without
-        // waiting for the next SessionConnected event. The
-        // RemoteServerCommandExecutor already has its client baked in, so
-        // nothing else needs to be wired here.
-        #[cfg(feature = "local_tty")]
-        if FeatureFlag::SshRemoteServer.is_enabled()
-            && matches!(
-                session_info.session_type,
-                BootstrapSessionType::WarpifiedRemote
-            )
-            && let Some(host_id) = RemoteServerManager::as_ref(ctx).host_id_for_session(session_id)
-        {
-            session.set_remote_host_id(Some(host_id.clone()));
-        }
+        let session = self.register_session(&session_info, ctx);
 
         let bootstrap_duration_seconds =
             pending_session_start_time.map(|start| start.elapsed().as_secs_f64());
@@ -473,6 +425,86 @@ impl Sessions {
                 session_type: session_info.session_type,
             },
         )))
+    }
+
+    pub fn restore_persistent_session(
+        &mut self,
+        session_info: SessionInfo,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let session_id = session_info.session_id;
+        self.pending_session_start_times.remove(&session_id);
+        let session = self.register_session(&session_info, ctx);
+        History::handle(ctx).update(ctx, |history, ctx| {
+            if matches!(session.session_type(), SessionType::Local) {
+                history.init_session(session, ctx);
+            } else {
+                // Reattaching must not inject history-loading commands into a running remote job.
+                history.init_session_with(session, async { Vec::new() }, ctx);
+            }
+        });
+        ctx.emit(SessionsEvent::SessionRestored { session_id });
+    }
+
+    fn register_session(
+        &mut self,
+        session_info: &SessionInfo,
+        ctx: &mut ModelContext<Self>,
+    ) -> Arc<Session> {
+        let session_id = session_info.session_id;
+        let (in_band_command_output_tx, in_band_command_output_rx) = async_channel::unbounded();
+        let command_executor = if let Some(executor) = &self.executor_for_all_sessions {
+            // Explicitly drop the receiver to match the other branch, where
+            // it gets consumed through the function call.
+            let _ = in_band_command_output_rx;
+            executor.clone()
+        } else {
+            let parent_session_info = session_info
+                .spawning_session_id
+                .as_ref()
+                .and_then(|session_id| self.sessions.get(session_id))
+                .map(|session| &session.info);
+            command_executor::new_command_executor_for_session(
+                session_info,
+                &self.executor_command_tx,
+                in_band_command_output_rx,
+                parent_session_info,
+                ctx,
+            )
+        };
+        if !in_band_command_output_tx.is_closed() {
+            // If the receiving side of the channel was stored somewhere (and
+            // not just dropped), store the sending side of the channel so we
+            // can proxy output to it.
+            self.in_band_command_output_tx_map
+                .insert(session_info.session_id, in_band_command_output_tx);
+        }
+
+        let session = Session::new(session_info.clone(), command_executor);
+
+        log::info!("Shell is bootstrapped with session_id {:?}", session.id());
+        log::debug!("Session details: {session:?}");
+
+        let session = Arc::new(session);
+        self.sessions.insert(session.id(), session.clone());
+
+        // For warpified-remote sessions, pick up the current host_id from
+        // the manager so session.remote_host_id() is populated without
+        // waiting for the next SessionConnected event. The
+        // RemoteServerCommandExecutor already has its client baked in, so
+        // nothing else needs to be wired here.
+        #[cfg(feature = "local_tty")]
+        if FeatureFlag::SshRemoteServer.is_enabled()
+            && matches!(
+                session_info.session_type,
+                BootstrapSessionType::WarpifiedRemote
+            )
+            && let Some(host_id) = RemoteServerManager::as_ref(ctx).host_id_for_session(session_id)
+        {
+            session.set_remote_host_id(Some(host_id.clone()));
+        }
+
+        session
     }
 
     pub fn get(&self, session_id: SessionId) -> Option<Arc<Session>> {

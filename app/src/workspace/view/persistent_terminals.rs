@@ -2,88 +2,27 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
+use settings::Setting as _;
 use uuid::Uuid;
-use warp_terminal::SizeInfo;
-use warp_terminal::local_tty::persistent::{Runtime, Session, SessionState};
+use warp_terminal::local_tty::persistent::Runtime;
 use warpui::modals::{AlertDialogWithCallbacks, ModalButton};
-use warpui::{SingletonEntity, ViewContext, ViewHandle, WeakViewHandle};
+use warpui::{AppContext, SingletonEntity, ViewContext, ViewHandle};
 
-use super::{NewSessionMenuAnchor, Workspace};
-use crate::menu::{MenuItem, MenuItemFields};
+use super::{DefaultSessionModeBehavior, NewSessionSource, Workspace};
+use crate::palette::PaletteMode;
 use crate::pane_group::pane::PaneId;
 use crate::pane_group::{PaneGroup, PanesLayout, PersistentTerminalLayout};
 use crate::persistent_terminals::runtime_dir;
+use crate::search::data_source::QueryFilter;
+use crate::server::telemetry::PaletteSource;
+use crate::tab::uses_vertical_tabs;
 use crate::terminal::local_tty::PersistentPtyConnection;
 use crate::view_components::DismissibleToast;
 use crate::workspace::registry::WorkspaceRegistry;
-use crate::workspace::{PersistentTerminalAction, WorkspaceAction};
+use crate::workspace::tab_settings::{TabSettings, VerticalTabsDisplayGranularity};
+use crate::workspace::{PaneViewLocator, PersistentTerminalAction};
 
 impl Workspace {
-    pub(super) fn add_persistent_terminal_menu_items(
-        &self,
-        items: &mut Vec<MenuItem<WorkspaceAction>>,
-        ctx: &ViewContext<Self>,
-    ) {
-        if runtime_dir().is_none() {
-            return;
-        }
-        items.push(MenuItem::Separator);
-        items.push(menu_item(
-            "New Persistent Terminal",
-            PersistentTerminalAction::Create { split: false },
-        ));
-        if self.tabs.get(self.active_tab_index).is_some() {
-            items.push(menu_item(
-                "New Persistent Terminal Split",
-                PersistentTerminalAction::Create { split: true },
-            ));
-        }
-        if self.focused_persistent_terminal(ctx).is_some() {
-            items.push(menu_item(
-                "Detach Persistent Terminal",
-                PersistentTerminalAction::Detach,
-            ));
-            items.push(menu_item(
-                "Rename Persistent Terminal",
-                PersistentTerminalAction::Rename,
-            ));
-        }
-    }
-
-    pub(super) fn discover_persistent_terminals(
-        &self,
-        anchor: NewSessionMenuAnchor,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        let Some(path) = runtime_dir() else { return };
-        ctx.spawn(
-            persistent_request(move || Runtime::new(path)?.list()),
-            move |workspace, result, ctx| {
-                if workspace
-                    .show_new_session_dropdown_menu
-                    .is_none_or(|open| open.position() != anchor.position())
-                {
-                    return;
-                }
-                let mut items = workspace.unified_new_session_menu_items(ctx);
-                workspace.add_persistent_terminal_menu_items(&mut items, ctx);
-                match result {
-                    Ok(sessions) => items.extend(sessions.into_iter().flat_map(session_menu_items)),
-                    Err(err) => items.push(
-                        MenuItemFields::new(format!("Persistent terminals unavailable: {err}"))
-                            .with_disabled(true)
-                            .into_item(),
-                    ),
-                }
-                workspace
-                    .new_session_dropdown_menu
-                    .update(ctx, |menu, ctx| {
-                        menu.set_items(items, ctx);
-                    });
-            },
-        );
-    }
-
     pub(super) fn handle_persistent_terminal_action(
         &mut self,
         action: &PersistentTerminalAction,
@@ -91,55 +30,62 @@ impl Workspace {
     ) {
         let Some(path) = runtime_dir() else { return };
         match *action {
-            PersistentTerminalAction::Create { split } => {
-                let group = self
-                    .tabs
-                    .get(self.active_tab_index)
-                    .map(|tab| &tab.pane_group);
-                let split_group = group.filter(|_| split).map(ViewHandle::downgrade);
-                let directory = self
-                    .active_session_view(ctx)
-                    .and_then(|view| view.as_ref(ctx).pwd_if_local(ctx))
-                    .map(PathBuf::from);
-                let shell = std::env::var_os("SHELL")
-                    .map_or_else(|| PathBuf::from("/bin/zsh"), PathBuf::from);
-                self.open_persistent_terminal(
-                    path,
-                    move |runtime| {
-                        runtime.create(
-                            &shell,
-                            directory.as_deref(),
-                            None,
-                            &SizeInfo::new_without_font_metrics(24, 80),
-                        )
-                    },
-                    split_group,
+            PersistentTerminalAction::OpenAttachPicker => {
+                self.open_palette_action(
+                    PaletteMode::Command,
+                    PaletteSource::Keybinding,
+                    None,
                     ctx,
                 );
+                self.palette.update(ctx, |palette, ctx| {
+                    palette.set_active_query_filter(QueryFilter::DetachedSessions, ctx);
+                });
             }
-            PersistentTerminalAction::Attach(id) => {
-                self.open_persistent_terminal(path, move |runtime| runtime.status(id), None, ctx);
+            PersistentTerminalAction::Attach(id) => self.open_persistent_terminal(path, id, ctx),
+            PersistentTerminalAction::Detach(locator) => {
+                let Some(locator) = locator.or_else(|| self.focused_persistent_terminal(ctx))
+                else {
+                    return;
+                };
+                let Some(id) = self.retainable_persistent_session(locator, ctx) else {
+                    return;
+                };
+                ctx.spawn(
+                    persistent_request(move || Runtime::new(path)?.retain(id)),
+                    move |workspace, result, ctx| match result {
+                        Ok(()) => {
+                            if let Some(group) =
+                                workspace.prepare_persistent_pane_close(locator, id, ctx)
+                            {
+                                group.update(ctx, |group, ctx| {
+                                    group.detach_persistent_session(locator.pane_id, id, ctx);
+                                });
+                                ctx.dispatch_global_action("workspace:save_app", ());
+                            }
+                        }
+                        Err(err) => workspace.persistent_terminal_error(err, ctx),
+                    },
+                );
             }
-            PersistentTerminalAction::Detach => {
-                if let Some((group, pane, _)) = self.focused_persistent_terminal(ctx) {
-                    self.close_pane(group.id(), pane, ctx);
-                    ctx.dispatch_global_action("workspace:save_app", ());
-                }
+            PersistentTerminalAction::Rename(locator) => {
+                let Some(id) = self.attached_persistent_session(locator, ctx) else {
+                    return;
+                };
+                self.edit_persistent_session_name(locator, id, ctx);
             }
-            PersistentTerminalAction::Rename => {
-                if let Some((_, _, id)) = self.focused_persistent_terminal(ctx) {
-                    self.rename_tab(self.active_tab_index, ctx);
-                    self.persistent_terminal_being_renamed = Some(id);
-                }
-            }
-            PersistentTerminalAction::ConfirmTermination(id) => {
+            PersistentTerminalAction::ConfirmTermination(locator) => {
+                let Some(id) = self.attached_persistent_session(locator, ctx) else {
+                    return;
+                };
                 ctx.show_native_platform_modal(AlertDialogWithCallbacks::for_view(
-                    "Terminate this persistent terminal?",
-                    "The terminal shell and its foreground job will be stopped.",
+                    "End this terminal session?",
+                    "The shell and its foreground job will stop.",
                     vec![
                         ModalButton::for_view("Cancel", |_, _| {}),
-                        ModalButton::for_view("Terminate", move |workspace: &mut Self, ctx| {
-                            workspace.terminate_persistent_terminal(path, id, ctx);
+                        ModalButton::for_view("End Session", move |workspace: &mut Self, ctx| {
+                            if workspace.attached_persistent_session(locator, ctx) == Some(id) {
+                                workspace.terminate_persistent_terminal(path, locator, id, ctx);
+                            }
                         }),
                     ],
                     |_, _| {},
@@ -148,35 +94,31 @@ impl Workspace {
         }
     }
 
-    fn open_persistent_terminal(
-        &mut self,
-        path: PathBuf,
-        session: impl FnOnce(&Runtime) -> Result<Session> + Send + 'static,
-        split_group: Option<WeakViewHandle<PaneGroup>>,
-        ctx: &mut ViewContext<Self>,
-    ) {
+    fn open_persistent_terminal(&mut self, path: PathBuf, id: Uuid, ctx: &mut ViewContext<Self>) {
         ctx.spawn(
             persistent_request(move || {
                 let runtime = Runtime::new(path)?;
-                let session = session(&runtime)?;
+                let session = runtime.status(id)?;
                 let attachment = runtime.attach(session.id)?;
-                let title = session_label(&session);
-                let truncated = attachment.truncated;
+                let replay_gap = attachment.replay_gap;
                 let layout = PersistentTerminalLayout {
                     id: session.id,
+                    name: session.name,
+                    snapshot: None,
+                    live_conversations: Vec::new(),
                     connection: PersistentPtyConnection::Attached(runtime, attachment),
                 };
-                Ok((layout, title, truncated))
+                Ok((layout, replay_gap))
             }),
             move |workspace, result, ctx| {
-                let (layout, title, truncated) = match result {
+                let (layout, replay_gap) = match result {
                     Ok(value) => value,
                     Err(err) => {
                         workspace.persistent_terminal_error(err, ctx);
                         return;
                     }
                 };
-                if truncated {
+                if replay_gap {
                     workspace.toast_stack.update(ctx, |stack, ctx| {
                         stack.add_ephemeral_toast(
                             DismissibleToast::default(
@@ -186,13 +128,7 @@ impl Workspace {
                         );
                     });
                 }
-                if let Some(group) = split_group.and_then(|group| group.upgrade(ctx)) {
-                    group.update(ctx, |group, ctx| {
-                        group.attach_persistent_terminal(layout, None, ctx)
-                    });
-                } else {
-                    workspace.show_persistent_terminal(layout, title, ctx);
-                }
+                workspace.show_persistent_terminal(layout, ctx);
                 ctx.dispatch_global_action("workspace:save_app", ());
             },
         );
@@ -201,7 +137,6 @@ impl Workspace {
     fn show_persistent_terminal(
         &mut self,
         layout: PersistentTerminalLayout,
-        title: String,
         ctx: &mut ViewContext<Self>,
     ) {
         if let Some((tab, pane)) = self.find_persistent_terminal(layout.id, ctx) {
@@ -224,23 +159,22 @@ impl Workspace {
             });
             return;
         }
+        let tab_title = layout.name.clone();
         self.add_tab_with_pane_layout(
             PanesLayout::PersistentTerminal(Box::new(layout)),
             Arc::default(),
-            Some(title),
+            tab_title,
             ctx,
         );
     }
 
-    fn find_persistent_terminal(
-        &self,
-        id: Uuid,
-        ctx: &ViewContext<Self>,
-    ) -> Option<(usize, PaneId)> {
+    fn find_persistent_terminal(&self, id: Uuid, ctx: &AppContext) -> Option<(usize, PaneId)> {
         self.tabs.iter().enumerate().find_map(|(tab, data)| {
-            let group = data.pane_group.as_ref(ctx);
-            let pane = group.find_terminal_pane_by_session_uuid(id.as_bytes())?;
-            (group.persistent_session_id(pane) == Some(id)).then_some((tab, pane))
+            let pane = data
+                .pane_group
+                .as_ref(ctx)
+                .find_persistent_session(id, ctx)?;
+            Some((tab, pane))
         })
     }
 
@@ -253,41 +187,119 @@ impl Workspace {
     ) {
         self.activate_tab(tab, ctx);
         self.tabs[tab].pane_group.update(ctx, |group, ctx| {
-            group.attach_persistent_terminal(layout, Some(pane), ctx);
+            group.attach_persistent_terminal(layout, pane, ctx);
         });
     }
 
-    fn focused_persistent_terminal(
-        &self,
-        ctx: &ViewContext<Self>,
-    ) -> Option<(ViewHandle<PaneGroup>, PaneId, Uuid)> {
+    pub(super) fn focused_persistent_terminal(&self, ctx: &AppContext) -> Option<PaneViewLocator> {
         let group = &self.tabs.get(self.active_tab_index)?.pane_group;
         let pane_group = group.as_ref(ctx);
-        let pane = pane_group.focused_pane_id(ctx);
-        let id = pane_group.persistent_session_id(pane)?;
-        Some((group.clone(), pane, id))
+        let pane_id = pane_group.focused_pane_id(ctx);
+        if !pane_group.persistent_session_is_attached(pane_id, ctx) {
+            return None;
+        }
+        let terminal = pane_group.terminal_view_from_pane_id(pane_id, ctx)?;
+        let focused = ctx.focused_view_id(self.window_id)?;
+        ctx.view_ancestors(self.window_id, focused)
+            .contains(&terminal.id())
+            .then_some(PaneViewLocator {
+                pane_group_id: group.id(),
+                pane_id,
+            })
+    }
+
+    fn retainable_persistent_session(
+        &self,
+        locator: PaneViewLocator,
+        ctx: &AppContext,
+    ) -> Option<Uuid> {
+        let group = self
+            .get_pane_group_view_with_id(locator.pane_group_id)?
+            .as_ref(ctx);
+        if !group.persistent_session_can_retain(locator.pane_id, ctx) {
+            return None;
+        }
+        group.persistent_session_id(locator.pane_id, ctx)
+    }
+
+    fn attached_persistent_session(
+        &self,
+        locator: PaneViewLocator,
+        ctx: &AppContext,
+    ) -> Option<Uuid> {
+        let group = self
+            .get_pane_group_view_with_id(locator.pane_group_id)?
+            .as_ref(ctx);
+        if !group.persistent_session_is_attached(locator.pane_id, ctx) {
+            return None;
+        }
+        group.persistent_session_id(locator.pane_id, ctx)
+    }
+
+    fn edit_persistent_session_name(
+        &mut self,
+        locator: PaneViewLocator,
+        id: Uuid,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if uses_vertical_tabs(ctx)
+            && self.vertical_tabs_panel_open
+            && matches!(
+                *TabSettings::as_ref(ctx)
+                    .vertical_tabs_display_granularity
+                    .value(),
+                VerticalTabsDisplayGranularity::Panes
+            )
+        {
+            self.rename_pane(locator, ctx);
+        } else {
+            let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.pane_group.id() == locator.pane_group_id)
+            else {
+                return;
+            };
+            let group = self.tabs[index].pane_group.as_ref(ctx);
+            let Some(pane) = group.pane_by_id(locator.pane_id) else {
+                return;
+            };
+            let configuration = pane.pane_configuration();
+            let configuration = configuration.as_ref(ctx);
+            let name = configuration
+                .custom_vertical_tabs_title()
+                .unwrap_or_else(|| configuration.title())
+                .to_owned();
+            self.rename_tab_internal(index, &name, ctx);
+        }
+        self.persistent_terminal_being_renamed = Some((locator, id));
     }
 
     pub(super) fn rename_persistent_terminal(
         &self,
-        group: &ViewHandle<PaneGroup>,
+        locator: PaneViewLocator,
         id: Uuid,
         name: &str,
         ctx: &mut ViewContext<Self>,
     ) {
         let Some(path) = runtime_dir() else { return };
-        let group = group.downgrade();
+        if self.attached_persistent_session(locator, ctx) != Some(id) {
+            return;
+        }
         let name = name.to_owned();
         ctx.spawn(
             persistent_request(move || Runtime::new(path)?.rename(id, Some(name))),
             move |workspace, result, ctx| match result {
                 Ok(session) => {
-                    if let Some(group) = group.upgrade(ctx) {
-                        group.update(ctx, |group, ctx| {
-                            if group.pane_count() == 1 {
-                                group.set_title(&session_label(&session), ctx);
-                            }
-                        });
+                    if let Some(name) = session.name
+                        && workspace.attached_persistent_session(locator, ctx) == Some(id)
+                        && let Some(group) =
+                            workspace.get_pane_group_view_with_id(locator.pane_group_id)
+                    {
+                        if group.as_ref(ctx).pane_count() == 1 {
+                            group.update(ctx, |group, ctx| group.set_title(&name, ctx));
+                        }
+                        workspace.set_custom_pane_name(locator, name, ctx);
                         ctx.dispatch_global_action("workspace:save_app", ());
                     }
                 }
@@ -296,19 +308,74 @@ impl Workspace {
         );
     }
 
-    fn terminate_persistent_terminal(&self, path: PathBuf, id: Uuid, ctx: &mut ViewContext<Self>) {
+    fn terminate_persistent_terminal(
+        &self,
+        path: PathBuf,
+        locator: PaneViewLocator,
+        id: Uuid,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(group) = self.get_pane_group_view_with_id(locator.pane_group_id) else {
+            return;
+        };
+        if !group.update(ctx, |group, ctx| {
+            group.set_persistent_session_ending(locator.pane_id, id, true, ctx)
+        }) {
+            return;
+        }
         ctx.spawn(
             persistent_request(move || Runtime::new(path)?.terminate(id)),
-            |workspace, result, ctx| match result {
-                Ok(()) => workspace.toast_stack.update(ctx, |stack, ctx| {
-                    stack.add_ephemeral_toast(
-                        DismissibleToast::success("Persistent terminal terminated.".into()),
-                        ctx,
-                    );
-                }),
-                Err(err) => workspace.persistent_terminal_error(err, ctx),
+            move |workspace, result, ctx| match result {
+                Ok(()) => {
+                    if let Some(group) = workspace.prepare_persistent_pane_close(locator, id, ctx) {
+                        group.update(ctx, |group, ctx| {
+                            group.close_ended_persistent_session(locator.pane_id, id, ctx);
+                        });
+                        ctx.dispatch_global_action("workspace:save_app", ());
+                    }
+                }
+                Err(err) => {
+                    if let Some(group) =
+                        workspace.get_pane_group_view_with_id(locator.pane_group_id)
+                    {
+                        group.update(ctx, |group, ctx| {
+                            group.set_persistent_session_ending(locator.pane_id, id, false, ctx);
+                        });
+                    }
+                    workspace.persistent_terminal_error(err, ctx);
+                }
             },
         );
+    }
+
+    fn prepare_persistent_pane_close(
+        &mut self,
+        locator: PaneViewLocator,
+        id: Uuid,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<ViewHandle<PaneGroup>> {
+        let group = self
+            .get_pane_group_view_with_id(locator.pane_group_id)?
+            .clone();
+        if group
+            .as_ref(ctx)
+            .persistent_session_id(locator.pane_id, ctx)
+            != Some(id)
+        {
+            return None;
+        }
+        if self.tabs.len() == 1 && group.as_ref(ctx).visible_pane_count() == 1 {
+            self.add_new_session_tab_internal_with_default_session_mode_behavior(
+                NewSessionSource::Tab,
+                Some(ctx.window_id()),
+                None,
+                None,
+                true,
+                DefaultSessionModeBehavior::Ignore,
+                ctx,
+            );
+        }
+        Some(group)
     }
 
     fn persistent_terminal_error(&self, err: anyhow::Error, ctx: &mut ViewContext<Self>) {
@@ -324,50 +391,4 @@ async fn persistent_request<T: Send + 'static>(
     tokio::task::spawn_blocking(request)
         .await
         .context("Persistent terminal request failed")?
-}
-
-fn session_label(session: &Session) -> String {
-    session.name.clone().unwrap_or_else(|| {
-        let id = session.id.simple().to_string();
-        format!("Persistent Terminal {}", &id[..8])
-    })
-}
-
-fn session_menu_items(session: Session) -> Vec<MenuItem<WorkspaceAction>> {
-    let name = session_label(&session);
-    let state = match session.state {
-        SessionState::Attached => "attached",
-        SessionState::Detached => "detached",
-        SessionState::Terminated => "terminated",
-        SessionState::Failed => "unavailable",
-    };
-    let mut items = vec![if session.state == SessionState::Detached {
-        menu_item(
-            format!("Attach to {name}"),
-            PersistentTerminalAction::Attach(session.id),
-        )
-    } else {
-        MenuItemFields::new(format!("{name} ({state})"))
-            .with_disabled(true)
-            .into_item()
-    }];
-    if matches!(
-        session.state,
-        SessionState::Attached | SessionState::Detached
-    ) {
-        items.push(menu_item(
-            format!("Terminate {name}…"),
-            PersistentTerminalAction::ConfirmTermination(session.id),
-        ));
-    }
-    items
-}
-
-fn menu_item(
-    label: impl Into<String>,
-    action: PersistentTerminalAction,
-) -> MenuItem<WorkspaceAction> {
-    MenuItemFields::new(label)
-        .with_on_select_action(WorkspaceAction::PersistentTerminal(action))
-        .into_item()
 }

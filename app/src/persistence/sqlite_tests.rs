@@ -16,6 +16,8 @@ use super::{
     decode_path, deduplicate_events, encode_path, get_all_codebase_index_metadata,
     read_sqlite_data, save_app_state, save_codebase_index_metadata, setup_database, start_writer,
 };
+use crate::ai::agent::conversation::AIConversationId;
+use crate::ai::blocklist::{InputConfig, InputType};
 use crate::app_state::{
     AppState, CodePaneSnapShot, CodePaneTabSnapshot, LeafContents, LeafSnapshot, PaneNodeSnapshot,
     TabGroupSnapshot, TabSnapshot, TerminalPaneSnapshot, WindowSnapshot,
@@ -28,7 +30,7 @@ use crate::persistence::model::ObjectPermissions;
 use crate::persistence::{
     BlockCompleted, ModelEvent, PersistedDataScope, PersistenceScope, StartedCommandMetadata,
 };
-use crate::server::ids::{ClientId, ServerId};
+use crate::server::ids::{ClientId, ServerId, SyncId};
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
 use crate::terminal::model::block::SerializedBlock;
@@ -422,17 +424,35 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
 }
 
 #[test]
-fn persistent_terminal_pane_round_trips_its_session_id() {
+fn persistent_terminal_pane_round_trips_session_and_ai_state() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let mut conn =
         setup_database(&tempdir.path().join("warp.sqlite")).expect("database should initialize");
     let id = uuid::Uuid::new_v4();
+    let active_conversation = AIConversationId::new();
     let pane = PaneNodeSnapshot::Leaf(LeafSnapshot {
         is_focused: true,
-        custom_vertical_tabs_title: None,
+        custom_vertical_tabs_title: Some("project".to_owned()),
         contents: LeafContents::PersistentTerminal {
             id,
-            is_active: true,
+            snapshot: TerminalPaneSnapshot {
+                uuid: id.as_bytes().to_vec(),
+                cwd: Some("/tmp/project".to_owned()),
+                shell_launch_data: Some(ShellLaunchData::Executable {
+                    executable_path: PathBuf::from("/bin/zsh"),
+                    shell_type: crate::terminal::shell::ShellType::Zsh,
+                }),
+                is_active: true,
+                is_read_only: false,
+                input_config: Some(InputConfig {
+                    input_type: InputType::AI,
+                    is_locked: true,
+                }),
+                llm_model_override: Some("saved-agent-model".to_owned()),
+                active_profile_id: Some(SyncId::ClientId(ClientId::new())),
+                conversation_ids_to_restore: vec![AIConversationId::new(), active_conversation],
+                active_conversation_id: Some(active_conversation),
+            },
         },
     });
     let mut window = test_terminal_window_snapshot(false);

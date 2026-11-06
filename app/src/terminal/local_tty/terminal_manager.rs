@@ -1,12 +1,12 @@
 use std::any::Any;
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 use std::net::Shutdown;
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,9 +32,9 @@ use warpui::r#async::executor::Background;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, ViewHandle};
 
 use super::event_loop::EventLoop;
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 use super::persistent::{Attachment, Runtime};
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 use super::persistent_pty::{PersistentPty, PersistentStream};
 use super::shell::{ShellStarter, ShellStarterSource};
 use super::spawner::{PtySpawnHooks, PtySpawnMode};
@@ -116,7 +116,7 @@ impl PtySpawnHooks for AppPtySpawnHooks {
     }
 }
 
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub(crate) enum PersistentPtyConnection {
     Attached(Runtime, Attachment),
@@ -126,7 +126,7 @@ pub(crate) enum PersistentPtyConnection {
 
 enum LocalPtyStart {
     Shell(Option<AvailableShell>),
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
     Persistent {
         id: Uuid,
         connection: PersistentPtyConnection,
@@ -145,9 +145,15 @@ pub struct TerminalManager<S> {
     /// This is an `Option` so that we can take ownership of the inner
     /// `JoinHandle` in `TerminalManager::drop`.
     event_loop_handle: Option<JoinHandle<mio_channel::Receiver<Message>>>,
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
     persistent_stream: Option<Arc<UnixStream>>,
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
+    persistent_session_id: Option<Uuid>,
+    #[cfg(target_os = "macos")]
+    persistent_session_pane_uuid: Option<Uuid>,
+    #[cfg(target_os = "macos")]
+    persistent_retained: Cell<bool>,
+    #[cfg(target_os = "macos")]
     persistent_detached: Cell<bool>,
     pub(super) model: Arc<FairMutex<TerminalModel>>,
     pub(super) view: ViewHandle<S>,
@@ -230,6 +236,8 @@ pub struct TerminalSurfaceResult<S, PostWire> {
 
 /// One-shot resources consumed when the shell is determined and the PTY starts.
 struct ShellStartupResources {
+    #[cfg(target_os = "macos")]
+    persistent_runtime_dir: Option<PathBuf>,
     event_loop_rx: mio_channel::Receiver<Message>,
     channel_event_proxy: ChannelEventListener,
     #[cfg(unix)]
@@ -369,7 +377,7 @@ impl<S> TerminalManager<S> {
     }
 
     /// Connects an existing PTY to a native terminal surface without starting a shell.
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn create_persistent_model<PostWire>(
         id: Uuid,
         connection: PersistentPtyConnection,
@@ -512,7 +520,7 @@ impl<S> TerminalManager<S> {
                 };
                 (shell_state, starter)
             }
-            #[cfg(all(target_os = "macos", debug_assertions))]
+            #[cfg(target_os = "macos")]
             LocalPtyStart::Persistent { .. } => (ShellLaunchState::PersistentPty, None),
         };
 
@@ -524,8 +532,7 @@ impl<S> TerminalManager<S> {
                 .map(|blocks| blocks.len())
                 .unwrap_or(0)
         );
-        #[cfg_attr(not(all(target_os = "macos", debug_assertions)), allow(unused_mut))]
-        let mut model = terminal_manager::create_terminal_model(
+        let model = terminal_manager::create_terminal_model(
             startup_directory.clone(),
             all_restored_blocks,
             initial_size,
@@ -534,10 +541,6 @@ impl<S> TerminalManager<S> {
             block_spacing,
             ctx,
         );
-        #[cfg(all(target_os = "macos", debug_assertions))]
-        if model.is_persistent_pty() {
-            model.start_persistent_pty();
-        }
         let colors = model.colors();
         let model = Arc::new(FairMutex::new(model));
 
@@ -575,6 +578,11 @@ impl<S> TerminalManager<S> {
         // If this session should be a shared-session creator, configure its initial
         // shared-session state before the surface is constructed, so that bootstrap
         // events can observe the correct pending status and source type.
+        #[cfg(target_os = "macos")]
+        let persistent_runtime_dir = (ssh_remote_server_support == SshRemoteServerSupport::Enabled
+            && matches!(is_shared_session_creator, IsSharedSessionCreator::No))
+        .then(crate::persistent_terminals::runtime_dir)
+        .flatten();
         match is_shared_session_creator {
             IsSharedSessionCreator::Yes { source }
                 if FeatureFlag::CreatingSharedSessions.is_enabled() =>
@@ -631,9 +639,15 @@ impl<S> TerminalManager<S> {
             event_loop_tx,
             model,
             event_loop_handle: None,
-            #[cfg(all(target_os = "macos", debug_assertions))]
+            #[cfg(target_os = "macos")]
             persistent_stream: None,
-            #[cfg(all(target_os = "macos", debug_assertions))]
+            #[cfg(target_os = "macos")]
+            persistent_session_id: None,
+            #[cfg(target_os = "macos")]
+            persistent_session_pane_uuid: None,
+            #[cfg(target_os = "macos")]
+            persistent_retained: Cell::new(false),
+            #[cfg(target_os = "macos")]
             persistent_detached: Cell::new(false),
             view: surface.clone(),
             #[cfg(unix)]
@@ -653,8 +667,10 @@ impl<S> TerminalManager<S> {
         // step may need manager-owned controllers and retained handles.
         post_wire(&mut terminal_manager, &surface, ctx);
 
-        #[cfg(all(target_os = "macos", debug_assertions))]
+        #[cfg(target_os = "macos")]
         if let LocalPtyStart::Persistent { id, connection } = start {
+            terminal_manager.persistent_session_id = Some(id);
+            terminal_manager.persistent_retained.set(true);
             let manager = ctx.add_model(|ctx| {
                 match connection {
                     PersistentPtyConnection::Attached(runtime, attachment) => {
@@ -664,6 +680,8 @@ impl<S> TerminalManager<S> {
                             attachment,
                             event_loop_rx,
                             channel_event_proxy,
+                            true,
+                            ctx,
                         );
                     }
                     PersistentPtyConnection::Discover(path) => {
@@ -696,6 +714,8 @@ impl<S> TerminalManager<S> {
                                         attachment,
                                         event_loop_rx,
                                         channel_event_proxy,
+                                        true,
+                                        ctx,
                                     );
                                 } else {
                                     manager.model().lock().exit(ExitReason::PtyDisconnected);
@@ -717,6 +737,8 @@ impl<S> TerminalManager<S> {
 
         let terminal_surface = surface.clone();
         let shell_startup_resources = ShellStartupResources {
+            #[cfg(target_os = "macos")]
+            persistent_runtime_dir,
             event_loop_rx,
             channel_event_proxy,
             #[cfg(unix)]
@@ -781,7 +803,49 @@ impl<S> TerminalManager<S> {
         self.remote_server_controller.clone()
     }
 
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
+    pub(crate) fn persistent_session_id(&self) -> Option<Uuid> {
+        self.persistent_session_id
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn persistent_session_pane_uuid(&self) -> Option<Uuid> {
+        self.persistent_session_pane_uuid
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn persistent_session_is_retained(&self) -> bool {
+        self.persistent_retained.get()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn mark_persistent_session_retained(&self) {
+        self.persistent_retained.set(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn persistent_session_is_attached(&self) -> bool {
+        self.persistent_stream.is_some()
+            && !self.persistent_detached.get()
+            && self
+                .event_loop_handle
+                .as_ref()
+                .is_some_and(|handle| !handle.is_finished())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn persistent_session_can_retain(&self) -> bool {
+        if !self.persistent_session_is_attached() {
+            return false;
+        }
+        let model = self.model.lock();
+        model.is_persistent_pty()
+            || (model.block_list().is_bootstrapping_precmd_done()
+                && model.block_list().active_block().has_received_precmd())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
     fn attach_persistent_pty(
         &mut self,
         id: Uuid,
@@ -789,34 +853,76 @@ impl<S> TerminalManager<S> {
         attachment: Attachment,
         event_loop_rx: mio_channel::Receiver<Message>,
         channel_event_proxy: ChannelEventListener,
-    ) {
+        reattaching: bool,
+        ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
+    ) where
+        S: TerminalSurface,
+        <S as Entity>::Event: PtyIntentEvent,
+    {
+        let native_shell = attachment.native_shell;
         let size = {
             let mut model = self.model.lock();
             model.set_shell_process_info(ShellProcessInfo {
                 pid: attachment.pid,
                 pty_leader_fd: None,
             });
+            if reattaching {
+                if let Some(shell) = &native_shell {
+                    model.restore_persistent_shell(
+                        shell.session_id,
+                        shell.shell_type,
+                        shell.launch_data.clone(),
+                    );
+                } else {
+                    model.start_persistent_pty();
+                }
+            }
             *model.block_list().size()
         };
         let stream = Arc::new(attachment.stream);
         self.persistent_stream = Some(stream.clone());
+        self.persistent_session_id = Some(id);
+        self.persistent_session_pane_uuid = native_shell.as_ref().and_then(|shell| shell.pane_uuid);
+        self.persistent_retained.set(attachment.retained);
         let pty = PersistentPty {
             runtime,
             id,
             stream: PersistentStream(stream),
         };
+        if let Some(shell) = &native_shell {
+            self.view.update(ctx, |surface, ctx| {
+                if !reattaching {
+                    surface.on_shell_determined(ctx);
+                }
+                surface.on_active_shell_launch_data_updated(Some(shell.launch_data.clone()), ctx);
+            });
+        }
         let _ = self.event_loop_tx.send(Message::Resize(size));
-        self.event_loop_handle = Some(
-            EventLoop::new(self.model(), channel_event_proxy, pty, event_loop_rx)
-                .spawn_with_persistent_replay(attachment.replay),
-        );
+        let event_loop = EventLoop::new(self.model(), channel_event_proxy, pty, event_loop_rx);
+        self.event_loop_handle = Some(match (native_shell.is_some(), reattaching) {
+            (true, true) => event_loop.spawn_with_native_persistent_replay(
+                attachment.replay,
+                move |model, parser, bytes| {
+                    model.replay_persistent_pty(
+                        parser,
+                        bytes,
+                        attachment.startup_replay,
+                        attachment.replay_gap,
+                        attachment.checkpoint.as_deref(),
+                        attachment.replay_offset,
+                    );
+                },
+            ),
+            (true, false) => event_loop.spawn_with_native_persistent(attachment.replay),
+            (false, _) => event_loop.spawn_with_persistent_replay(attachment.replay),
+        });
         #[cfg(feature = "integration_tests")]
         {
             self.pid = Some(attachment.pid);
         }
     }
 
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
     pub(super) fn detach_persistent_pty(&self) {
         self.persistent_detached.set(true);
         if let Some(stream) = &self.persistent_stream {
@@ -829,7 +935,7 @@ impl<S> TerminalManager<S> {
     /// process that event.
     pub(super) fn shutdown_event_loop(&mut self) {
         let shutdown_res = self.event_loop_tx.send(Message::Shutdown);
-        #[cfg(all(target_os = "macos", debug_assertions))]
+        #[cfg(target_os = "macos")]
         if let Some(stream) = &self.persistent_stream {
             let _ = stream.shutdown(Shutdown::Both);
         }
@@ -1288,17 +1394,100 @@ fn on_shell_determined<S: TerminalSurface>(
         .lock()
         .register_session_id(generated_session_id);
 
-    // Enqueue the init shell script (for shells that need it), then create
-    // the PTY and start its corresponding event loop.
+    let options = TerminalManager::<S>::pty_options(
+        startup_directory,
+        shell_starter,
+        env_vars,
+        manager.model(),
+        ctx,
+    );
+    #[cfg(target_os = "macos")]
+    if let Some(path) = shell_startup_resources.persistent_runtime_dir.clone() {
+        let owner_options = options.clone();
+        ctx.spawn(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let runtime = Runtime::new(path)?;
+                    let session = runtime.create_native(owner_options, None)?;
+                    match runtime.attach(session.id) {
+                        Ok(mut attachment)
+                            if attachment.native_shell.is_some() && !attachment.replay_gap =>
+                        {
+                            if !attachment.startup_replay.is_empty() {
+                                attachment.startup_replay.append(&mut attachment.replay);
+                                attachment.replay = std::mem::take(&mut attachment.startup_replay);
+                            }
+                            Ok((session.id, runtime, attachment))
+                        }
+                        Ok(_) => {
+                            let _ = runtime.terminate(session.id);
+                            anyhow::bail!("Persistent terminal startup could not be replayed");
+                        }
+                        Err(error) => {
+                            let _ = runtime.terminate(session.id);
+                            Err(error)
+                        }
+                    }
+                })
+                .await
+            },
+            move |manager, result, ctx| {
+                let Some(manager) = manager.as_any_mut().downcast_mut::<TerminalManager<S>>()
+                else {
+                    return;
+                };
+                if manager.persistent_detached.get()
+                    || !ctx.is_window_open(manager.view.window_id(ctx))
+                {
+                    return;
+                }
+                if let Ok(Ok((id, runtime, attachment))) = result {
+                    if manager
+                        .enqueue_init_script(&options.shell_starter, generated_session_id)
+                        .is_err()
+                    {
+                        manager.model().lock().exit(ExitReason::PtySpawnFailed);
+                        return;
+                    }
+                    manager.attach_persistent_pty(
+                        id,
+                        runtime,
+                        attachment,
+                        shell_startup_resources.event_loop_rx,
+                        shell_startup_resources.channel_event_proxy,
+                        false,
+                        ctx,
+                    );
+                } else {
+                    log::warn!("Could not start the persistent PTY owner, starting a local PTY");
+                    start_direct_shell(manager, options, shell_startup_resources, ctx);
+                }
+            },
+        );
+        return;
+    }
+    start_direct_shell(manager, options, shell_startup_resources, ctx);
+}
+
+fn start_direct_shell<S: TerminalSurface>(
+    manager: &mut TerminalManager<S>,
+    options: PtyOptions,
+    resources: ShellStartupResources,
+    ctx: &mut ModelContext<Box<dyn TerminalManagerTrait>>,
+) where
+    <S as Entity>::Event: PtyIntentEvent,
+{
     let ShellStartupResources {
         event_loop_rx,
         channel_event_proxy,
         #[cfg(unix)]
         model_events,
-    } = shell_startup_resources;
+        ..
+    } = resources;
+    let shell_launch_data = options.shell_starter.launch_data();
     manager.recovery_resources = Some(ShellRecoveryResources {
-        starter: shell_starter.clone(),
-        original_env: env_vars.clone(),
+        starter: options.shell_starter.clone(),
+        original_env: options.env_vars.clone(),
         channel_event_proxy: channel_event_proxy.clone(),
         #[cfg(unix)]
         model_events: model_events.clone(),
@@ -1307,14 +1496,11 @@ fn on_shell_determined<S: TerminalSurface>(
     #[cfg(windows)]
     let event_loop_tx = manager.event_loop_tx.clone();
     let pty = match manager
-        .enqueue_init_script(&shell_starter, generated_session_id)
+        .enqueue_init_script(&options.shell_starter, options.shell_starter.session_id())
         .context("Failed to write shell init script to the pty")
         .and_then(|_| {
-            TerminalManager::<S>::create_pty(
-                startup_directory,
-                shell_starter,
-                env_vars,
-                model.clone(),
+            TerminalManager::<S>::spawn_pty(
+                options,
                 #[cfg(windows)]
                 event_loop_tx,
                 ctx,
@@ -1427,11 +1613,26 @@ impl<S> TerminalManager<S> {
         #[cfg(windows)] event_loop_tx: mio_channel::Sender<Message>,
         ctx: &mut AppContext,
     ) -> anyhow::Result<Pty> {
+        let options = Self::pty_options(startup_directory, shell_starter, env_vars, model, ctx);
+        Self::spawn_pty(
+            options,
+            #[cfg(windows)]
+            event_loop_tx,
+            ctx,
+        )
+    }
+
+    fn pty_options(
+        startup_directory: Option<PathBuf>,
+        shell_starter: ShellStarter,
+        env_vars: HashMap<OsString, OsString>,
+        model: Arc<FairMutex<TerminalModel>>,
+        ctx: &AppContext,
+    ) -> PtyOptions {
         let is_shell_debug_mode_enabled = *DebugSettings::as_ref(ctx)
             .is_shell_debug_mode_enabled
             .value();
         let is_honor_ps1_enabled = *SessionSettings::as_ref(ctx).honor_ps1;
-        let is_crash_reporting_enabled = PrivacySettings::as_ref(ctx).is_crash_reporting_enabled;
 
         // Determine whether the Node.js Version chip is enabled anywhere it could be
         // shown (the Warp prompt, the agent footer, or the CLI agent footer). When it
@@ -1470,7 +1671,7 @@ impl<S> TerminalManager<S> {
                 .value();
 
         let size: SizeInfo = model.lock().block_list().size().to_owned();
-        let options = PtyOptions {
+        PtyOptions {
             size,
             window_id: None,
             shell_starter,
@@ -1482,10 +1683,16 @@ impl<S> TerminalManager<S> {
             honor_ps1: is_honor_ps1_enabled,
             node_version_chip_enabled,
             close_fds: true,
-        };
+        }
+    }
 
+    fn spawn_pty(
+        options: PtyOptions,
+        #[cfg(windows)] event_loop_tx: mio_channel::Sender<Message>,
+        ctx: &mut AppContext,
+    ) -> anyhow::Result<Pty> {
         let hooks = AppPtySpawnHooks {
-            is_crash_reporting_enabled,
+            is_crash_reporting_enabled: PrivacySettings::as_ref(ctx).is_crash_reporting_enabled,
         };
         Pty::new(
             options,

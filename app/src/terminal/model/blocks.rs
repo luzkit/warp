@@ -3096,7 +3096,7 @@ impl BlockList {
         self.active_block_mut().set_shell_host(shell_host)
     }
 
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
     pub(super) fn start_persistent_pty(&mut self) {
         self.active_block_mut().hide();
         self.update_active_block_height();

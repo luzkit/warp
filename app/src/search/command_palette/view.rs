@@ -46,6 +46,8 @@ use crate::settings::CtrlTabBehavior;
 use crate::terminal::keys_settings::KeysSettings;
 use crate::themes::theme::WarpTheme;
 use crate::view_components::DismissibleToast;
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+use crate::workspace::PersistentTerminalAction;
 use crate::workspace::{ForkedConversationDestination, WorkspaceAction, active_terminal_in_window};
 use crate::{ToastStack, send_telemetry_from_ctx};
 
@@ -734,10 +736,13 @@ impl View {
     ) {
         // Tab navigations don't appear in the main command palette to avoid confusion with session
         // navigations, so they can't evict real recent items from SelectedItems.
-        if !matches!(
-            result_action,
-            CommandPaletteItemAction::NavigateToTab { .. }
-        ) {
+        let record_in_recents = match result_action {
+            CommandPaletteItemAction::NavigateToTab { .. } => false,
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            CommandPaletteItemAction::AttachPersistentSession(_) => false,
+            _ => true,
+        };
+        if record_in_recents {
             let selected_items_handle = SelectedItems::handle(ctx);
             selected_items_handle.update(ctx, |selected_items, _ctx| {
                 selected_items.enqueue(result_action.to_summary())
@@ -748,6 +753,14 @@ impl View {
             && let Some(action) = &binding.action
         {
             match action.as_any().downcast_ref::<WorkspaceAction>() {
+                #[cfg(all(target_os = "macos", feature = "local_tty"))]
+                Some(WorkspaceAction::PersistentTerminal(
+                    PersistentTerminalAction::OpenAttachPicker,
+                )) => {
+                    self.reset(ctx);
+                    self.set_active_query_filter(QueryFilter::DetachedSessions, ctx);
+                    return;
+                }
                 Some(WorkspaceAction::TogglePalette {
                     mode: PaletteMode::LaunchConfig,
                     source: _,
@@ -796,6 +809,12 @@ impl View {
                 if let Some(action) = binding.action.as_deref() {
                     self.dispatch_typed_action_on_view(action, ctx);
                 };
+            }
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            CommandPaletteItemAction::AttachPersistentSession(id) => {
+                ctx.dispatch_typed_action(&WorkspaceAction::PersistentTerminal(
+                    PersistentTerminalAction::Attach(id),
+                ));
             }
             CommandPaletteItemAction::NavigateToSession {
                 pane_view_locator,

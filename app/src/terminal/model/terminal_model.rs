@@ -2137,9 +2137,149 @@ impl TerminalModel {
         matches!(self.shell_launch_state, ShellLaunchState::PersistentPty)
     }
 
-    #[cfg(all(target_os = "macos", debug_assertions))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn start_persistent_pty(&mut self) {
         self.block_list.start_persistent_pty();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn restore_persistent_shell(
+        &mut self,
+        session_id: SessionId,
+        shell_type: ShellType,
+        shell_launch_data: ShellLaunchData,
+    ) {
+        self.shell_launch_state = ShellLaunchState::DeterminingShell {
+            available_shell: None,
+            display_name: ShellName::LessDescriptive(shell_type.name().to_owned()),
+        };
+        self.set_login_shell_spawned(shell_type);
+        self.set_pending_shell_launch_data(shell_launch_data);
+        self.register_session_id(session_id);
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn replay_persistent_pty(
+        &mut self,
+        parser: &mut ansi::Processor,
+        bytes: &[u8],
+        mut startup_replay: Vec<u8>,
+        replay_gap: bool,
+        checkpoint: Option<&warp_terminal::local_tty::persistent::NativeCheckpoint>,
+        replay_offset: Option<u64>,
+    ) {
+        self.event_proxy
+            .send_app_event(Event::PersistentReplayStarted);
+        let bytes = if replay_gap
+            && let (Some(checkpoint), Some(offset)) = (checkpoint, replay_offset)
+        {
+            let mut frames = checkpoint
+                .startup
+                .iter()
+                .chain(&checkpoint.prompt)
+                .filter(|frame| frame.start < offset)
+                .collect::<Vec<_>>();
+            frames.sort_by_key(|frame| frame.start);
+            frames.dedup_by_key(|frame| frame.start);
+            let mut replayed_end = None;
+            for frame in frames {
+                if replayed_end != Some(frame.start) {
+                    self.prepare_persistent_replay_gap(parser, true);
+                }
+                parser.replay_bytes(self, &frame.bytes);
+                replayed_end = Some(frame.end);
+            }
+            let skip = replayed_end.unwrap_or(offset).saturating_sub(offset) as usize;
+            if replayed_end.is_none_or(|end| end < offset) {
+                let restored_latest_prompt = checkpoint
+                    .prompt
+                    .last()
+                    .is_some_and(|frame| replayed_end.is_some_and(|end| frame.end <= end));
+                self.prepare_persistent_replay_gap(
+                    parser,
+                    checkpoint.command_running || !restored_latest_prompt,
+                );
+                Self::persistent_replay_boundary(bytes)
+            } else {
+                &bytes[skip.min(bytes.len())..]
+            }
+        } else if replay_gap {
+            // Stop at the first complete prompt. The omitted bytes may include the end of any
+            // subsequent command or escape sequence, so the tail needs its own parser state.
+            for chunk in startup_replay.split_inclusive(|byte| matches!(*byte, b'\x07' | b'\\')) {
+                parser.replay_bytes(self, chunk);
+                if self.block_list.is_bootstrapping_precmd_done()
+                    && self.block_list.active_block().has_received_precmd()
+                {
+                    break;
+                }
+            }
+            self.prepare_persistent_replay_gap(parser, true);
+            Self::persistent_replay_boundary(bytes)
+        } else if startup_replay.is_empty() {
+            bytes
+        } else {
+            startup_replay.extend_from_slice(bytes);
+            &startup_replay
+        };
+        parser.replay_bytes(self, bytes);
+        if replay_gap && !self.block_list.is_bootstrapped() {
+            self.shell_launch_state = ShellLaunchState::PersistentPty;
+            self.start_persistent_pty();
+            *parser = ansi::Processor::terminal_only();
+        } else if replay_gap && checkpoint.is_some_and(|checkpoint| checkpoint.command_running) {
+            self.start_command_execution();
+        }
+        self.finish_persistent_replay();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_persistent_replay(&self) {
+        let active_block = self.block_list.active_block();
+        let at_prompt = self.block_list.is_bootstrapping_precmd_done()
+            && active_block.has_received_precmd()
+            && !active_block.started()
+            && !self.alt_screen_active;
+        let active_metadata =
+            active_block
+                .session_id()
+                .map(|_| crate::terminal::event::BlockMetadataReceivedEvent {
+                    block_metadata: active_block.metadata(),
+                    block_index: active_block.index(),
+                    is_after_in_band_command: false,
+                    is_done_bootstrapping: self.block_list.is_bootstrapping_precmd_done(),
+                });
+        self.event_proxy
+            .send_app_event(Event::PersistentReplayFinished {
+                at_prompt,
+                active_metadata,
+            });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn prepare_persistent_replay_gap(&mut self, parser: &mut ansi::Processor, running: bool) {
+        // A submitted block accepts a completion even when the omitted bytes held its Preexec.
+        if running
+            && self.block_list.is_bootstrapping_precmd_done()
+            && self.block_list.active_block().has_received_precmd()
+        {
+            self.start_command_execution();
+        }
+        *parser = ansi::Processor::new();
+        self.is_receiving_hook = IsReceivingHook::No;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_replay_boundary(bytes: &[u8]) -> &[u8] {
+        // A truncated tail may start inside an escape payload or terminal line.
+        match bytes
+            .iter()
+            .position(|byte| matches!(*byte, b'\n' | b'\x1b'))
+        {
+            Some(offset) if bytes[offset] == b'\n' => &bytes[offset + 1..],
+            Some(offset) => &bytes[offset..],
+            None => &[],
+        }
     }
 
     pub fn shared_session_status(&self) -> &SharedSessionStatus {
@@ -2667,6 +2807,17 @@ pub enum HandlerEvent {
 }
 
 impl ansi::Handler for TerminalModel {
+    #[cfg(target_os = "macos")]
+    fn start_replay_continuation(&mut self) {
+        self.event_proxy
+            .send_app_event(Event::PersistentReplayStarted);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_replay_continuation(&mut self) {
+        self.finish_persistent_replay();
+    }
+
     fn is_registered_session(&self, session_id: SessionId) -> bool {
         self.registered_session_ids.contains(&session_id)
     }
@@ -3787,3 +3938,7 @@ impl ModeProvider for TerminalModel {
 #[cfg(test)]
 #[path = "terminal_model_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "persistent_replay_tests.rs"]
+mod persistent_replay_tests;

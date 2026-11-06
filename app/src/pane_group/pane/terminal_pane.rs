@@ -1,4 +1,6 @@
 //! Implementation of terminal panes.
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+use std::cell::Cell;
 #[cfg(not(target_family = "wasm"))]
 use std::collections::HashMap;
 use std::sync::mpsc::SyncSender;
@@ -91,7 +93,10 @@ pub struct TerminalPane {
 
     /// Used to uniquely identify the pane, even across separate runs of the app.
     uuid: Vec<u8>,
-    persistent_session_id: Option<uuid::Uuid>,
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(in crate::pane_group) persistent_session_ending: Cell<bool>,
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(in crate::pane_group) pending_persistent_snapshot: Option<TerminalPaneSnapshot>,
 
     pane_configuration: ModelHandle<PaneConfiguration>,
 
@@ -170,7 +175,10 @@ impl TerminalPane {
         Self {
             model_event_sender,
             uuid,
-            persistent_session_id: None,
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            persistent_session_ending: Cell::new(false),
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            pending_persistent_snapshot: None,
             pane_configuration,
             view,
         }
@@ -187,15 +195,14 @@ impl TerminalPane {
         self.view.as_ref(ctx).child(ctx)
     }
 
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
-    pub(in crate::pane_group) fn with_persistent_session(mut self, id: uuid::Uuid) -> Self {
-        self.persistent_session_id = Some(id);
-        self
-    }
-
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
-    pub(in crate::pane_group) fn persistent_session_id(&self) -> Option<uuid::Uuid> {
-        self.persistent_session_id
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(in crate::pane_group) fn persistent_session_id(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<uuid::Uuid> {
+        self.terminal_manager(ctx)
+            .as_ref(ctx)
+            .persistent_session_id()
     }
 
     /// The UUID that identifies this terminal session across app restarts.
@@ -480,8 +487,15 @@ impl PaneContent for TerminalPane {
     fn snapshot(&self, app: &AppContext) -> LeafContents {
         let view = self.terminal_view(app).as_ref(app);
         let is_active = view.is_active_session(app);
-        if let Some(id) = self.persistent_session_id {
-            return LeafContents::PersistentTerminal { id, is_active };
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        let manager = self.terminal_manager(app);
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        if let Some(snapshot) = &self.pending_persistent_snapshot
+            && let Some(id) = manager.as_ref(app).persistent_session_id()
+        {
+            let mut snapshot = snapshot.clone();
+            snapshot.is_active = is_active;
+            return LeafContents::PersistentTerminal { id, snapshot };
         }
 
         // Capture the current input_config from the AI input model
@@ -571,7 +585,7 @@ impl PaneContent for TerminalPane {
                         .active_conversation_id()
                 });
 
-            LeafContents::Terminal(TerminalPaneSnapshot {
+            let snapshot = TerminalPaneSnapshot {
                 uuid: self.uuid.clone(),
                 cwd: view.pwd_if_local(app),
                 is_active,
@@ -582,7 +596,18 @@ impl PaneContent for TerminalPane {
                 active_profile_id,
                 conversation_ids_to_restore,
                 active_conversation_id,
-            })
+            };
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            if manager.as_ref(app).persistent_session_is_retained()
+                && let Some(id) = manager.as_ref(app).persistent_session_id()
+            {
+                let snapshot = TerminalPaneSnapshot {
+                    uuid: id.as_bytes().to_vec(),
+                    ..snapshot
+                };
+                return LeafContents::PersistentTerminal { id, snapshot };
+            }
+            LeafContents::Terminal(snapshot)
         }
     }
 
@@ -993,6 +1018,14 @@ fn handle_terminal_view_event(
                 }
             }
             Event::Exited => {
+                #[cfg(all(target_os = "macos", feature = "local_tty"))]
+                if group
+                    .terminal_session_by_id(pane_id)
+                    .is_some_and(|pane| pane.persistent_session_ending.get())
+                {
+                    return;
+                }
+
                 // If the shell process exited before it successfully bootstrapped,
                 // keep the pane open.  There might be useful information visible
                 // in the output, and if this was the first shell spawned when the

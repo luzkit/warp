@@ -20,6 +20,8 @@ use session_sharing_protocol::sharer::{
     QuotaType, RemoveGuestResponse, SessionEndedReason, SessionSourceType,
     TeamAccessLevelUpdateResponse, UpdatePendingUserRoleResponse,
 };
+#[cfg(target_os = "macos")]
+use uuid::Uuid;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::send_telemetry_from_ctx;
 use warp_errors::report_error;
@@ -2255,6 +2257,41 @@ impl TerminalManagerTrait for TerminalManager<TerminalView> {
         TerminalManager::on_session_bootstrapped(self, session_id, ctx);
     }
 
+    #[cfg(target_os = "macos")]
+    fn persistent_session_id(&self) -> Option<Uuid> {
+        TerminalManager::persistent_session_id(self)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_pane_uuid(&self) -> Option<Uuid> {
+        TerminalManager::persistent_session_pane_uuid(self)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_is_retained(&self) -> bool {
+        TerminalManager::persistent_session_is_retained(self)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mark_persistent_session_retained(&self) {
+        TerminalManager::mark_persistent_session_retained(self);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_is_attached(&self) -> bool {
+        TerminalManager::persistent_session_is_attached(self)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_can_retain(&self) -> bool {
+        TerminalManager::persistent_session_can_retain(self)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn disconnect_persistent_session(&self) {
+        self.detach_persistent_pty();
+    }
+
     fn on_view_detached(
         &self,
         // The detach type is intentionally ignored: a sharer always stops sharing immediately,
@@ -2263,8 +2300,8 @@ impl TerminalManagerTrait for TerminalManager<TerminalView> {
         detach_type: crate::pane_group::pane::DetachType,
         app: &mut AppContext,
     ) {
-        #[cfg(all(target_os = "macos", debug_assertions))]
-        if !matches!(detach_type, crate::pane_group::pane::DetachType::Moved) {
+        #[cfg(target_os = "macos")]
+        if matches!(detach_type, crate::pane_group::pane::DetachType::Closed) {
             self.detach_persistent_pty();
         }
 

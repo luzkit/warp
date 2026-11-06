@@ -5,6 +5,8 @@ use std::sync::Arc;
 use parking_lot::FairMutex;
 use pathfinder_geometry::vector::Vector2F;
 use settings::Setting as _;
+#[cfg(target_os = "macos")]
+use uuid::Uuid;
 use warpui::{AppContext, ModelContext, SingletonEntity};
 
 use super::event_listener::ChannelEventListener;
@@ -33,6 +35,38 @@ pub trait TerminalManager: Any {
     /// Implementations should preserve state on [`DetachType::HiddenForClose`] or
     /// [`DetachType::Moved`] and clean up only on [`DetachType::Closed`].
     fn on_view_detached(&self, _detach_type: DetachType, _app: &mut AppContext) {}
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_id(&self) -> Option<Uuid> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_pane_uuid(&self) -> Option<Uuid> {
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_is_retained(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mark_persistent_session_retained(&self) {}
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_is_attached(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn persistent_session_can_retain(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "macos")]
+    fn disconnect_persistent_session(&self) {}
+
     fn recover_cloud_shell(
         &mut self,
         _request: CloudShellRecoveryRequest,

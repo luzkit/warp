@@ -124,7 +124,7 @@ use crate::terminal::available_shells::{AvailableShell, AvailableShells};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::PluginModalKind;
 use crate::terminal::general_settings::{GeneralSettings, GeneralSettingsChangedEvent};
-#[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
 use crate::terminal::local_tty::PersistentPtyConnection;
 #[cfg(feature = "local_tty")]
 use crate::terminal::local_tty::TerminalManager as LocalTtyTerminalManager;
@@ -847,10 +847,13 @@ impl NewTerminalOptions {
     }
 }
 
-#[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
 #[derive(Debug)]
 pub struct PersistentTerminalLayout {
     pub(crate) id: Uuid,
+    pub(crate) name: Option<String>,
+    pub(crate) snapshot: Option<TerminalPaneSnapshot>,
+    pub(crate) live_conversations: Vec<AIConversation>,
     pub(crate) connection: PersistentPtyConnection,
 }
 
@@ -858,7 +861,7 @@ pub struct PersistentTerminalLayout {
 #[derive(Debug)]
 pub enum PanesLayout {
     SingleTerminal(Box<NewTerminalOptions>),
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
     PersistentTerminal(Box<PersistentTerminalLayout>),
     Snapshot(Box<PaneNodeSnapshot>),
     Template(PaneTemplateType),
@@ -1641,15 +1644,22 @@ impl PaneGroup {
                 };
                 Ok((PaneData::new(pane_id), focus))
             }
-            LeafContents::PersistentTerminal { id, is_active } => {
-                #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+            LeafContents::PersistentTerminal { id, snapshot } => {
+                #[cfg(all(target_os = "macos", feature = "local_tty"))]
                 {
+                    let is_active = snapshot.is_active;
                     let connection = crate::persistent_terminals::auto_reattach_path().map_or(
                         PersistentPtyConnection::Disconnected,
                         PersistentPtyConnection::Discover,
                     );
                     let pane = Self::create_persistent_pane(
-                        PersistentTerminalLayout { id, connection },
+                        PersistentTerminalLayout {
+                            id,
+                            name: None,
+                            snapshot: Some(snapshot),
+                            live_conversations: Vec::new(),
+                            connection,
+                        },
                         resources,
                         view_size,
                         ctx,
@@ -1665,9 +1675,9 @@ impl PaneGroup {
                         },
                     ))
                 }
-                #[cfg(not(all(target_os = "macos", feature = "local_tty", debug_assertions)))]
+                #[cfg(not(all(target_os = "macos", feature = "local_tty")))]
                 {
-                    let _ = is_active;
+                    let _ = snapshot;
                     anyhow::bail!("Persistent terminal {id} is unavailable in this build")
                 }
             }
@@ -1688,48 +1698,12 @@ impl PaneGroup {
 
                 let startup_directory = terminal_snapshot
                     .cwd
+                    .as_ref()
                     .map(PathBuf::from)
                     .filter(|path| path.is_dir());
 
-                // Filter conversation IDs to only include those that have task messages
-                // and are not entirely passive (ignored suggestions).
-                // This prevents showing the "Previous session" banner when there's nothing to restore
-                // and avoids restoring passive code diffs that the user never acted on.
-                let filtered_conversation_ids: Vec<AIConversationId> = terminal_snapshot
-                    .conversation_ids_to_restore
-                    .iter()
-                    .filter(|&conversation_id| {
-                        RestoredAgentConversations::handle(ctx).update(ctx, |store, _| {
-                            store
-                                .get_conversation(conversation_id)
-                                .is_some_and(|persisted_conv| {
-                                    // Filter conversations that contain no tasks.
-                                    if persisted_conv.all_tasks().next().is_none() {
-                                        return false;
-                                    }
-
-                                    // Filter conversations that are entirely passive.
-                                    !persisted_conv.is_entirely_passive()
-                                })
-                        })
-                    })
-                    .copied()
-                    .collect();
-
-                let conversation_restoration = {
-                    let conversations = RestoredAgentConversations::handle(ctx)
-                        .update(ctx, |store, _| {
-                            store.take_conversations(&filtered_conversation_ids)
-                        });
-                    vec1::Vec1::try_from_vec(conversations)
-                        .ok()
-                        .map(
-                            |conversations| ConversationRestorationInNewPaneType::Startup {
-                                conversations,
-                                active_conversation_id: terminal_snapshot.active_conversation_id,
-                            },
-                        )
-                };
+                let conversation_restoration =
+                    Self::take_terminal_conversations(&terminal_snapshot, ctx);
                 let (terminal_view, terminal_manager) = PaneGroup::create_session(
                     startup_directory,
                     HashMap::new(),
@@ -1760,49 +1734,7 @@ impl PaneGroup {
                 let pane_id = terminal_pane_id.into();
                 pane_contents.insert(pane_id, Box::new(pane_data));
 
-                if let Some(llm_override) = &terminal_snapshot.llm_model_override
-                    && let Ok(llm_id) = serde_json::from_str::<LLMId>(llm_override)
-                {
-                    log::info!("Selecting base agent model {llm_id} (from terminal snapshot)");
-                    let scope = ResolvedTeamScope::from_scope(
-                        &UserWorkspaces::as_ref(ctx).team_context_for_view(ctx),
-                    );
-                    LLMPreferences::handle(ctx).update(ctx, |llm_prefs, ctx| {
-                        llm_prefs.update_preferred_agent_mode_llm(
-                            &scope,
-                            &llm_id,
-                            terminal_view_id,
-                            ctx,
-                        );
-                    });
-                }
-
-                if let Some(active_profile_sync_id) = &terminal_snapshot.active_profile_id {
-                    log::info!(
-                        "Attempting to restore active_profile '{active_profile_sync_id}' for terminal {terminal_view_id:?}"
-                    );
-
-                    let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
-
-                    if let Some(profile_id) =
-                        profiles_model.get_profile_id_by_sync_id(active_profile_sync_id, ctx)
-                    {
-                        AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                            profiles_model.set_active_profile(
-                                terminal_view_id,
-                                profile_id.clone(),
-                                ctx,
-                            );
-                        });
-                        log::info!(
-                            "Restored active profile {profile_id:?} for terminal {terminal_view_id:?}"
-                        );
-                    } else {
-                        log::warn!(
-                            "Failed to restore active profile for terminal {terminal_view_id:?}"
-                        );
-                    }
-                }
+                Self::restore_terminal_preferences(&terminal_snapshot, terminal_view_id, ctx);
 
                 let focus = InitialFocus {
                     focused_pane: leaf.is_focused.then_some(pane_id),
@@ -2302,9 +2234,31 @@ impl PaneGroup {
 
     /// Returns the [`PaneId`] of the terminal pane whose persistent UUID matches
     /// the given bytes, or `None` if no such pane exists in this group.
-    pub fn find_terminal_pane_by_session_uuid(&self, uuid: &[u8]) -> Option<PaneId> {
+    #[cfg_attr(
+        not(all(target_os = "macos", feature = "local_tty")),
+        allow(unused_variables)
+    )]
+    pub fn find_terminal_pane_by_session_uuid(
+        &self,
+        uuid: &[u8],
+        ctx: &AppContext,
+    ) -> Option<PaneId> {
         self.panes_of::<TerminalPane>()
-            .find(|pane| pane.session_uuid() == uuid && !self.is_pane_hidden_for_close(pane.id()))
+            .filter(|pane| !self.is_pane_hidden_for_close(pane.id()))
+            .find(|pane| {
+                if pane.session_uuid() == uuid {
+                    return true;
+                }
+                #[cfg(all(target_os = "macos", feature = "local_tty"))]
+                let matches_alias = pane
+                    .terminal_manager(ctx)
+                    .as_ref(ctx)
+                    .persistent_session_pane_uuid()
+                    .is_some_and(|original| original.as_bytes() == uuid);
+                #[cfg(not(all(target_os = "macos", feature = "local_tty")))]
+                let matches_alias = false;
+                matches_alias
+            })
             .map(|pane| pane.id())
     }
 
@@ -3461,14 +3415,122 @@ impl PaneGroup {
         (PaneData::new(pane_id), focus)
     }
 
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    fn take_terminal_conversations(
+        terminal_snapshot: &TerminalPaneSnapshot,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<ConversationRestorationInNewPaneType> {
+        // Filter conversation IDs to only include those that have task messages
+        // and are not entirely passive (ignored suggestions).
+        // This prevents showing the "Previous session" banner when there's nothing to restore
+        // and avoids restoring passive code diffs that the user never acted on.
+        let filtered_conversation_ids: Vec<AIConversationId> = terminal_snapshot
+            .conversation_ids_to_restore
+            .iter()
+            .filter(|&conversation_id| {
+                RestoredAgentConversations::handle(ctx).update(ctx, |store, _| {
+                    store
+                        .get_conversation(conversation_id)
+                        .is_some_and(|persisted_conv| {
+                            // Filter conversations that contain no tasks.
+                            if persisted_conv.all_tasks().next().is_none() {
+                                return false;
+                            }
+
+                            // Filter conversations that are entirely passive.
+                            !persisted_conv.is_entirely_passive()
+                        })
+                })
+            })
+            .copied()
+            .collect();
+
+        {
+            let conversations = RestoredAgentConversations::handle(ctx).update(ctx, |store, _| {
+                store.take_conversations(&filtered_conversation_ids)
+            });
+            vec1::Vec1::try_from_vec(conversations)
+                .ok()
+                .map(
+                    |conversations| ConversationRestorationInNewPaneType::Startup {
+                        conversations,
+                        active_conversation_id: terminal_snapshot.active_conversation_id,
+                    },
+                )
+        }
+    }
+
+    fn restore_terminal_preferences(
+        terminal_snapshot: &TerminalPaneSnapshot,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(llm_override) = &terminal_snapshot.llm_model_override
+            && let Ok(llm_id) = serde_json::from_str::<LLMId>(llm_override)
+        {
+            log::info!("Selecting base agent model {llm_id} (from terminal snapshot)");
+            let scope = ResolvedTeamScope::from_scope(
+                &UserWorkspaces::as_ref(ctx).team_context_for_view(ctx),
+            );
+            LLMPreferences::handle(ctx).update(ctx, |llm_prefs, ctx| {
+                llm_prefs.update_preferred_agent_mode_llm(&scope, &llm_id, terminal_view_id, ctx);
+            });
+        }
+
+        if let Some(active_profile_sync_id) = &terminal_snapshot.active_profile_id {
+            log::info!(
+                "Attempting to restore active_profile '{active_profile_sync_id}' for terminal {terminal_view_id:?}"
+            );
+
+            let profiles_model = AIExecutionProfilesModel::as_ref(ctx);
+
+            if let Some(profile_id) =
+                profiles_model.get_profile_id_by_sync_id(active_profile_sync_id, ctx)
+            {
+                AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
+                    profiles_model.set_active_profile(terminal_view_id, profile_id.clone(), ctx);
+                });
+                log::info!(
+                    "Restored active profile {profile_id:?} for terminal {terminal_view_id:?}"
+                );
+            } else {
+                log::warn!("Failed to restore active profile for terminal {terminal_view_id:?}");
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
     fn create_persistent_pane(
         layout: PersistentTerminalLayout,
         mut resources: TerminalViewResources,
         view_size: Vector2F,
         ctx: &mut ViewContext<Self>,
     ) -> TerminalPane {
-        let PersistentTerminalLayout { id, connection } = layout;
+        let PersistentTerminalLayout {
+            id,
+            name,
+            snapshot,
+            live_conversations,
+            connection,
+        } = layout;
+        let defer_conversations = matches!(connection, PersistentPtyConnection::Disconnected);
+        let conversation_restoration = vec1::Vec1::try_from_vec(live_conversations)
+            .ok()
+            .map(
+                |conversations| ConversationRestorationInNewPaneType::Startup {
+                    conversations,
+                    active_conversation_id: snapshot
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.active_conversation_id),
+                },
+            )
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .filter(|_| !defer_conversations)
+                    .and_then(|snapshot| Self::take_terminal_conversations(snapshot, ctx))
+            });
+        let has_conversation_restoration = conversation_restoration.is_some();
+        let initial_input_config = snapshot.as_ref().and_then(|snapshot| snapshot.input_config);
         resources.model_event_sender = None;
         let window_id = ctx.window_id();
         let terminal = LocalTtyTerminalManager::<TerminalView>::create_persistent_model(
@@ -3482,9 +3544,9 @@ impl PaneGroup {
                         resources,
                         model_event_sender: None,
                         window_id,
-                        initial_input_config: None,
-                        conversation_restoration: None,
-                        has_conversation_restoration: false,
+                        initial_input_config,
+                        conversation_restoration,
+                        has_conversation_restoration,
                         is_historical: false,
                         should_use_live_appearance: false,
                         has_restored_command_blocks: false,
@@ -3494,21 +3556,32 @@ impl PaneGroup {
                 )
             },
         );
-        TerminalPane::new(
+        if let Some(snapshot) = &snapshot {
+            Self::restore_terminal_preferences(snapshot, terminal.surface.id(), ctx);
+        }
+        let mut pane = TerminalPane::new(
             id.as_bytes().to_vec(),
             terminal.manager,
             terminal.surface,
             None,
             ctx,
-        )
-        .with_persistent_session(id)
+        );
+        if defer_conversations {
+            pane.pending_persistent_snapshot = snapshot;
+        }
+        if let Some(name) = name {
+            pane.pane_configuration().update(ctx, |configuration, ctx| {
+                configuration.set_custom_vertical_tabs_title(name, ctx);
+            });
+        }
+        pane
     }
 
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
     pub(crate) fn attach_persistent_terminal(
         &mut self,
         layout: PersistentTerminalLayout,
-        replace: Option<PaneId>,
+        replace: PaneId,
         ctx: &mut ViewContext<Self>,
     ) {
         let resources = TerminalViewResources {
@@ -3516,26 +3589,138 @@ impl PaneGroup {
             server_api: self.server_api.clone(),
             model_event_sender: None,
         };
+        let custom_title = self.content_by_pane_id(replace).and_then(|pane| {
+            pane.as_pane()
+                .pane_configuration()
+                .as_ref(ctx)
+                .custom_vertical_tabs_title()
+                .map(str::to_owned)
+        });
         let view_size = Self::estimated_view_bounds(ctx).size();
+        let snapshot = self
+            .downcast_pane_by_id::<TerminalPane>(replace)
+            .and_then(|pane| {
+                if let LeafContents::Terminal(snapshot)
+                | LeafContents::PersistentTerminal { snapshot, .. } = pane.snapshot(ctx)
+                {
+                    Some(snapshot)
+                } else {
+                    None
+                }
+            });
+        let old_view = self.terminal_view_from_pane_id(replace, ctx);
+        let history = BlocklistAIHistoryModel::as_ref(ctx);
+        let active_conversation = old_view
+            .as_ref()
+            .and_then(|view| history.active_conversation(view.id()))
+            .map(AIConversation::id);
+        let live_conversations: Vec<_> = old_view
+            .as_ref()
+            .into_iter()
+            .flat_map(|view| {
+                history
+                    .all_live_conversations_for_terminal_surface(view.id())
+                    .cloned()
+            })
+            .collect();
+        let conversation_ids: Vec<_> = live_conversations.iter().map(AIConversation::id).collect();
+        let layout = PersistentTerminalLayout {
+            name: custom_title.or(layout.name),
+            snapshot: snapshot.or(layout.snapshot),
+            live_conversations,
+            ..layout
+        };
         let pane = Self::create_persistent_pane(layout, resources, view_size, ctx);
-        if let Some(existing) = replace {
-            self.replace_pane(existing, pane, false, ctx);
-        } else {
-            let relative_to = self.focused_pane_id(ctx);
-            self.add_pane(
-                Direction::Right,
-                Some(relative_to),
-                Box::new(pane),
-                true,
-                ctx,
-            );
+        let new_view_id = pane.terminal_view(ctx).id();
+        BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+            for conversation_id in conversation_ids {
+                history.set_active_conversation_id(conversation_id, new_view_id, ctx);
+            }
+            if let Some(conversation_id) = active_conversation {
+                history.set_active_conversation_id(conversation_id, new_view_id, ctx);
+            }
+        });
+        self.replace_pane(replace, pane, false, ctx);
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn persistent_session_id(&self, pane_id: PaneId, ctx: &AppContext) -> Option<Uuid> {
+        self.downcast_pane_by_id::<TerminalPane>(pane_id)?
+            .persistent_session_id(ctx)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn persistent_session_is_attached(&self, pane_id: PaneId, ctx: &AppContext) -> bool {
+        self.downcast_pane_by_id::<TerminalPane>(pane_id)
+            .is_some_and(|pane| {
+                pane.terminal_manager(ctx)
+                    .as_ref(ctx)
+                    .persistent_session_is_attached()
+            })
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn persistent_session_can_retain(&self, pane_id: PaneId, ctx: &AppContext) -> bool {
+        self.downcast_pane_by_id::<TerminalPane>(pane_id)
+            .is_some_and(|pane| {
+                pane.terminal_manager(ctx)
+                    .as_ref(ctx)
+                    .persistent_session_can_retain()
+            })
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn find_persistent_session(&self, id: Uuid, ctx: &AppContext) -> Option<PaneId> {
+        self.panes
+            .visible_pane_ids()
+            .into_iter()
+            .find(|&pane_id| self.persistent_session_id(pane_id, ctx) == Some(id))
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn set_persistent_session_ending(
+        &self,
+        pane_id: PaneId,
+        id: Uuid,
+        ending: bool,
+        ctx: &AppContext,
+    ) -> bool {
+        self.downcast_pane_by_id::<TerminalPane>(pane_id)
+            .is_some_and(|pane| {
+                pane.persistent_session_id(ctx) == Some(id)
+                    && pane.persistent_session_ending.replace(ending) != ending
+            })
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn detach_persistent_session(
+        &mut self,
+        pane_id: PaneId,
+        id: Uuid,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane) = self.downcast_pane_by_id::<TerminalPane>(pane_id) else {
+            return;
+        };
+        let manager = pane.terminal_manager(ctx);
+        let manager = manager.as_ref(ctx);
+        if manager.persistent_session_id() == Some(id) {
+            manager.mark_persistent_session_retained();
+            manager.disconnect_persistent_session();
+            self.close_ended_persistent_session(pane_id, id, ctx);
         }
     }
 
-    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
-    pub(crate) fn persistent_session_id(&self, pane_id: PaneId) -> Option<Uuid> {
-        self.downcast_pane_by_id::<TerminalPane>(pane_id)?
-            .persistent_session_id()
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    pub(crate) fn close_ended_persistent_session(
+        &mut self,
+        pane_id: PaneId,
+        id: Uuid,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.find_persistent_session(id, ctx) == Some(pane_id) {
+            self.close_pane_internal(pane_id, false, ctx);
+        }
     }
 
     /// Constructs a new [`PaneGroup`] with a layout that adheres
@@ -3618,7 +3803,7 @@ impl PaneGroup {
                     pane_history,
                     ctx,
                 ),
-                #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+                #[cfg(all(target_os = "macos", feature = "local_tty"))]
                 PanesLayout::PersistentTerminal(layout) => {
                     let pane =
                         Self::create_persistent_pane(*layout, resources, view_bounds.size(), ctx);
@@ -4898,6 +5083,15 @@ impl PaneGroup {
     }
 
     pub fn close_pane(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        self.close_pane_internal(pane_id, true, ctx);
+    }
+
+    fn close_pane_internal(
+        &mut self,
+        pane_id: PaneId,
+        allow_undo: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
         // Don't close a pane that doesn't exist
         if !self.pane_contents.contains_key(&pane_id) {
             return;
@@ -4955,7 +5149,7 @@ impl PaneGroup {
             self.remove_child_agent_panes(terminal_view.id(), ctx);
         }
 
-        if FeatureFlag::UndoClosedPanes.is_enabled() {
+        if allow_undo && FeatureFlag::UndoClosedPanes.is_enabled() {
             // Don't clase a pane that's already been hidden to allow for undo functionality
             if self.is_pane_hidden_for_close(pane_id) {
                 return;
@@ -5000,13 +5194,13 @@ impl PaneGroup {
                 ctx,
             );
         } else {
-            if self.pane_count() == 1 {
+            if self.panes.visible_pane_count() == 1 {
                 // Tell the workspace that this pane group is now empty without
                 // doing any additional clean-up work.  This ensures we don't
                 // pre-emptively delete any state that we might want to retain
                 // if the user re-opens the closed tab.
                 ctx.emit(Event::Exited {
-                    add_to_undo_stack: true,
+                    add_to_undo_stack: allow_undo,
                 });
 
                 return;
@@ -7059,7 +7253,11 @@ impl PaneGroup {
     }
 
     /// Returns the count of visible panes (excluding hidden panes).
-    #[cfg(any(test, feature = "integration_tests"))]
+    #[cfg(any(
+        test,
+        feature = "integration_tests",
+        all(target_os = "macos", feature = "local_tty")
+    ))]
     pub fn visible_pane_count(&self) -> usize {
         self.panes.visible_pane_count()
     }

@@ -138,7 +138,7 @@ pub enum LeafContents {
     Terminal(TerminalPaneSnapshot),
     PersistentTerminal {
         id: uuid::Uuid,
-        is_active: bool,
+        snapshot: TerminalPaneSnapshot,
     },
     Notebook(NotebookPaneSnapshot),
     AIDocument(AIDocumentPaneSnapshot),

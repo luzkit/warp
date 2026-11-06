@@ -10204,6 +10204,12 @@ impl TerminalView {
             SessionsEvent::SessionBootstrapped(event) => {
                 self.handle_session_bootstrapped(*event, ctx);
             }
+            SessionsEvent::SessionRestored { .. } => {
+                self.is_login_shell_bootstrapped = true;
+                self.hide_slow_bootstrap_banner(ctx);
+                self.input.update(ctx, |_, ctx| ctx.notify());
+                ctx.notify();
+            }
             _ => {}
         }
     }
@@ -12566,6 +12572,10 @@ impl TerminalView {
 
     fn handle_terminal_event(&mut self, event: &ModelEvent, ctx: &mut ViewContext<Self>) {
         match event {
+            ModelEvent::PersistentReplayFinished { .. } => {
+                self.refresh_warp_prompt(ctx);
+                ctx.notify();
+            }
             ModelEvent::TerminalClear => {
                 self.handle_terminal_wakeup((), ctx);
                 self.update_scroll_position_locking(ScrollPositionUpdate::AfterClear, ctx);

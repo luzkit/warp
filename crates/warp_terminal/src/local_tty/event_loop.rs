@@ -141,6 +141,17 @@ enum ChannelResult {
     ReplaceShell,
 }
 
+type ReplayHandler<M> = Box<dyn FnOnce(&mut M, &mut ansi::Processor, &[u8]) + Send>;
+
+enum PersistentReplay<M> {
+    Raw(Vec<u8>),
+    NativeStartup(Vec<u8>),
+    NativeReattach {
+        bytes: Vec<u8>,
+        apply: ReplayHandler<M>,
+    },
+}
+
 impl<P, M> EventLoop<P, M>
 where
     P: local_tty::EventedPty + Send + 'static,
@@ -338,10 +349,27 @@ where
 
     /// Renders retained output before entering live I/O with a persistent PTY owner.
     pub fn spawn_with_persistent_replay(self, replay: Vec<u8>) -> JoinHandle<Receiver<Message>> {
-        self.spawn_inner(Some(replay))
+        self.spawn_inner(Some(PersistentReplay::Raw(replay)))
     }
 
-    fn spawn_inner(mut self, replay: Option<Vec<u8>>) -> JoinHandle<Receiver<Message>> {
+    /// Processes output from a newly launched Warp shell before entering live I/O.
+    pub fn spawn_with_native_persistent(self, buffered: Vec<u8>) -> JoinHandle<Receiver<Message>> {
+        self.spawn_inner(Some(PersistentReplay::NativeStartup(buffered)))
+    }
+
+    /// Applies native reattachment state before live PTY bytes can arrive.
+    pub fn spawn_with_native_persistent_replay(
+        self,
+        replay: Vec<u8>,
+        apply: impl FnOnce(&mut M, &mut ansi::Processor, &[u8]) + Send + 'static,
+    ) -> JoinHandle<Receiver<Message>> {
+        self.spawn_inner(Some(PersistentReplay::NativeReattach {
+            bytes: replay,
+            apply: Box::new(apply),
+        }))
+    }
+
+    fn spawn_inner(mut self, replay: Option<PersistentReplay<M>>) -> JoinHandle<Receiver<Message>> {
         #[cfg(test)]
         let feature_flag_overrides = warp_core::features::get_overrides();
 
@@ -356,11 +384,27 @@ where
                 let persistent = replay.is_some();
                 let mut state = State::default();
                 if let Some(replay) = replay {
-                    state.parser = ansi::Processor::terminal_only();
                     let mut model = self.terminal.lock();
-                    let mut sink = io::sink();
-                    state.parser.parse_bytes(&mut *model, &replay, &mut sink);
-                    state.parser.finish_sync_output(&mut *model, &mut sink);
+                    match replay {
+                        PersistentReplay::Raw(bytes) => {
+                            state.parser = ansi::Processor::terminal_only();
+                            let mut sink = io::sink();
+                            state.parser.parse_bytes(&mut *model, &bytes, &mut sink);
+                            state.parser.finish_sync_output(&mut *model, &mut sink);
+                        }
+                        PersistentReplay::NativeStartup(bytes) => {
+                            let mut responses = Vec::new();
+                            state
+                                .parser
+                                .parse_bytes(&mut *model, &bytes, &mut responses);
+                            if !responses.is_empty() {
+                                state.write_list.push_back(Cow::Owned(responses));
+                            }
+                        }
+                        PersistentReplay::NativeReattach { bytes, apply } => {
+                            apply(&mut *model, &mut state.parser, &bytes);
+                        }
+                    }
                     self.event_listener.send_wakeup_event();
                 }
                 let mut disconnected = false;

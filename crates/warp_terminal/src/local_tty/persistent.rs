@@ -1,5 +1,6 @@
 //! Local transport for PTYs whose lifetime is independent of a Warp window.
 
+mod checkpoint;
 mod worker;
 
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -14,6 +15,8 @@ use std::time::Duration;
 use std::{fmt, thread};
 
 use anyhow::{Context as _, Result, bail, ensure};
+use bincode::Options as _;
+pub use checkpoint::{CheckpointFrame, NativeCheckpoint};
 use command::blocking::Command;
 use instant::Instant;
 use nix::fcntl::{FlockArg, flock};
@@ -21,15 +24,23 @@ use nix::unistd::{geteuid, getpeereid};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use warp_core::SessionId;
 
 use crate::SizeInfo;
+use crate::local_tty::PtyOptions;
+use crate::local_tty::shell::ShellStarter;
+use crate::shell::{ShellLaunchData, ShellType};
 
 const MAGIC: [u8; 4] = *b"WPPT";
+const NATIVE_STARTUP_MAGIC: [u8; 4] = *b"WPPN";
 const VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024;
+const MAX_NATIVE_STARTUP_BYTES: usize = 1024 * 1024;
 const MAX_SESSIONS: usize = 8;
 const DEFAULT_HISTORY_BYTES: usize = 1024 * 1024;
 const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_NATIVE_PREFIX_BYTES: usize = 256 * 1024;
+const MAX_CHECKPOINT_BYTES: usize = 256 * 1024;
 const MAX_SOCKET_PATH_BYTES: usize = 103;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -50,6 +61,20 @@ pub struct Session {
     pub name: Option<String>,
     pub pid: Option<u32>,
     pub state: SessionState,
+    #[serde(default = "retained_by_default")]
+    pub retained: bool,
+}
+
+fn retained_by_default() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NativeShell {
+    pub session_id: SessionId,
+    pub shell_type: ShellType,
+    pub launch_data: ShellLaunchData,
+    pub pane_uuid: Option<Uuid>,
 }
 
 /// A single writer lease. Dropping the stream releases it.
@@ -58,6 +83,12 @@ pub struct Attachment {
     pub replay: Vec<u8>,
     pub pid: u32,
     pub truncated: bool,
+    pub replay_gap: bool,
+    pub retained: bool,
+    pub native_shell: Option<NativeShell>,
+    pub startup_replay: Vec<u8>,
+    pub checkpoint: Option<Box<NativeCheckpoint>>,
+    pub replay_offset: Option<u64>,
 }
 
 impl fmt::Debug for Attachment {
@@ -66,7 +97,10 @@ impl fmt::Debug for Attachment {
             .debug_struct("Attachment")
             .field("pid", &self.pid)
             .field("replay_len", &self.replay.len())
+            .field("startup_replay_len", &self.startup_replay.len())
             .field("truncated", &self.truncated)
+            .field("replay_gap", &self.replay_gap)
+            .field("retained", &self.retained)
             .finish_non_exhaustive()
     }
 }
@@ -77,7 +111,7 @@ pub struct Runtime {
 }
 
 #[derive(Deserialize, Serialize)]
-struct Startup {
+struct RawStartup {
     shell: PathBuf,
     directory: Option<PathBuf>,
     name: Option<String>,
@@ -86,10 +120,24 @@ struct Startup {
 }
 
 #[derive(Deserialize, Serialize)]
+struct NativeStartup {
+    options: PtyOptions,
+    name: Option<String>,
+    history_bytes: usize,
+}
+
+enum Startup {
+    Raw(RawStartup),
+    Native(NativeStartup),
+}
+
+#[derive(Deserialize, Serialize)]
 enum Request {
     Status,
     Attach,
+    AttachWithCheckpoint,
     Rename(Option<String>),
+    Retain,
     Terminate,
     Resize(SizeInfo),
 }
@@ -101,6 +149,20 @@ enum Response {
         pid: u32,
         replay_len: usize,
         truncated: bool,
+    },
+    NativeAttached {
+        pid: u32,
+        replay_len: usize,
+        truncated: bool,
+        retained: bool,
+        shell: NativeShell,
+        startup_replay_len: usize,
+        #[serde(default)]
+        replay_gap: Option<bool>,
+        #[serde(default)]
+        checkpoint_len: Option<usize>,
+        #[serde(default)]
+        replay_offset: Option<u64>,
     },
     Ok,
     Error(String),
@@ -148,14 +210,7 @@ impl Runtime {
             shell.is_absolute(),
             "Persistent terminal shell must be an absolute path"
         );
-        let history_bytes = match std::env::var("WARP_PERSISTENT_PTY_HISTORY_BYTES") {
-            Ok(value) => value
-                .parse()
-                .context("Invalid persistent terminal history limit")?,
-            Err(std::env::VarError::NotPresent) => DEFAULT_HISTORY_BYTES,
-            Err(err) => return Err(err).context("Invalid persistent terminal history limit"),
-        };
-        validate_history_bytes(history_bytes)?;
+        let history_bytes = configured_history_bytes()?;
 
         validate_directory(&self.path)?;
         let lock_path = self.path.join("lock");
@@ -174,8 +229,8 @@ impl Runtime {
         flock(lock.as_raw_fd(), FlockArg::LockExclusive)?;
 
         let mut count = 0;
-        for id in self.session_ids()? {
-            match self.connect(id) {
+        for id in self.session_ids(false)? {
+            match self.connect_socket(self.socket_path(id)) {
                 Err(err) if is_stale_socket(&err) => {
                     let _ = fs::remove_file(self.socket_path(id));
                 }
@@ -187,14 +242,37 @@ impl Runtime {
             "Persistent terminal session limit reached"
         );
 
-        let id = Uuid::new_v4();
-        let startup = Startup {
+        self.start_worker(Startup::Raw(RawStartup {
             shell: shell.to_owned(),
             directory: directory.map(Path::to_owned),
             name,
             size: *size,
             history_bytes,
-        };
+        }))
+    }
+
+    /// Starts an ordinary local shell with a lease that must be retained explicitly.
+    pub fn create_native(&self, options: PtyOptions, name: Option<String>) -> Result<Session> {
+        validate_name(name.as_deref())?;
+        ensure!(
+            matches!(options.shell_starter, ShellStarter::Direct(_)),
+            "Persistent native terminals require a local shell executable"
+        );
+        self.start_worker(Startup::Native(NativeStartup {
+            options,
+            name,
+            history_bytes: configured_history_bytes()?,
+        }))
+    }
+
+    fn start_worker(&self, startup: Startup) -> Result<Session> {
+        validate_directory(&self.path)?;
+        let id = Uuid::new_v4();
+        let socket_path = self.startup_socket_path(id, &startup);
+        ensure!(
+            socket_path.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH_BYTES,
+            "Persistent terminal runtime path is too long for a macOS socket"
+        );
         let mut command = Command::new(std::env::current_exe()?);
         command
             .arg(WORKER_ARG)
@@ -222,7 +300,7 @@ impl Runtime {
                 .stdin
                 .take()
                 .context("Missing persistent terminal startup pipe")?;
-            write_frame(&mut stdin, &startup)?;
+            write_startup(&mut stdin, &startup)?;
             drop(stdin);
 
             let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -251,7 +329,7 @@ impl Runtime {
             Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = fs::remove_file(self.socket_path(id));
+                let _ = fs::remove_file(socket_path);
                 Err(err)
             }
         }
@@ -259,15 +337,17 @@ impl Runtime {
 
     pub fn list(&self) -> Result<Vec<Session>> {
         Ok(self
-            .session_ids()?
+            .session_ids(true)?
             .into_iter()
-            .map(|id| {
-                self.status(id).unwrap_or(Session {
+            .filter_map(|id| {
+                let session = self.status(id).unwrap_or(Session {
                     id,
                     name: None,
                     pid: None,
                     state: SessionState::Failed,
-                })
+                    retained: true,
+                });
+                session.retained.then_some(session)
             })
             .collect())
     }
@@ -277,19 +357,75 @@ impl Runtime {
     }
 
     pub fn attach(&self, id: Uuid) -> Result<Attachment> {
-        let (mut stream, response) = self.request(id, Request::Attach)?;
-        let Response::Attached {
+        let mut stream = self.connect(id)?;
+        write_frame(&mut stream, &Request::AttachWithCheckpoint)?;
+        let response = read_frame(&mut stream)?;
+        let (mut stream, response) = match response {
+            Response::Error(error)
+                if error == "Invalid or incompatible persistent terminal request" =>
+            {
+                self.request(id, Request::Attach)?
+            }
+            Response::Error(error) => bail!("{error}"),
+            response => (stream, response),
+        };
+        let (
             pid,
             replay_len,
             truncated,
-        } = response
-        else {
-            bail!("Unexpected persistent terminal attach response");
+            replay_gap,
+            retained,
+            native_shell,
+            startup_replay_len,
+            checkpoint_len,
+            replay_offset,
+        ) = match response {
+            Response::Attached {
+                pid,
+                replay_len,
+                truncated,
+            } => (
+                pid, replay_len, truncated, truncated, true, None, 0, 0, None,
+            ),
+            Response::NativeAttached {
+                pid,
+                replay_len,
+                truncated,
+                retained,
+                shell,
+                startup_replay_len,
+                replay_gap,
+                checkpoint_len,
+                replay_offset,
+            } => (
+                pid,
+                replay_len,
+                truncated,
+                replay_gap.unwrap_or(truncated),
+                retained,
+                Some(shell),
+                startup_replay_len,
+                checkpoint_len.unwrap_or(0),
+                replay_offset,
+            ),
+            _ => bail!("Unexpected persistent terminal attach response"),
         };
         ensure!(
-            replay_len <= MAX_HISTORY_BYTES,
+            replay_len <= MAX_HISTORY_BYTES && startup_replay_len <= MAX_NATIVE_PREFIX_BYTES,
             "Persistent terminal replay exceeds its limit"
         );
+        let checkpoint = if checkpoint_len == 0 {
+            None
+        } else {
+            let payload = read_payload(&mut stream, checkpoint_len, MAX_CHECKPOINT_BYTES)?;
+            let checkpoint: NativeCheckpoint = checkpoint_codec().deserialize(&payload)?;
+            checkpoint.validate(replay_offset, replay_len)?;
+            Some(Box::new(checkpoint))
+        };
+        let mut startup_replay = vec![0; startup_replay_len];
+        stream
+            .read_exact(&mut startup_replay)
+            .context("Could not read persistent terminal startup replay")?;
         let mut replay = vec![0; replay_len];
         stream
             .read_exact(&mut replay)
@@ -302,7 +438,24 @@ impl Runtime {
             replay,
             pid,
             truncated,
+            replay_gap,
+            retained,
+            native_shell,
+            startup_replay,
+            checkpoint,
+            replay_offset,
         })
+    }
+
+    /// Keeps an attached session alive after its current and future leases disconnect.
+    pub fn retain(&self, id: Uuid) -> Result<()> {
+        if self.status(id)?.retained {
+            return Ok(());
+        }
+        match self.request(id, Request::Retain)?.1 {
+            Response::Ok => Ok(()),
+            _ => bail!("Unexpected persistent terminal retain response"),
+        }
     }
 
     pub fn rename(&self, id: Uuid, name: Option<String>) -> Result<Session> {
@@ -342,8 +495,18 @@ impl Runtime {
     }
 
     fn connect(&self, id: Uuid) -> Result<UnixStream> {
+        let native_path = self.native_socket_path(id);
+        match fs::symlink_metadata(&native_path) {
+            Ok(_) => self.connect_socket(native_path),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                self.connect_socket(self.socket_path(id))
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn connect_socket(&self, path: PathBuf) -> Result<UnixStream> {
         validate_directory(&self.path)?;
-        let path = self.socket_path(id);
         let metadata = fs::symlink_metadata(&path)?;
         ensure!(
             metadata.file_type().is_socket() && private_metadata(&metadata, 0o600),
@@ -360,7 +523,18 @@ impl Runtime {
         self.path.join(id.simple().to_string())
     }
 
-    fn session_ids(&self) -> Result<Vec<Uuid>> {
+    fn native_socket_path(&self, id: Uuid) -> PathBuf {
+        self.path.join(format!("n{}", id.simple()))
+    }
+
+    fn startup_socket_path(&self, id: Uuid, startup: &Startup) -> PathBuf {
+        match startup {
+            Startup::Raw(_) => self.socket_path(id),
+            Startup::Native(_) => self.native_socket_path(id),
+        }
+    }
+
+    fn session_ids(&self, include_native: bool) -> Result<Vec<Uuid>> {
         validate_directory(&self.path)?;
         let mut ids = Vec::new();
         for entry in fs::read_dir(&self.path)? {
@@ -368,6 +542,11 @@ impl Runtime {
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else {
                 continue;
+            };
+            let name = if include_native {
+                name.strip_prefix('n').unwrap_or(name)
+            } else {
+                name
             };
             if name.len() == 32
                 && let Ok(id) = Uuid::parse_str(name)
@@ -383,7 +562,7 @@ impl Runtime {
 }
 
 pub fn run_worker(runtime_path: PathBuf, id: Uuid) -> Result<()> {
-    let startup = read_frame(&mut io::stdin().lock())?;
+    let startup = read_startup(&mut io::stdin().lock())?;
     worker::run(&Runtime::new(runtime_path)?, id, startup)
 }
 
@@ -403,6 +582,18 @@ fn validate_history_bytes(bytes: usize) -> Result<()> {
         "Persistent terminal history limit must be between 1 and {MAX_HISTORY_BYTES} bytes"
     );
     Ok(())
+}
+
+fn configured_history_bytes() -> Result<usize> {
+    let bytes = match std::env::var("WARP_PERSISTENT_PTY_HISTORY_BYTES") {
+        Ok(value) => value
+            .parse()
+            .context("Invalid persistent terminal history limit")?,
+        Err(std::env::VarError::NotPresent) => DEFAULT_HISTORY_BYTES,
+        Err(err) => return Err(err).context("Invalid persistent terminal history limit"),
+    };
+    validate_history_bytes(bytes)?;
+    Ok(bytes)
 }
 
 fn validate_directory(path: &Path) -> Result<()> {
@@ -437,38 +628,100 @@ fn is_stale_socket(err: &anyhow::Error) -> bool {
 }
 
 fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
-    let payload = serde_json::to_vec(value)?;
+    write_payload(writer, MAGIC, &serde_json::to_vec(value)?, MAX_FRAME_BYTES)
+}
+
+fn write_payload(
+    writer: &mut impl Write,
+    magic: [u8; 4],
+    payload: &[u8],
+    max_bytes: usize,
+) -> Result<()> {
     ensure!(
-        payload.len() <= MAX_FRAME_BYTES,
+        payload.len() <= max_bytes,
         "Persistent terminal control message exceeds its limit"
     );
-    writer.write_all(&MAGIC)?;
+    writer.write_all(&magic)?;
     writer.write_all(&VERSION.to_be_bytes())?;
     writer.write_all(&(payload.len() as u32).to_be_bytes())?;
-    writer.write_all(&payload)?;
+    writer.write_all(payload)?;
     Ok(())
 }
 
 fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
-    let mut header = [0; 12];
-    reader.read_exact(&mut header)?;
+    let (magic, len) = read_header(reader)?;
     ensure!(
-        header[..4] == MAGIC,
+        magic == MAGIC,
         "Invalid persistent terminal control message"
     );
+    Ok(serde_json::from_slice(&read_payload(
+        reader,
+        len,
+        MAX_FRAME_BYTES,
+    )?)?)
+}
+
+fn read_header(reader: &mut impl Read) -> Result<([u8; 4], usize)> {
+    let mut header = [0; 12];
+    reader.read_exact(&mut header)?;
     let version = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
     ensure!(
         version == VERSION,
         "Persistent terminal protocol version {version} is incompatible with {VERSION}"
     );
     let len = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
+    Ok(([header[0], header[1], header[2], header[3]], len))
+}
+
+fn read_payload(reader: &mut impl Read, len: usize, max_bytes: usize) -> Result<Vec<u8>> {
     ensure!(
-        len <= MAX_FRAME_BYTES,
+        len <= max_bytes,
         "Persistent terminal control message exceeds its limit"
     );
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload)?;
-    Ok(serde_json::from_slice(&payload)?)
+    Ok(payload)
+}
+
+fn checkpoint_codec() -> impl bincode::Options {
+    bincode::options().with_limit(MAX_CHECKPOINT_BYTES as u64)
+}
+
+fn native_startup_codec() -> impl bincode::Options {
+    bincode::options().with_limit(MAX_NATIVE_STARTUP_BYTES as u64)
+}
+
+fn write_startup(writer: &mut impl Write, startup: &Startup) -> Result<()> {
+    match startup {
+        Startup::Raw(startup) => write_frame(writer, startup),
+        Startup::Native(startup) => {
+            // JSON cannot represent non-UTF-8 Unix environment variables.
+            let payload = native_startup_codec().serialize(startup)?;
+            write_payload(
+                writer,
+                NATIVE_STARTUP_MAGIC,
+                &payload,
+                MAX_NATIVE_STARTUP_BYTES,
+            )
+        }
+    }
+}
+
+fn read_startup(reader: &mut impl Read) -> Result<Startup> {
+    let (magic, len) = read_header(reader)?;
+    match magic {
+        MAGIC => {
+            let payload = read_payload(reader, len, MAX_FRAME_BYTES)?;
+            Ok(Startup::Raw(serde_json::from_slice(&payload)?))
+        }
+        NATIVE_STARTUP_MAGIC => {
+            let payload = read_payload(reader, len, MAX_NATIVE_STARTUP_BYTES)?;
+            Ok(Startup::Native(
+                native_startup_codec().deserialize(&payload)?,
+            ))
+        }
+        _ => bail!("Invalid persistent terminal startup message"),
+    }
 }
 
 #[cfg(test)]

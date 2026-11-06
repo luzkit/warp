@@ -357,9 +357,62 @@ impl<'a> ProcessorInput<'a> {
     }
 }
 
+// VTE does not expose its current state. Track sequence boundaries so a control sequence cannot
+// gain live side effects merely because its final bytes arrive after retained history.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SequenceBoundary {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsIgnore,
+    Dcs,
+    Osc,
+    Opaque,
+    Utf8,
+}
+
+impl SequenceBoundary {
+    fn advance(self, byte: u8) -> Self {
+        if self == Self::Utf8 {
+            return self;
+        }
+        match byte {
+            0x18 | 0x1a => return Self::Ground,
+            0x1b => return Self::Escape,
+            _ => {}
+        }
+        match (self, byte) {
+            (Self::Ground, 0xc2..=0xf4) => Self::Utf8,
+            (Self::Escape, b'[') => Self::Csi,
+            (Self::Escape, b']') => Self::Osc,
+            (Self::Escape, b'P') => Self::DcsEntry,
+            (Self::Escape, b'X' | b'^' | b'_') => Self::Opaque,
+            (Self::Escape, 0x20..=0x2f) => Self::EscapeIntermediate,
+            (Self::Escape | Self::EscapeIntermediate, 0x30..=0x7e)
+            | (Self::Csi, 0x40..=0x7e)
+            | (Self::Osc, 0x07)
+            | (Self::Dcs | Self::DcsIgnore | Self::Opaque, 0x9c) => Self::Ground,
+            (Self::DcsEntry | Self::DcsParam, 0x20..=0x2f) => Self::DcsIntermediate,
+            (Self::DcsEntry, 0x30..=0x3f) => Self::DcsParam,
+            (Self::DcsParam, 0x3c..=0x3f) | (Self::DcsIntermediate, 0x30..=0x3f) => Self::DcsIgnore,
+            (Self::DcsEntry | Self::DcsParam | Self::DcsIntermediate, 0x40..=0x7e) => Self::Dcs,
+            _ => self,
+        }
+    }
+}
+
 /// Internal state for VTE processor.
 struct ProcessorState {
     terminal_only: bool,
+    replaying: bool,
+    replay_pending: bool,
+    replay_pending_kv_hook: bool,
+    sequence_boundary: SequenceBoundary,
     preceding_char: Option<char>,
     dcs_data: DcsData,
     apc_data: Vec<u8>,
@@ -370,6 +423,8 @@ struct ProcessorState {
 pub struct Processor {
     state: ProcessorState,
     parser: VteParser,
+    replaying: bool,
+    replay_continuation_active: bool,
 }
 
 impl Default for Processor {
@@ -377,12 +432,18 @@ impl Default for Processor {
         Processor {
             state: ProcessorState {
                 terminal_only: false,
+                replaying: false,
+                replay_pending: false,
+                replay_pending_kv_hook: false,
+                sequence_boundary: SequenceBoundary::Ground,
                 preceding_char: None,
                 dcs_data: DcsData::default(),
                 apc_data: vec![],
                 sync_output: SyncOutputState::Inactive,
             },
             parser: VteParser::new(),
+            replaying: false,
+            replay_continuation_active: false,
         }
     }
 }
@@ -393,10 +454,19 @@ impl Processor {
     }
 
     /// Creates a parser for a raw PTY stream with terminal state changes only.
-    pub(crate) fn terminal_only() -> Self {
+    pub fn terminal_only() -> Self {
         let mut processor = Self::new();
         processor.state.terminal_only = true;
         processor
+    }
+
+    /// Applies retained bytes without sending terminal replies or triggering external actions.
+    pub fn replay_bytes<H: Handler>(&mut self, handler: &mut H, bytes: &[u8]) {
+        self.replaying = true;
+        let mut sink = io::sink();
+        self.parse_bytes(handler, bytes, &mut sink);
+        self.finish_sync_output(handler, &mut sink);
+        self.replaying = false;
     }
 
     /// Advance the parser by a series of bytes. If the addition of the bytes trigger any actions,
@@ -463,8 +533,28 @@ impl Processor {
             // improve performance: while the performer ctor is cheap, there is still a non-zero cost
             // that adds up if we do this per-byte. Implementing this is a challenge due to the fact
             // that the performer requires a mutable reference to [`ProcessorState`].
-            let mut performer = Performer::new(&mut self.state, handler, writer);
-            self.parser.advance(&mut performer, byte);
+            self.state.replaying = self.replaying || self.state.replay_pending;
+            if !self.replaying && self.state.replay_pending && !self.replay_continuation_active {
+                handler.start_replay_continuation();
+                self.replay_continuation_active = true;
+            }
+            let starts_escape =
+                byte == 0x1b && self.state.sequence_boundary != SequenceBoundary::Utf8;
+            self.state.sequence_boundary = self.state.sequence_boundary.advance(byte);
+            if self.state.replaying {
+                let mut sink = io::sink();
+                let mut performer = Performer::new(&mut self.state, handler, &mut sink);
+                self.parser.advance(&mut performer, byte);
+            } else {
+                let mut performer = Performer::new(&mut self.state, handler, writer);
+                self.parser.advance(&mut performer, byte);
+            }
+            self.state.replay_pending = self.state.sequence_boundary != SequenceBoundary::Ground
+                && (self.replaying || (!starts_escape && self.state.replay_pending));
+            if !self.state.replay_pending && self.replay_continuation_active {
+                handler.finish_replay_continuation();
+                self.replay_continuation_active = false;
+            }
             return;
         };
 
@@ -593,7 +683,7 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
     /// assumes that the hook was encoded originally.
     fn handle_decoded_hook(&mut self, hook: Result<DProtoHook, serde_json::Error>) {
         if let Ok(ref hook) = hook
-            && !self.validate_hook_session_id(hook)
+            && (!self.should_apply_hook(hook) || !self.validate_hook_session_id(hook))
         {
             return;
         }
@@ -628,6 +718,7 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
             Ok(DProtoHook::FinishUpdate { value }) => self.handler.finish_update(value),
             Ok(DProtoHook::ExitShell { value }) => self.handler.exit_shell(value),
 
+            Err(_) if self.state.replaying => (),
             Err(e) => safe_error!(
                 safe: ("Error when deserializing escape sequence data"),
                 full: ("Error when deserializing escape sequence data: {:?}", e)
@@ -644,7 +735,7 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
         // that might otherwise corrupt parsing of the PTY output (the same can't be said for the
         // payloads of other DCS hooks).
         if let Ok(ref hook) = hook
-            && !self.validate_hook_session_id(hook)
+            && (!self.should_apply_hook(hook) || !self.validate_hook_session_id(hook))
         {
             return;
         }
@@ -659,10 +750,26 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
             Ok(_) => {
                 report_error!("Received non hex-encoded hook that is not SourcedRcFileForWarp");
             }
+            Err(_) if self.state.replaying => (),
             Err(err) => {
                 log::warn!("Received malformed SourcedRcFileForWarp hook {err:#}");
             }
         }
+    }
+
+    fn should_apply_hook(&self, hook: &DProtoHook) -> bool {
+        !self.state.replaying
+            || matches!(
+                hook,
+                DProtoHook::CommandFinished { .. }
+                    | DProtoHook::Precmd { .. }
+                    | DProtoHook::Preexec { .. }
+                    | DProtoHook::Bootstrapped { .. }
+                    | DProtoHook::InitShell { .. }
+                    | DProtoHook::SSH { .. }
+                    | DProtoHook::ExitShell { .. }
+                    | DProtoHook::Clear { .. }
+            )
     }
 
     /// Handles hex-encoded data from a DCS or an OSC by decoding it and then handling the
@@ -670,17 +777,22 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
     fn handle_decoded_data(&mut self, decoded_data: Result<Vec<u8>, hex::FromHexError>) {
         match decoded_data {
             Ok(decoded_data) => {
-                safe_debug!(
-                    safe: ("Decoded payload"),
-                    full: ("Decoded payload string: {:?}", std::str::from_utf8(&decoded_data))
-                );
+                if !self.state.replaying {
+                    safe_debug!(
+                        safe: ("Decoded payload"),
+                        full: ("Decoded payload string: {:?}", std::str::from_utf8(&decoded_data))
+                    );
+                }
 
                 let hook = serde_json::from_slice::<DProtoHook>(&decoded_data);
-                if let Ok(hook) = &hook {
+                if !self.state.replaying
+                    && let Ok(hook) = &hook
+                {
                     log::info!("Received {} hook", hook.name());
                 }
                 self.handle_decoded_hook(hook);
             }
+            Err(_) if self.state.replaying => (),
             Err(e) => safe_error!(
                 safe: ("Error when decoding payload"),
                 full: ("Error when decoding payload: {:?}", e)
@@ -695,9 +807,12 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
                     log::warn!("Start pending hook OSC did not contain shell hook");
                     return;
                 };
+                self.state.replay_pending_kv_hook = self.state.replaying;
                 self.handler.start_receiving_hook(hook.into());
             }
             Some(&WARP_KV_END_BYTE) => {
+                let continued_replay =
+                    std::mem::take(&mut self.state.replay_pending_kv_hook) && !self.state.replaying;
                 let Some(pending_shell_hook) = self.handler.finish_receiving_hook() else {
                     return;
                 };
@@ -708,11 +823,21 @@ impl<'a, H: Handler + 'a, W: io::Write> Performer<'a, H, W> {
                         return;
                     }
                 };
-                safe_debug!(
-                    safe: ("Decoded payload"),
-                    full: ("Decoded payload string: {:?}", serde_json::to_string(&hook))
-                );
+                if continued_replay {
+                    self.handler.start_replay_continuation();
+                    self.state.replaying = true;
+                }
+                if !self.state.replaying {
+                    safe_debug!(
+                        safe: ("Decoded payload"),
+                        full: ("Decoded payload string: {:?}", serde_json::to_string(&hook))
+                    );
+                }
                 self.handle_decoded_hook(Ok(hook));
+                if continued_replay {
+                    self.state.replaying = false;
+                    self.handler.finish_replay_continuation();
+                }
             }
             Some(&WARP_KV_ENTRY_BYTE) => {
                 let Some(key) = params.get(3) else {
@@ -746,6 +871,7 @@ where
 {
     #[inline]
     fn print(&mut self, c: char) {
+        self.state.sequence_boundary = SequenceBoundary::Ground;
         self.handler.input(c);
         self.state.preceding_char = Some(c);
     }
@@ -760,7 +886,7 @@ where
                 self.handler.linefeed();
             }
             C0::BEL => {
-                if !self.state.terminal_only {
+                if !self.state.terminal_only && !self.state.replaying {
                     self.handler.bell();
                 }
             }
@@ -790,10 +916,12 @@ where
         match self.state.dcs_data.final_char {
             HEX_ENCODED_JSON_MARKER => {
                 let dcs_data_str = String::from_utf8_lossy(&self.state.dcs_data.data);
-                safe_debug!(
-                    safe: ("Received DCS string"),
-                    full: ("Received DCS string with JSON payload: {:?}", dcs_data_str)
-                );
+                if !self.state.replaying {
+                    safe_debug!(
+                        safe: ("Received DCS string"),
+                        full: ("Received DCS string with JSON payload: {:?}", dcs_data_str)
+                    );
+                }
                 let decoded_data = hex::decode(&*dcs_data_str);
                 self.handle_decoded_data(decoded_data);
             }
@@ -825,6 +953,15 @@ where
         }
 
         let terminal_only = self.state.terminal_only;
+        let replaying = self.state.replaying;
+        if replaying
+            && matches!(
+                params.first().copied(),
+                Some(b"9" | b"52" | b"777" | b"781378")
+            )
+        {
+            return;
+        }
         if terminal_only
             && !matches!(
                 params.first().copied(),
@@ -846,7 +983,7 @@ where
             return;
         }
         let unhandled = |params: &[&[u8]]| {
-            if !terminal_only {
+            if !terminal_only && !replaying {
                 debug!(
                     "[unhandled osc_dispatch]: [{}] at line {}",
                     format_params(params),
@@ -1174,10 +1311,12 @@ where
                             log::warn!("Warp OSC marker did not contain payload");
                             return;
                         };
-                        safe_debug!(
-                            safe: ("Received Warp OSC string for shell hook"),
-                            full: ("Received Warp OSC string for shell hook with JSON payload: {:?}", data_str)
-                        );
+                        if !replaying {
+                            safe_debug!(
+                                safe: ("Received Warp OSC string for shell hook"),
+                                full: ("Received Warp OSC string for shell hook with JSON payload: {:?}", data_str)
+                            );
+                        }
                         let decoded_data = hex::decode(&*data_str);
                         self.handle_decoded_data(decoded_data);
                     }
@@ -1190,10 +1329,12 @@ where
                             log::warn!("Warp OSC marker did not contain payload");
                             return;
                         };
-                        safe_debug!(
-                            safe: ("Received Warp OSC string for shell hook"),
-                            full: ("Received Warp OSC string for shell hook with JSON payload: {:?}", data_str)
-                        );
+                        if !replaying {
+                            safe_debug!(
+                                safe: ("Received Warp OSC string for shell hook"),
+                                full: ("Received Warp OSC string for shell hook with JSON payload: {:?}", data_str)
+                            );
+                        }
                         let hook = serde_json::from_str::<DProtoHook>(&data_str);
                         self.handle_unencoded_hook(hook)
                     }
@@ -1220,6 +1361,7 @@ where
                 Some(&WARP_COMPLETIONS_END_BYTE) => {
                     self.handler.end_completions_output();
                 }
+                _ if replaying => (),
                 Some(&WARP_COMPLETIONS_MATCH_RESULT_BYTE) => {
                     let Some(match_text) = decode_hex_completions_payload(params.get(2)) else {
                         log::warn!(
@@ -1402,6 +1544,7 @@ where
             ('h', intermediate) => {
                 for param in params_iter.map(|param| param[0]) {
                     match Mode::from_primitive(intermediate, param) {
+                        Some(Mode::SyncOutput) if self.state.replaying => {}
                         Some(mode) => {
                             handler.set_mode(mode);
                             if mode == Mode::SyncOutput {
@@ -1642,7 +1785,7 @@ where
     }
 
     fn apc_put(&mut self, byte: u8) {
-        if !self.state.terminal_only {
+        if !self.state.terminal_only && !self.state.replaying {
             self.state.apc_data.push(byte);
         }
     }

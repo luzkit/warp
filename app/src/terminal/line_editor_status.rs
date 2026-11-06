@@ -69,6 +69,14 @@ impl LineEditorStatus {
     }
 
     fn handle_model_event(&mut self, event: &ModelEvent, ctx: &mut ModelContext<Self>) {
+        if matches!(
+            event,
+            ModelEvent::PersistentReplayFinished { at_prompt: false }
+        ) {
+            self.set_line_editor_inactive(ctx);
+            return;
+        }
+
         let Some(active_session_id) = self.model_event_dispatcher.as_ref(ctx).active_session_id()
         else {
             return;
@@ -80,6 +88,9 @@ impl LineEditorStatus {
 
         let is_active_session_zsh = active_session.shell().shell_type() == ShellType::Zsh;
         match event {
+            ModelEvent::PersistentReplayFinished { at_prompt: true } => {
+                self.mark_line_editor_active_after_delay(LINE_EDITOR_ACTIVATION_DELAY, ctx);
+            }
             ModelEvent::Handler(AnsiHandlerEvent::Precmd) => {
                 if is_active_session_zsh {
                     self.did_receive_zsh_precmd = true;
@@ -150,3 +161,7 @@ pub enum LineEditorStatusEvent {
 impl Entity for LineEditorStatus {
     type Event = LineEditorStatusEvent;
 }
+
+#[cfg(test)]
+#[path = "line_editor_status_tests.rs"]
+mod tests;

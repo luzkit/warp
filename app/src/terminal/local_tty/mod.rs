@@ -1,10 +1,10 @@
 pub mod docker_sandbox;
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 mod persistent_pty;
 pub mod terminal_manager;
 mod terminal_view_adaptor;
 
-#[cfg(all(target_os = "macos", debug_assertions))]
+#[cfg(target_os = "macos")]
 pub(crate) use terminal_manager::PersistentPtyConnection;
 pub use terminal_manager::{TerminalManager, get_shell_starter};
 #[cfg(feature = "tui")]

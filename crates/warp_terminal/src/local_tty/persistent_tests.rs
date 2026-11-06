@@ -1,4 +1,6 @@
+use std::ffi::OsString;
 use std::fs::Permissions;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::thread::JoinHandle;
@@ -8,8 +10,59 @@ use nix::unistd::mkfifo;
 use tempfile::TempDir;
 
 use super::*;
+use crate::focus_env::TERMINAL_SESSION_UUID_ENV;
+use crate::local_tty::shell::DirectShellStarter;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+const PANE_UUID: Uuid = Uuid::from_u128(42);
+
+#[test]
+fn attachment_falls_back_to_owners_without_checkpoints() {
+    let directory = tempfile::tempdir_in("/private/tmp").unwrap();
+    let runtime = Runtime::new(directory.path().join("runtime")).unwrap();
+    let id = Uuid::new_v4();
+    let path = runtime.socket_path(id);
+    let listener = UnixListener::bind(&path).unwrap();
+    fs::set_permissions(path, Permissions::from_mode(0o600)).unwrap();
+    let (release_owner, owner_released) = std::sync::mpsc::channel();
+    let owner = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(matches!(
+            read_frame::<Request>(&mut stream).unwrap(),
+            Request::AttachWithCheckpoint
+        ));
+        write_frame(
+            &mut stream,
+            &Response::Error("Invalid or incompatible persistent terminal request".to_owned()),
+        )
+        .unwrap();
+        drop(stream);
+        let (mut stream, _) = listener.accept().unwrap();
+        assert!(matches!(
+            read_frame::<Request>(&mut stream).unwrap(),
+            Request::Attach
+        ));
+        write_frame(
+            &mut stream,
+            &Response::Attached {
+                pid: 42,
+                replay_len: 7,
+                truncated: false,
+            },
+        )
+        .unwrap();
+        stream.write_all(b"history").unwrap();
+        owner_released.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+
+    let attachment = runtime.attach(id).unwrap();
+
+    assert_eq!(attachment.replay, b"history");
+    assert!(attachment.checkpoint.is_none());
+    assert_eq!(attachment.replay_offset, None);
+    release_owner.send(()).unwrap();
+    owner.join().unwrap();
+}
 
 struct Shell {
     runtime: Runtime,
@@ -20,17 +73,33 @@ struct Shell {
 
 impl Shell {
     fn start(history_bytes: usize) -> Self {
+        Self::start_with(|directory| {
+            Startup::Raw(RawStartup {
+                shell: PathBuf::from("/bin/sh"),
+                directory: Some(directory.to_owned()),
+                name: None,
+                size: SizeInfo::new_without_font_metrics(24, 80),
+                history_bytes,
+            })
+        })
+    }
+
+    fn start_native(history_bytes: usize) -> Self {
+        Self::start_with(|directory| {
+            Startup::Native(NativeStartup {
+                options: native_options(directory),
+                name: None,
+                history_bytes,
+            })
+        })
+    }
+
+    fn start_with(startup: impl FnOnce(&Path) -> Startup) -> Self {
         let directory = tempfile::tempdir_in("/private/tmp").unwrap();
         let runtime = Runtime::new(directory.path().join("runtime")).unwrap();
         let id = Uuid::new_v4();
         let worker_runtime = runtime.clone();
-        let startup = Startup {
-            shell: PathBuf::from("/bin/sh"),
-            directory: Some(directory.path().to_owned()),
-            name: None,
-            size: SizeInfo::new_without_font_metrics(24, 80),
-            history_bytes,
-        };
+        let startup = startup(directory.path());
         let worker = thread::spawn(move || worker::run(&worker_runtime, id, startup));
         let shell = Self {
             runtime,
@@ -93,6 +162,30 @@ impl Shell {
             drop(attachment);
             self.wait_for_state(SessionState::Detached);
         }
+    }
+}
+
+fn native_options(directory: &Path) -> PtyOptions {
+    PtyOptions {
+        size: SizeInfo::new_without_font_metrics(24, 80),
+        window_id: None,
+        shell_starter: ShellStarter::Direct(DirectShellStarter::new_for_test(
+            ShellType::Bash,
+            PathBuf::from("/bin/sh"),
+            Vec::new(),
+        )),
+        start_dir: Some(directory.to_owned()),
+        env_vars: [(
+            TERMINAL_SESSION_UUID_ENV.into(),
+            PANE_UUID.simple().to_string().into(),
+        )]
+        .into(),
+        enable_ssh_wrapper: false,
+        reuse_ssh_control_master: false,
+        shell_debug_mode: false,
+        honor_ps1: false,
+        node_version_chip_enabled: false,
+        close_fds: true,
     }
 }
 
@@ -261,6 +354,153 @@ fn attach_grants_one_writer_lease() {
 }
 
 #[test]
+fn dropping_an_unretained_native_lease_reaps_its_shell() {
+    let mut shell = Shell::start_native(4096);
+    let attachment = shell.attach();
+    let pid = attachment.pid as i32;
+    assert!(!attachment.retained);
+    assert!(shell.runtime.list().unwrap().is_empty());
+
+    drop(attachment);
+    shell.worker.take().unwrap().join().unwrap().unwrap();
+
+    assert!(shell.runtime.list().unwrap().is_empty());
+    assert_eq!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+}
+
+#[test]
+fn retained_native_lease_survives_repeated_reattachment() {
+    let shell = Shell::start_native(4096);
+    let first = shell.attach();
+    let native_shell = first.native_shell.as_ref().unwrap();
+    assert_eq!(native_shell.pane_uuid, Some(PANE_UUID));
+    assert_eq!(native_shell.shell_type, ShellType::Bash);
+    let session_id = native_shell.session_id;
+    let pid = first.pid;
+
+    shell.runtime.retain(shell.id).unwrap();
+    drop(first);
+    let detached = shell.wait_for_state(SessionState::Detached);
+    assert_eq!(shell.runtime.list().unwrap(), [detached]);
+    let second = shell.attach();
+    assert!(second.retained);
+    assert_eq!(second.pid, pid);
+    assert_eq!(second.native_shell.as_ref().unwrap().session_id, session_id);
+
+    drop(second);
+    assert!(shell.wait_for_state(SessionState::Detached).retained);
+    assert_eq!(shell.attach().pid, pid);
+}
+
+#[test]
+fn native_reattachment_returns_evicted_startup_without_overlap() {
+    let shell = Shell::start_native(4096);
+    let script = shell.script(
+        r#"printf '\nstartup-marker\n'
+head -c 12000 /dev/zero | tr '\000' x
+printf '\nlatest-marker\n'
+"#,
+    );
+    let mut attachment = shell.attach();
+    shell.runtime.retain(shell.id).unwrap();
+    writeln!(attachment.stream, "/bin/sh '{}'", script.display()).unwrap();
+    read_through(&mut attachment.stream, "\nlatest-marker");
+    drop(attachment);
+    shell.wait_for_state(SessionState::Detached);
+
+    let reattached = shell.attach();
+
+    assert!(reattached.truncated);
+    assert!(!reattached.replay_gap);
+    assert!(String::from_utf8_lossy(&reattached.startup_replay).contains("\nstartup-marker"));
+    assert!(String::from_utf8_lossy(&reattached.replay).contains("\nlatest-marker"));
+    let mut combined = reattached.startup_replay;
+    combined.extend_from_slice(&reattached.replay);
+    let expected = [
+        b"\r\nstartup-marker\r\n".as_slice(),
+        &vec![b'x'; 12000],
+        b"\r\nlatest-marker",
+    ]
+    .concat();
+    assert!(
+        combined
+            .windows(expected.len())
+            .any(|window| window == expected)
+    );
+}
+
+#[test]
+fn native_reattachment_reports_gap_after_startup_prefix_limit() {
+    let shell = Shell::start_native(4096);
+    let script = shell.script(
+        r#"head -c 400000 /dev/zero | tr '\000' x
+printf '\nlatest-marker\n'
+"#,
+    );
+    let mut attachment = shell.attach();
+    shell.runtime.retain(shell.id).unwrap();
+    writeln!(attachment.stream, "/bin/sh '{}'", script.display()).unwrap();
+    read_through(&mut attachment.stream, "\nlatest-marker");
+    drop(attachment);
+    shell.wait_for_state(SessionState::Detached);
+
+    let reattached = shell.attach();
+
+    assert!(reattached.truncated);
+    assert!(reattached.replay_gap);
+    assert_eq!(reattached.startup_replay.len(), MAX_NATIVE_PREFIX_BYTES);
+    assert!(String::from_utf8_lossy(&reattached.replay).contains("\nlatest-marker"));
+}
+
+#[test]
+fn native_attachment_stays_live_while_delivering_burst_output() {
+    let shell = Shell::start_native(4096);
+    let script = shell.script(
+        r#"head -c 1000000 /dev/zero | tr '\000' x
+printf '\nburst-ended\n'
+"#,
+    );
+    let mut attachment = shell.attach();
+    writeln!(attachment.stream, "/bin/sh '{}'", script.display()).unwrap();
+    let output = read_through(&mut attachment.stream, "\nburst-ended");
+
+    assert!(output.contains(&"x".repeat(1_000_000)));
+    assert_eq!(
+        shell.runtime.status(shell.id).unwrap().state,
+        SessionState::Attached
+    );
+}
+
+#[test]
+fn native_startup_preserves_non_utf8_environment() {
+    let mut options = native_options(Path::new("/private/tmp"));
+    let value = OsString::from_vec(vec![0xfe, 0xff]);
+    options.env_vars.insert("VARIABLE".into(), value.clone());
+    let startup = Startup::Native(NativeStartup {
+        options,
+        name: None,
+        history_bytes: 4096,
+    });
+    let mut frame = Vec::new();
+    write_startup(&mut frame, &startup).unwrap();
+
+    let Startup::Native(decoded) = read_startup(&mut frame.as_slice()).unwrap() else {
+        panic!("expected native startup");
+    };
+
+    assert_eq!(
+        decoded
+            .options
+            .env_vars
+            .get(std::ffi::OsStr::new("VARIABLE")),
+        Some(&value)
+    );
+}
+
+#[test]
 fn attach_reports_truncated_history() {
     let shell = Shell::start(4096);
     let script = shell.script(
@@ -276,6 +516,7 @@ printf '\nmarker\n'
 
     let reattached = shell.attach();
     assert!(reattached.truncated);
+    assert!(reattached.replay_gap);
     assert_eq!(reattached.replay.len(), 4096);
     assert!(String::from_utf8_lossy(&reattached.replay).contains("\nmarker"));
 }
@@ -395,7 +636,8 @@ fn list_reports_a_stale_socket_as_failed() {
             id,
             pid: None,
             name: None,
-            state: SessionState::Failed
+            state: SessionState::Failed,
+            retained: true,
         }]
     );
 }

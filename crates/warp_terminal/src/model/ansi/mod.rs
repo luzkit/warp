@@ -359,6 +359,7 @@ impl<'a> ProcessorInput<'a> {
 
 /// Internal state for VTE processor.
 struct ProcessorState {
+    terminal_only: bool,
     preceding_char: Option<char>,
     dcs_data: DcsData,
     apc_data: Vec<u8>,
@@ -375,6 +376,7 @@ impl Default for Processor {
     fn default() -> Processor {
         Processor {
             state: ProcessorState {
+                terminal_only: false,
                 preceding_char: None,
                 dcs_data: DcsData::default(),
                 apc_data: vec![],
@@ -388,6 +390,13 @@ impl Default for Processor {
 impl Processor {
     pub fn new() -> Processor {
         Default::default()
+    }
+
+    /// Creates a parser for a raw PTY stream with terminal state changes only.
+    pub(crate) fn terminal_only() -> Self {
+        let mut processor = Self::new();
+        processor.state.terminal_only = true;
+        processor
     }
 
     /// Advance the parser by a series of bytes. If the addition of the bytes trigger any actions,
@@ -750,7 +759,11 @@ where
             C0::LF | C0::VT | C0::FF => {
                 self.handler.linefeed();
             }
-            C0::BEL => self.handler.bell(),
+            C0::BEL => {
+                if !self.state.terminal_only {
+                    self.handler.bell();
+                }
+            }
             C0::SUB => self.handler.substitute(),
             C0::SI => self.handler.set_active_charset(CharsetIndex::G0),
             C0::SO => self.handler.set_active_charset(CharsetIndex::G1),
@@ -760,12 +773,16 @@ where
 
     #[inline]
     fn hook(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
-        self.state.dcs_data.on_hook(intermediates, c);
+        if !self.state.terminal_only {
+            self.state.dcs_data.on_hook(intermediates, c);
+        }
     }
 
     #[inline]
     fn put(&mut self, byte: u8) {
-        self.state.dcs_data.push(byte);
+        if !self.state.terminal_only {
+            self.state.dcs_data.push(byte);
+        }
     }
 
     #[inline]
@@ -807,13 +824,36 @@ where
             buf
         }
 
-        fn unhandled(params: &[&[u8]]) {
-            debug!(
-                "[unhandled osc_dispatch]: [{}] at line {}",
-                format_params(params),
-                line!()
-            );
+        let terminal_only = self.state.terminal_only;
+        if terminal_only
+            && !matches!(
+                params.first().copied(),
+                Some(
+                    b"0" | b"2"
+                        | b"4"
+                        | b"8"
+                        | b"10"
+                        | b"11"
+                        | b"12"
+                        | b"50"
+                        | b"104"
+                        | b"110"
+                        | b"111"
+                        | b"112"
+                )
+            )
+        {
+            return;
         }
+        let unhandled = |params: &[&[u8]]| {
+            if !terminal_only {
+                debug!(
+                    "[unhandled osc_dispatch]: [{}] at line {}",
+                    format_params(params),
+                    line!()
+                );
+            }
+        };
 
         if params.is_empty() || params[0].is_empty() {
             return;
@@ -1602,7 +1642,9 @@ where
     }
 
     fn apc_put(&mut self, byte: u8) {
-        self.state.apc_data.push(byte);
+        if !self.state.terminal_only {
+            self.state.apc_data.push(byte);
+        }
     }
 
     fn apc_end(&mut self) {

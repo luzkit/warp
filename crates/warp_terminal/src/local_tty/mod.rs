@@ -6,6 +6,8 @@
 pub mod docker_sandbox;
 pub mod event_loop;
 pub mod mio_channel;
+#[cfg(target_os = "macos")]
+pub mod persistent;
 pub mod recorder;
 #[cfg(unix)]
 pub mod server;
@@ -32,7 +34,7 @@ pub use self::unix::*;
 #[cfg(windows)]
 pub use self::windows::*;
 use crate::SizeInfo;
-use crate::event::ObservedExitStatus;
+use crate::event::{ExitReason, ObservedExitStatus};
 
 /// This trait defines the behaviour needed to read and/or write to a stream.
 /// It defines an abstraction over mio's interface in order to allow either one
@@ -76,6 +78,11 @@ pub trait EventedPty: EventedReadWrite {
     /// Tells the kernel that the window size changed with the new pixel
     /// dimensions and line/column counts.
     fn on_resize(&mut self, size: &SizeInfo);
+
+    /// Reports the owner state after a client transport disconnects.
+    fn disconnect_reason(&self) -> ExitReason {
+        ExitReason::PtyDisconnected
+    }
 
     /// Terminate the PTY process
     fn kill(self) -> Result<()>;

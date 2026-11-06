@@ -327,6 +327,10 @@ pub(crate) fn create_terminal_view_surface(
         post_wire: move |terminal_manager: &mut TerminalManager<TerminalView>,
                          view: &ViewHandle<TerminalView>,
                          ctx: &mut AppContext| {
+            if terminal_manager.model().lock().is_persistent_pty() {
+                return;
+            }
+
             // Append the session restoration separator to the block list if there are any
             // restored blocks (command blocks or AI conversations) to show.
             let should_show_restoration_separator = (has_conversation_restoration
@@ -2259,6 +2263,11 @@ impl TerminalManagerTrait for TerminalManager<TerminalView> {
         detach_type: crate::pane_group::pane::DetachType,
         app: &mut AppContext,
     ) {
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        if !matches!(detach_type, crate::pane_group::pane::DetachType::Moved) {
+            self.detach_persistent_pty();
+        }
+
         let shared_session_status = self.model.lock().shared_session_status().clone();
         if shared_session_status.is_sharer() {
             Self::log_shared_session_lifecycle(

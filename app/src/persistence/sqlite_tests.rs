@@ -422,6 +422,38 @@ fn test_terminal_window_snapshot(vertical_tabs_panel_open: bool) -> WindowSnapsh
 }
 
 #[test]
+fn persistent_terminal_pane_round_trips_its_session_id() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let mut conn =
+        setup_database(&tempdir.path().join("warp.sqlite")).expect("database should initialize");
+    let id = uuid::Uuid::new_v4();
+    let pane = PaneNodeSnapshot::Leaf(LeafSnapshot {
+        is_focused: true,
+        custom_vertical_tabs_title: None,
+        contents: LeafContents::PersistentTerminal {
+            id,
+            is_active: true,
+        },
+    });
+    let mut window = test_terminal_window_snapshot(false);
+    window.tabs[0].root = pane.clone();
+    let app_state = AppState {
+        windows: vec![window],
+        active_window_index: Some(0),
+        block_lists: Default::default(),
+        running_mcp_servers: Default::default(),
+    };
+
+    save_app_state(&mut conn, &app_state).expect("app state should save");
+
+    let restored = read_sqlite_data(&mut conn, None, PersistedDataScope::Full)
+        .expect("app state should load")
+        .app_state
+        .expect("app state should be present for the full scope");
+    assert_eq!(restored.windows[0].tabs[0].root, pane);
+}
+
+#[test]
 fn test_sqlite_round_trips_vertical_tabs_panel_open() {
     let tempdir = tempfile::tempdir().expect("tempdir should be created");
     let database_path = tempdir.path().join("warp.sqlite");

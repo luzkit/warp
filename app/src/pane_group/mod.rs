@@ -124,6 +124,8 @@ use crate::terminal::available_shells::{AvailableShell, AvailableShells};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::PluginModalKind;
 use crate::terminal::general_settings::{GeneralSettings, GeneralSettingsChangedEvent};
+#[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+use crate::terminal::local_tty::PersistentPtyConnection;
 #[cfg(feature = "local_tty")]
 use crate::terminal::local_tty::TerminalManager as LocalTtyTerminalManager;
 #[cfg(all(feature = "local_tty", not(feature = "remote_tty")))]
@@ -845,10 +847,19 @@ impl NewTerminalOptions {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+#[derive(Debug)]
+pub struct PersistentTerminalLayout {
+    pub(crate) id: Uuid,
+    pub(crate) connection: PersistentPtyConnection,
+}
+
 /// The possible layouts of a pane group.
 #[derive(Debug)]
 pub enum PanesLayout {
     SingleTerminal(Box<NewTerminalOptions>),
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    PersistentTerminal(Box<PersistentTerminalLayout>),
     Snapshot(Box<PaneNodeSnapshot>),
     Template(PaneTemplateType),
     AmbientAgent,
@@ -1629,6 +1640,36 @@ impl PaneGroup {
                     active_session: None,
                 };
                 Ok((PaneData::new(pane_id), focus))
+            }
+            LeafContents::PersistentTerminal { id, is_active } => {
+                #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+                {
+                    let connection = crate::persistent_terminals::auto_reattach_path().map_or(
+                        PersistentPtyConnection::Disconnected,
+                        PersistentPtyConnection::Discover,
+                    );
+                    let pane = Self::create_persistent_pane(
+                        PersistentTerminalLayout { id, connection },
+                        resources,
+                        view_size,
+                        ctx,
+                    );
+                    let terminal_pane_id = pane.terminal_pane_id();
+                    let pane_id = terminal_pane_id.into();
+                    pane_contents.insert(pane_id, Box::new(pane));
+                    Ok((
+                        PaneData::new(pane_id),
+                        InitialFocus {
+                            focused_pane: leaf.is_focused.then_some(pane_id),
+                            active_session: is_active.then_some(terminal_pane_id),
+                        },
+                    ))
+                }
+                #[cfg(not(all(target_os = "macos", feature = "local_tty", debug_assertions)))]
+                {
+                    let _ = is_active;
+                    anyhow::bail!("Persistent terminal {id} is unavailable in this build")
+                }
             }
             LeafContents::Terminal(terminal_snapshot) => {
                 let uuid = PaneUuid(terminal_snapshot.uuid.clone());
@@ -3420,6 +3461,83 @@ impl PaneGroup {
         (PaneData::new(pane_id), focus)
     }
 
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    fn create_persistent_pane(
+        layout: PersistentTerminalLayout,
+        mut resources: TerminalViewResources,
+        view_size: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) -> TerminalPane {
+        let PersistentTerminalLayout { id, connection } = layout;
+        resources.model_event_sender = None;
+        let window_id = ctx.window_id();
+        let terminal = LocalTtyTerminalManager::<TerminalView>::create_persistent_model(
+            id,
+            connection,
+            view_size,
+            ctx,
+            |surface_init, ctx| {
+                create_terminal_view_surface(
+                    TerminalViewSurfaceConfig {
+                        resources,
+                        model_event_sender: None,
+                        window_id,
+                        initial_input_config: None,
+                        conversation_restoration: None,
+                        has_conversation_restoration: false,
+                        is_historical: false,
+                        should_use_live_appearance: false,
+                        has_restored_command_blocks: false,
+                    },
+                    surface_init,
+                    ctx,
+                )
+            },
+        );
+        TerminalPane::new(
+            id.as_bytes().to_vec(),
+            terminal.manager,
+            terminal.surface,
+            None,
+            ctx,
+        )
+        .with_persistent_session(id)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    pub(crate) fn attach_persistent_terminal(
+        &mut self,
+        layout: PersistentTerminalLayout,
+        replace: Option<PaneId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let resources = TerminalViewResources {
+            tips_completed: self.tips_completed.clone(),
+            server_api: self.server_api.clone(),
+            model_event_sender: None,
+        };
+        let view_size = Self::estimated_view_bounds(ctx).size();
+        let pane = Self::create_persistent_pane(layout, resources, view_size, ctx);
+        if let Some(existing) = replace {
+            self.replace_pane(existing, pane, false, ctx);
+        } else {
+            let relative_to = self.focused_pane_id(ctx);
+            self.add_pane(
+                Direction::Right,
+                Some(relative_to),
+                Box::new(pane),
+                true,
+                ctx,
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    pub(crate) fn persistent_session_id(&self, pane_id: PaneId) -> Option<Uuid> {
+        self.downcast_pane_by_id::<TerminalPane>(pane_id)?
+            .persistent_session_id()
+    }
+
     /// Constructs a new [`PaneGroup`] with a layout that adheres
     /// to the specification of the provided [`PanesLayout`].
     #[allow(clippy::too_many_arguments)]
@@ -3500,6 +3618,22 @@ impl PaneGroup {
                     pane_history,
                     ctx,
                 ),
+                #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+                PanesLayout::PersistentTerminal(layout) => {
+                    let pane =
+                        Self::create_persistent_pane(*layout, resources, view_bounds.size(), ctx);
+                    let terminal_pane_id = pane.terminal_pane_id();
+                    let pane_id = terminal_pane_id.into();
+                    pane_contents.insert(pane_id, Box::new(pane));
+                    pane_history.push(pane_id);
+                    (
+                        PaneData::new(pane_id),
+                        InitialFocus {
+                            focused_pane: Some(pane_id),
+                            active_session: Some(terminal_pane_id),
+                        },
+                    )
+                }
                 PanesLayout::AmbientAgent => Self::initial_ambient_agent_pane(
                     resources,
                     view_bounds,

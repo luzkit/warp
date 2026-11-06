@@ -3096,6 +3096,18 @@ impl BlockList {
         self.active_block_mut().set_shell_host(shell_host)
     }
 
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    pub(super) fn start_persistent_pty(&mut self) {
+        self.active_block_mut().hide();
+        self.update_active_block_height();
+        self.bootstrap_stage = BootstrapStage::PostBootstrapPrecmd;
+        self.create_new_block(BlockId::new(), self.bootstrap_stage, None, None);
+        let block = self.active_block_mut();
+        block.set_should_hide_command_grid(true);
+        block.start_background(None);
+        self.update_active_block_height();
+    }
+
     pub fn set_bootstrapped(&mut self) {
         self.bootstrap_stage = BootstrapStage::Bootstrapped;
     }

@@ -91,6 +91,7 @@ pub struct TerminalPane {
 
     /// Used to uniquely identify the pane, even across separate runs of the app.
     uuid: Vec<u8>,
+    persistent_session_id: Option<uuid::Uuid>,
 
     pane_configuration: ModelHandle<PaneConfiguration>,
 
@@ -169,6 +170,7 @@ impl TerminalPane {
         Self {
             model_event_sender,
             uuid,
+            persistent_session_id: None,
             pane_configuration,
             view,
         }
@@ -183,6 +185,17 @@ impl TerminalPane {
     /// The [`TerminalView`] backing the [`PaneView`] for this terminal pane.
     pub(crate) fn terminal_view(&self, ctx: &AppContext) -> ViewHandle<TerminalView> {
         self.view.as_ref(ctx).child(ctx)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    pub(in crate::pane_group) fn with_persistent_session(mut self, id: uuid::Uuid) -> Self {
+        self.persistent_session_id = Some(id);
+        self
+    }
+
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    pub(in crate::pane_group) fn persistent_session_id(&self) -> Option<uuid::Uuid> {
+        self.persistent_session_id
     }
 
     /// The UUID that identifies this terminal session across app restarts.
@@ -467,6 +480,9 @@ impl PaneContent for TerminalPane {
     fn snapshot(&self, app: &AppContext) -> LeafContents {
         let view = self.terminal_view(app).as_ref(app);
         let is_active = view.is_active_session(app);
+        if let Some(id) = self.persistent_session_id {
+            return LeafContents::PersistentTerminal { id, is_active };
+        }
 
         // Capture the current input_config from the AI input model
         let current_input_config = view.input_config(app.as_ref());

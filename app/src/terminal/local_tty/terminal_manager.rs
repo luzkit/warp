@@ -1,7 +1,13 @@
 use std::any::Any;
+#[cfg(all(target_os = "macos", debug_assertions))]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
+#[cfg(all(target_os = "macos", debug_assertions))]
+use std::net::Shutdown;
+#[cfg(all(target_os = "macos", debug_assertions))]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,6 +32,10 @@ use warpui::r#async::executor::Background;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, ViewHandle};
 
 use super::event_loop::EventLoop;
+#[cfg(all(target_os = "macos", debug_assertions))]
+use super::persistent::{Attachment, Runtime};
+#[cfg(all(target_os = "macos", debug_assertions))]
+use super::persistent_pty::{PersistentPty, PersistentStream};
 use super::shell::{ShellStarter, ShellStarterSource};
 use super::spawner::{PtySpawnHooks, PtySpawnMode};
 #[cfg(unix)]
@@ -106,6 +116,23 @@ impl PtySpawnHooks for AppPtySpawnHooks {
     }
 }
 
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[derive(Debug)]
+pub(crate) enum PersistentPtyConnection {
+    Attached(Runtime, Attachment),
+    Discover(PathBuf),
+    Disconnected,
+}
+
+enum LocalPtyStart {
+    Shell(Option<AvailableShell>),
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    Persistent {
+        id: Uuid,
+        connection: PersistentPtyConnection,
+    },
+}
+
 /// Owns a local terminal session: the terminal model, PTY event loop, PTY
 /// controller, and a terminal surface.
 ///
@@ -118,6 +145,10 @@ pub struct TerminalManager<S> {
     /// This is an `Option` so that we can take ownership of the inner
     /// `JoinHandle` in `TerminalManager::drop`.
     event_loop_handle: Option<JoinHandle<mio_channel::Receiver<Message>>>,
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    persistent_stream: Option<Arc<UnixStream>>,
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    persistent_detached: Cell<bool>,
     pub(super) model: Arc<FairMutex<TerminalModel>>,
     pub(super) view: ViewHandle<S>,
 
@@ -328,9 +359,45 @@ impl<S> TerminalManager<S> {
             user_default_shell_unsupported_banner_model_handle,
             initial_size,
             model_event_sender,
-            chosen_shell,
+            LocalPtyStart::Shell(chosen_shell),
             BlockSpacing::for_gui(ctx),
             SshRemoteServerSupport::Enabled,
+            ctx,
+            create_surface,
+            |manager| Box::new(manager),
+        )
+    }
+
+    /// Connects an existing PTY to a native terminal surface without starting a shell.
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    pub(crate) fn create_persistent_model<PostWire>(
+        id: Uuid,
+        connection: PersistentPtyConnection,
+        initial_size: Vector2F,
+        ctx: &mut AppContext,
+        create_surface: impl FnOnce(
+            TerminalSurfaceInit,
+            &mut AppContext,
+        ) -> TerminalSurfaceResult<S, PostWire>,
+    ) -> TerminalManagerInit<S>
+    where
+        S: TerminalSurface,
+        <S as Entity>::Event: PtyIntentEvent,
+        Self: TerminalManagerTrait,
+        PostWire: FnOnce(&mut Self, &ViewHandle<S>, &mut AppContext),
+    {
+        let banner = ctx.add_model(|_| BannerState::NotDismissed);
+        Self::create_model_with_manager(
+            None,
+            HashMap::new(),
+            IsSharedSessionCreator::No,
+            None,
+            banner,
+            initial_size,
+            None,
+            LocalPtyStart::Persistent { id, connection },
+            BlockSpacing::for_gui(ctx),
+            SshRemoteServerSupport::Disabled,
             ctx,
             create_surface,
             |manager| Box::new(manager),
@@ -369,7 +436,7 @@ impl<S> TerminalManager<S> {
             user_default_shell_unsupported_banner_model_handle,
             initial_size,
             model_event_sender,
-            chosen_shell,
+            LocalPtyStart::Shell(chosen_shell),
             block_spacing,
             SshRemoteServerSupport::Disabled,
             ctx,
@@ -388,7 +455,7 @@ impl<S> TerminalManager<S> {
         user_default_shell_unsupported_banner_model_handle: ModelHandle<BannerState>,
         initial_size: Vector2F,
         model_event_sender: Option<SyncSender<ModelEvent>>,
-        chosen_shell: Option<AvailableShell>,
+        start: LocalPtyStart,
         block_spacing: BlockSpacing,
         ssh_remote_server_support: SshRemoteServerSupport,
         ctx: &mut AppContext,
@@ -429,11 +496,25 @@ impl<S> TerminalManager<S> {
             )
         });
 
-        let preferred_shell = chosen_shell.unwrap_or_else(|| {
-            AvailableShells::handle(ctx)
-                .read(ctx, |shells, ctx| shells.get_user_preferred_shell(ctx))
-        });
-        let wsl_name_or_shell_starter = ShellStarter::init(preferred_shell.clone());
+        let (shell_state, wsl_name_or_shell_starter) = match &start {
+            LocalPtyStart::Shell(chosen_shell) => {
+                let preferred_shell = chosen_shell.clone().unwrap_or_else(|| {
+                    AvailableShells::handle(ctx)
+                        .read(ctx, |shells, ctx| shells.get_user_preferred_shell(ctx))
+                });
+                let starter = ShellStarter::init(preferred_shell.clone());
+                let shell_state = ShellLaunchState::DeterminingShell {
+                    available_shell: Some(preferred_shell),
+                    display_name: starter
+                        .as_ref()
+                        .map(|starter| starter.name())
+                        .unwrap_or(ShellName::LessDescriptive("Shell".to_owned())),
+                };
+                (shell_state, starter)
+            }
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            LocalPtyStart::Persistent { .. } => (ShellLaunchState::PersistentPty, None),
+        };
 
         // Create the terminal model with all restored blocks
         log::info!(
@@ -443,21 +524,20 @@ impl<S> TerminalManager<S> {
                 .map(|blocks| blocks.len())
                 .unwrap_or(0)
         );
-        let model = terminal_manager::create_terminal_model(
+        #[cfg_attr(not(all(target_os = "macos", debug_assertions)), allow(unused_mut))]
+        let mut model = terminal_manager::create_terminal_model(
             startup_directory.clone(),
             all_restored_blocks,
             initial_size,
             channel_event_proxy.clone(),
-            ShellLaunchState::DeterminingShell {
-                available_shell: Some(preferred_shell),
-                display_name: wsl_name_or_shell_starter
-                    .as_ref()
-                    .map(|wsl_name_or_shell_starter| wsl_name_or_shell_starter.name())
-                    .unwrap_or(ShellName::LessDescriptive("Shell".to_owned())),
-            },
+            shell_state,
             block_spacing,
             ctx,
         );
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        if model.is_persistent_pty() {
+            model.start_persistent_pty();
+        }
         let colors = model.colors();
         let model = Arc::new(FairMutex::new(model));
 
@@ -551,6 +631,10 @@ impl<S> TerminalManager<S> {
             event_loop_tx,
             model,
             event_loop_handle: None,
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            persistent_stream: None,
+            #[cfg(all(target_os = "macos", debug_assertions))]
+            persistent_detached: Cell::new(false),
             view: surface.clone(),
             #[cfg(unix)]
             terminal_attributes_poller: None,
@@ -568,6 +652,68 @@ impl<S> TerminalManager<S> {
         // Run surface-specific wiring after the manager exists, because this
         // step may need manager-owned controllers and retained handles.
         post_wire(&mut terminal_manager, &surface, ctx);
+
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        if let LocalPtyStart::Persistent { id, connection } = start {
+            let manager = ctx.add_model(|ctx| {
+                match connection {
+                    PersistentPtyConnection::Attached(runtime, attachment) => {
+                        terminal_manager.attach_persistent_pty(
+                            id,
+                            runtime,
+                            attachment,
+                            event_loop_rx,
+                            channel_event_proxy,
+                        );
+                    }
+                    PersistentPtyConnection::Discover(path) => {
+                        ctx.spawn(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    let runtime = Runtime::new(path)?;
+                                    let attachment = runtime.attach(id)?;
+                                    anyhow::Ok((runtime, attachment))
+                                })
+                                .await
+                                .ok()
+                                .and_then(Result::ok)
+                            },
+                            move |manager: &mut Box<dyn TerminalManagerTrait>, connection, ctx| {
+                                let Some(manager) = manager.as_any_mut().downcast_mut::<Self>()
+                                else {
+                                    return;
+                                };
+                                if manager.persistent_detached.get()
+                                    || !ctx.is_window_open(manager.view.window_id(ctx))
+                                {
+                                    manager.model().lock().exit(ExitReason::PtyDisconnected);
+                                    return;
+                                }
+                                if let Some((runtime, attachment)) = connection {
+                                    manager.attach_persistent_pty(
+                                        id,
+                                        runtime,
+                                        attachment,
+                                        event_loop_rx,
+                                        channel_event_proxy,
+                                    );
+                                } else {
+                                    manager.model().lock().exit(ExitReason::PtyDisconnected);
+                                }
+                            },
+                        );
+                    }
+                    PersistentPtyConnection::Disconnected => {
+                        terminal_manager
+                            .model()
+                            .lock()
+                            .exit(ExitReason::PtyDisconnected);
+                    }
+                }
+                box_manager(terminal_manager)
+            });
+            return TerminalManagerInit { manager, surface };
+        }
 
         let terminal_surface = surface.clone();
         let shell_startup_resources = ShellStartupResources {
@@ -635,10 +781,58 @@ impl<S> TerminalManager<S> {
         self.remote_server_controller.clone()
     }
 
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    fn attach_persistent_pty(
+        &mut self,
+        id: Uuid,
+        runtime: Runtime,
+        attachment: Attachment,
+        event_loop_rx: mio_channel::Receiver<Message>,
+        channel_event_proxy: ChannelEventListener,
+    ) {
+        let size = {
+            let mut model = self.model.lock();
+            model.set_shell_process_info(ShellProcessInfo {
+                pid: attachment.pid,
+                pty_leader_fd: None,
+            });
+            *model.block_list().size()
+        };
+        let stream = Arc::new(attachment.stream);
+        self.persistent_stream = Some(stream.clone());
+        let pty = PersistentPty {
+            runtime,
+            id,
+            stream: PersistentStream(stream),
+        };
+        let _ = self.event_loop_tx.send(Message::Resize(size));
+        self.event_loop_handle = Some(
+            EventLoop::new(self.model(), channel_event_proxy, pty, event_loop_rx)
+                .spawn_with_persistent_replay(attachment.replay),
+        );
+        #[cfg(feature = "integration_tests")]
+        {
+            self.pid = Some(attachment.pid);
+        }
+    }
+
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    pub(super) fn detach_persistent_pty(&self) {
+        self.persistent_detached.set(true);
+        if let Some(stream) = &self.persistent_stream {
+            let _ = self.event_loop_tx.send(Message::Shutdown);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
     /// Sends a shutdown message to the PTY event loop and waits for it to
     /// process that event.
     pub(super) fn shutdown_event_loop(&mut self) {
         let shutdown_res = self.event_loop_tx.send(Message::Shutdown);
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        if let Some(stream) = &self.persistent_stream {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         // Happens normally if the event loop has already been terminated (so the channel is now gone).
         if let Err(e) = shutdown_res {
             log::info!("Failed to send Shutdown {e:?}");

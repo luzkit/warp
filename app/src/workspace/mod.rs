@@ -24,6 +24,8 @@ mod toast_stack;
 pub mod util;
 pub mod view;
 
+#[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+pub use action::PersistentTerminalAction;
 pub use action::{
     AutoCloudHandoffTrigger, CommandSearchOptions, InitContent, RestoreConversationLayout,
     TabContextMenuAnchor, VerticalTabsPaneContextMenuTarget, WorkspaceAction,

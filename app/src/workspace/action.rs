@@ -125,6 +125,16 @@ pub enum AutoCloudHandoffTrigger {
     Uri,
 }
 
+#[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+#[derive(Debug, Clone)]
+pub enum PersistentTerminalAction {
+    Create { split: bool },
+    Attach(uuid::Uuid),
+    Detach,
+    Rename,
+    ConfirmTermination(uuid::Uuid),
+}
+
 #[derive(Debug, Clone)]
 pub enum WorkspaceAction {
     ActivateTab(usize),
@@ -267,6 +277,8 @@ pub enum WorkspaceAction {
         anchor: NewSessionMenuAnchor,
     },
     SelectNewSessionMenuItem(NewSessionMenuItem),
+    #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+    PersistentTerminal(PersistentTerminalAction),
     AutoupdateFailureLink,
     ApplyUpdate,
     LogOut,
@@ -927,6 +939,8 @@ impl WorkspaceAction {
             ContinueConversationLocally { .. } => true,
             #[cfg(not(target_family = "wasm"))]
             ContinueThirdPartyConversationLocally { .. } => true,
+            #[cfg(all(target_os = "macos", feature = "local_tty", debug_assertions))]
+            PersistentTerminal(_) => false,
             ActivateTab(_)
             | ActivateTabByNumber(_)
             | SetTabShortcutModifierKey { .. }

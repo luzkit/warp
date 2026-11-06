@@ -128,9 +128,12 @@ pub enum TerminationType {
     /// updating styling to support this properly.
     #[allow(dead_code)]
     Normal,
+    PersistentPty(ExitReason),
     /// The PTY failed to spawn and the shell process never started.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
-    PtySpawnFailure { pty_spawn_error: anyhow::Error },
+    PtySpawnFailure {
+        pty_spawn_error: anyhow::Error,
+    },
     /// The shell process terminated before we were able to bootstrap.
     Premature {
         shell_detail: String,
@@ -143,10 +146,17 @@ impl TerminationType {
         const ICON_SIZE: f32 = 16.;
 
         let icon_type = match self {
-            TerminationType::Normal => ui_components::icons::Icon::Info,
-            TerminationType::Premature { .. } | TerminationType::PtySpawnFailure { .. } => {
-                ui_components::icons::Icon::Warning
-            }
+            TerminationType::Normal
+            | TerminationType::PersistentPty(
+                ExitReason::ShellProcessExited { .. } | ExitReason::ProcessKilled,
+            ) => ui_components::icons::Icon::Info,
+            TerminationType::PersistentPty(
+                ExitReason::PtyDisconnected
+                | ExitReason::PtySpawnFailed
+                | ExitReason::ShellNotFound,
+            )
+            | TerminationType::Premature { .. }
+            | TerminationType::PtySpawnFailure { .. } => ui_components::icons::Icon::Warning,
         };
 
         Container::new(
@@ -166,6 +176,15 @@ impl TerminationType {
     fn text(&self, appearance: &Appearance) -> Box<dyn Element> {
         let text = match self {
             TerminationType::Normal => "Shell process exited",
+            TerminationType::PersistentPty(
+                ExitReason::ShellProcessExited { .. } | ExitReason::ProcessKilled,
+            ) => "Persistent session ended",
+            TerminationType::PersistentPty(ExitReason::PtyDisconnected) => {
+                "Persistent session disconnected"
+            }
+            TerminationType::PersistentPty(
+                ExitReason::PtySpawnFailed | ExitReason::ShellNotFound,
+            ) => "Persistent session unavailable",
             TerminationType::PtySpawnFailure { .. } => "Shell process could not start!",
             TerminationType::Premature { .. } => "Shell process exited prematurely!",
         };
@@ -178,7 +197,7 @@ impl TerminationType {
 
     fn subtext(&self, appearance: &Appearance) -> Option<Box<dyn Element>> {
         let text: Cow<str> = match self {
-            TerminationType::Normal => return None,
+            TerminationType::Normal | TerminationType::PersistentPty(_) => return None,
             TerminationType::PtySpawnFailure { pty_spawn_error } => {
                 format!("{pty_spawn_error:#}").into()
             }
@@ -204,7 +223,7 @@ impl TerminationType {
         handles: &mut Vec<MouseStateHandle>,
     ) -> Vec<Box<dyn Element>> {
         match self {
-            TerminationType::Normal => vec![],
+            TerminationType::Normal | TerminationType::PersistentPty(_) => vec![],
             TerminationType::Premature { .. } => {
                 let ui_builder = inverted_color_ui_builder(appearance);
 

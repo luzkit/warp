@@ -8842,7 +8842,7 @@ impl TerminalView {
     }
 
     pub fn is_input_box_visible(&self, model: &TerminalModel, app: &AppContext) -> bool {
-        if model.is_read_only() {
+        if model.is_read_only() || model.is_persistent_pty() {
             return false;
         }
         // Warp's own headless TUI (`warp_tui`) is itself an agent surface, so
@@ -9863,6 +9863,9 @@ impl TerminalView {
     fn should_write_typed_chars_to_pty(&self, ctx: &mut ViewContext<Self>) -> bool {
         // Lock the model once and hold it throughout the function
         let model = self.model.lock();
+        if model.is_persistent_pty() {
+            return !model.is_read_only();
+        }
 
         // If the active block hasn't started yet, we don't want to write to the pty.
         // Note that we check block started and NOT block.is_long_running(), because
@@ -9891,7 +9894,7 @@ impl TerminalView {
             self.highlighted_link.invalidate();
             self.report_possible_typeahead(characters);
             self.write_user_bytes_to_pty(characters.as_bytes().to_vec(), ctx);
-        } else {
+        } else if !self.model.lock().is_persistent_pty() {
             // We should only insert typed characters into the input box buffer.
             // When input_sequence is triggered on KeyDown, we should focus
             // on the input area and let the editor view handle the TypedCharacters
@@ -10020,6 +10023,9 @@ impl TerminalView {
     ) -> bool {
         {
             let mut terminal_model = self.model.lock();
+            if terminal_model.is_persistent_pty() && terminal_model.is_read_only() {
+                return false;
+            }
             let active_block = terminal_model.block_list().active_block();
             if active_block.is_agent_in_control() {
                 return false;
@@ -11502,7 +11508,8 @@ impl TerminalView {
                     Some(shell_detail.into()),
                     Some(reason),
                 ),
-                _ => (None, None, None),
+                shell_terminated_banner::TerminationType::Normal
+                | shell_terminated_banner::TerminationType::PersistentPty(_) => (None, None, None),
             };
 
             if let Some(termination_reason) = termination_reason {
@@ -12654,16 +12661,19 @@ impl TerminalView {
                     });
                 }
 
+                let persistent_pty = self.model.lock().is_persistent_pty();
                 // If the pty spawn has failed, we've already inserted a banner.
                 if !self.pty_spawn_failed {
-                    let shell_detail = self.shell_detail.take().unwrap_or("shell".to_owned());
-                    self.insert_shell_process_terminated_banner(
+                    let termination_type = if persistent_pty {
+                        shell_terminated_banner::TerminationType::PersistentPty(*reason)
+                    } else {
+                        let shell_detail = self.shell_detail.take().unwrap_or("shell".to_owned());
                         shell_terminated_banner::TerminationType::Premature {
                             shell_detail,
                             reason: *reason,
-                        },
-                        ctx,
-                    );
+                        }
+                    };
+                    self.insert_shell_process_terminated_banner(termination_type, ctx);
                 }
                 // Mark the editor as disabled to ensure user interactions with
                 // it are ignored.
@@ -12676,11 +12686,11 @@ impl TerminalView {
 
                 // If we failed to bootstrap by the time we exited, show the
                 // bootstrap block so the user might be able to see what went wrong.
-                if !self.is_login_shell_bootstrapped {
+                if !self.is_login_shell_bootstrapped && !persistent_pty {
                     self.show_initialization_block();
                 }
 
-                if !self.pty_spawn_failed {
+                if !self.pty_spawn_failed && !persistent_pty {
                     ctx.emit(Event::Exited);
                 }
             }
@@ -13522,17 +13532,21 @@ impl TerminalView {
             ModelEvent::TerminalModeSwapped(mode) => {
                 #[cfg(feature = "local_tty")]
                 {
-                    let active_command = self
-                        .model
-                        .lock()
-                        .block_list()
-                        .active_block()
-                        .top_level_command(self.sessions.as_ref(ctx));
-                    // If we don't know what the top-level command is,
-                    // we should still perform the redundant resize.
-                    if active_command.is_none_or(|cmd| {
-                        !ALT_SCREEN_APPS_THAT_MUST_MATCH_BLOCKLIST_PADDING.contains(cmd.as_str())
-                    }) {
+                    let refresh_size_on_screen_swap = {
+                        let model = self.model.lock();
+                        // Retained output can contain historical mode changes. The next layout
+                        // sends the size for the screen that the attachment actually displays.
+                        !model.is_persistent_pty()
+                            && model
+                                .block_list()
+                                .active_block()
+                                .top_level_command(self.sessions.as_ref(ctx))
+                                .is_none_or(|cmd| {
+                                    !ALT_SCREEN_APPS_THAT_MUST_MATCH_BLOCKLIST_PADDING
+                                        .contains(cmd.as_str())
+                                })
+                    };
+                    if refresh_size_on_screen_swap {
                         // Since the alt-screen and blocklist have different sizes,
                         // let's make sure to refresh the winsize when switching
                         // back and forth between these modes.
@@ -21374,6 +21388,11 @@ impl TerminalView {
     }
 
     fn focus_input_box(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.model.lock().is_persistent_pty() {
+            self.focus_terminal(ctx);
+            return;
+        }
+
         // Only clear selected blocks and text if we're not in AI mode since in AI mode we don't want to clear
         // the selected blocks or text (context) when we focus the input.
         //

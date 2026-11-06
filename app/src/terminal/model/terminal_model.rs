@@ -1593,6 +1593,7 @@ impl TerminalModel {
 
     pub fn is_read_only(&self) -> bool {
         self.handled_exit
+            || (self.is_persistent_pty() && self.shell_process_info.is_none())
             || self.is_conversation_transcript_viewer()
             || self.shared_session_status().is_finished_viewer()
     }
@@ -2129,14 +2130,16 @@ impl TerminalModel {
     }
 
     pub fn get_shell(&self) -> Option<AvailableShell> {
-        match &self.shell_launch_state {
-            ShellLaunchState::DeterminingShell {
-                available_shell, ..
-            } => available_shell.clone(),
-            ShellLaunchState::ShellSpawned {
-                available_shell, ..
-            } => available_shell.clone(),
-        }
+        self.shell_launch_state.available_shell()
+    }
+
+    pub fn is_persistent_pty(&self) -> bool {
+        matches!(self.shell_launch_state, ShellLaunchState::PersistentPty)
+    }
+
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    pub(crate) fn start_persistent_pty(&mut self) {
+        self.block_list.start_persistent_pty();
     }
 
     pub fn shared_session_status(&self) -> &SharedSessionStatus {

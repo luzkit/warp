@@ -51,6 +51,7 @@ cp -R "$plugin" "$app_bundle/Contents/PlugIns/"
 plutil -insert NSDockTilePlugIn -string WarpDockTilePlugin.docktileplugin "$app_bundle/Contents/Info.plist"
 plutil -insert MainAppBundleIdentifier -string dev.warp.WarpOss \
     "$app_bundle/Contents/PlugIns/WarpDockTilePlugin.docktileplugin/Contents/Info.plist"
+codesign --force --sign - "$app_bundle/Contents/PlugIns/WarpDockTilePlugin.docktileplugin"
 
 # Changing the Mach-O rpath invalidates its signature before schema generation executes it.
 codesign --force --sign - "$binary"

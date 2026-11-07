@@ -46,17 +46,28 @@ are not erased during installation.
 
 ## Build and publish
 
-The private `luzkit/nab-release-app` repository coordinates notarized builds using
-its existing Mac runner and Keychain. The reviewed workflow template is
-[`script/ci/fork-notarized-release.yml`](../../script/ci/fork-notarized-release.yml);
-deploy it there as `.github/workflows/fork-notarized-release.yml`. It runs only by
-manual dispatch from that repository's `main` branch. The public fork's PRs never
-receive access to the signing runner.
+The dedicated private [`luzkit/warp-release`](https://github.com/luzkit/warp-release)
+repository is the new home for notarized builds using the existing Mac runner and
+Keychain. The reviewed workflow template is
+[`script/ci/fork-notarized-release.yml`](../../script/ci/fork-notarized-release.yml),
+deployed there as `.github/workflows/fork-notarized-release.yml`. It runs only by
+manual dispatch from that repository's `main` branch, and remains disabled until
+`WARP_RELEASE_ENABLED` is explicitly set to `true` after the migration checklist in
+that repository is complete. The public fork's PRs never receive access to the
+signing runner.
+
+During migration, the existing `luzkit/nab-release-app` controller remains available
+with its original workflow. The signing script accepts only the exact reviewed
+workflow on `main` in these two private controllers and records the actual controller
+in the artifact provenance. Do not remove the old controller until the dedicated
+pipeline has completed a verified release; never change the Release Manager app's
+own release workflows. Existing published installers and their provenance remain
+unchanged.
 
 1. Merge the release changes into `luzkit/warp:master`, then create an immutable tag
    such as `fork-v0.1.0` at that exact commit. Tags use `fork-vMAJOR.MINOR.PATCH`, with
    major at most 9999 and minor/patch at most 99 for Apple's bundle version format.
-2. In the private repository, run **Notarized fork macOS release** from `main` with
+2. In the private repository, run **Warp signed macOS release** from `main` with
    `release_tag` set to that tag. `preflight_only` validates the source and signing
    setup without starting a build. A full release also requires
    `allow_mac_build=true`, explicitly approving compilation on the personal Mac,
@@ -74,8 +85,10 @@ receive access to the signing runner.
    and both accepted notarization receipts; publish only after verification.
 
 The controller intentionally has no cross-repository write credential. Publishing
-uses the release operator's existing GitHub authorization for `luzkit/warp`. This
-keeps the existing runner groups and other Mac projects unchanged. The Linux
+uses the release operator's existing GitHub authorization for `luzkit/warp`. Do not
+create new credentials for this migration. Authorizing the dedicated private
+repository in the existing runner groups requires separate approval; preserve all
+existing selected repositories and leave public-repository access disabled. The Linux
 resolve/validation and final verification jobs use `[self-hosted, Linux]`, the
 labels of the existing `homelab-ci-01`, `homelab-ci-02`, and `homelab-ci-03` pool.
 Their tools are installed inside Ubuntu job containers, not on the persistent host.
@@ -85,9 +98,10 @@ Do not overwrite a version tag or existing release assets; use a new version for
 changed source. The final publication must recheck the tag SHA and existing drafts,
 which the controller's read-only token cannot necessarily see.
 
-The existing private repository variables are `MAC_SIGNING_IDENTITY` and
-`APPLE_KEYCHAIN_PROFILE`. The workflow derives the team and full Developer ID
-selector from that identity; certificates and notarization credentials stay in the
+The private controller needs `MAC_SIGNING_IDENTITY` and
+`APPLE_KEYCHAIN_PROFILE`, copied from the existing controller as ordinary repository
+variables, plus the explicit `WARP_RELEASE_ENABLED` activation gate. The workflow
+derives the team and full Developer ID selector from that identity; certificates and notarization credentials stay in the
 runner account's Keychain. It never exports keys, imports certificates, or unlocks
 the Keychain with a password. An unavailable identity/profile stops before the
 costly build. A failed or timed-out Apple submission retains its ID in a diagnostic

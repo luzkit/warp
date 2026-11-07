@@ -2571,9 +2571,10 @@ fn render_tab_group_internal(
     let draggable: Box<dyn Element> = if is_parent_group_dragging || is_sole_group_member {
         group_element
     } else {
+        let source = tab.pane_group.id();
         let draggable = Draggable::new(tab.draggable_state.clone(), group_element)
-            .on_drag_start(|ctx, _, _| {
-                ctx.dispatch_typed_action(WorkspaceAction::StartTabDrag);
+            .on_drag_start(move |ctx, _, _| {
+                ctx.dispatch_typed_action(WorkspaceAction::StartTabDrag(source));
             })
             .on_drag(move |ctx, _, rect, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::DragTab {
@@ -2581,13 +2582,19 @@ fn render_tab_group_internal(
                     tab_position: rect,
                 });
             })
-            .on_drop(|ctx, _, _, _| {
-                ctx.dispatch_typed_action(WorkspaceAction::DropTab);
+            .on_drop_at(move |ctx, _, tab_position, _, cursor_position| {
+                ctx.dispatch_typed_action(WorkspaceAction::DropTab {
+                    source,
+                    tab_position,
+                    cursor_position,
+                });
             });
         // Only lock the drag to the vertical axis when cross-window tab drag is
         // disabled. When it is enabled, the user needs to be able to drag
         // horizontally out of the panel to detach the tab into a new window.
-        let draggable = if FeatureFlag::DragTabsToWindows.is_enabled() {
+        let draggable = if FeatureFlag::DragTabsToWindows.is_enabled()
+            || FeatureFlag::EnhancedPaneManagement.is_enabled()
+        {
             draggable
         } else {
             draggable.with_drag_axis(DragAxis::VerticalOnly)

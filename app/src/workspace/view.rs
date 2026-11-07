@@ -7,6 +7,8 @@ pub(crate) mod codex_modal;
 pub mod conversation_list;
 #[cfg(enable_crash_recovery)]
 mod crash_recovery;
+mod docking_overlay;
+mod enhanced_docking;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
@@ -122,6 +124,8 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
+use self::docking_overlay::DockingTabDrag;
+pub(crate) use self::docking_overlay::handle_docking_input;
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     SummaryPaneKind, SummaryPaneKindIcons, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID,
@@ -1103,6 +1107,7 @@ pub struct Workspace {
     reward_modal: ViewHandle<Modal<RewardView>>,
     reward_modal_pending: Option<RewardKind>,
     pub(crate) current_workspace_state: WorkspaceState,
+    docking_tab_drag: Option<DockingTabDrag>,
     previous_workspace_state: Option<WorkspaceState>,
     welcome_tips_view_state: WelcomeTipsViewState,
     welcome_tips_view: ViewHandle<TipsView>,
@@ -3524,6 +3529,7 @@ impl Workspace {
             reward_modal,
             reward_modal_pending: None,
             current_workspace_state: Default::default(),
+            docking_tab_drag: None,
             previous_workspace_state: None,
             model_event_sender,
             launch_config_save_modal,
@@ -12393,6 +12399,15 @@ impl Workspace {
         let tab_data = self.tabs.remove(index);
 
         let removed_pane_group_id = tab_data.pane_group.id();
+        if self
+            .docking_tab_drag
+            .is_some_and(|drag| drag.source == removed_pane_group_id)
+        {
+            tab_data.draggable_state.cancel_drag();
+            tab_data.draggable_state.set_suppress_overlay_paint(false);
+            self.docking_tab_drag = None;
+            self.current_workspace_state.is_tab_being_dragged = false;
+        }
         self.tab_mru_order.retain(|id| *id != removed_pane_group_id);
 
         // If the closed tab was a group member, prune the group when it now
@@ -22381,7 +22396,17 @@ impl Workspace {
         {
             ChildView::new(&self.agent_management_view).finish()
         } else {
-            ChildView::new(&active_tab_data.pane_group).finish()
+            let pane_group = ChildView::new(&active_tab_data.pane_group);
+            if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                let window_id = self.window_id;
+                pane_group
+                    .with_event_filter(move |event, app| {
+                        !docking_overlay::tab_drag_owns_pointer(event, window_id, app)
+                    })
+                    .finish()
+            } else {
+                pane_group.finish()
+            }
         };
 
         let terminal_content = match self.maybe_render_workspace_banner(app, appearance) {
@@ -24962,7 +24987,8 @@ impl TypedActionView for Workspace {
             ToggleMouseReporting => self.toggle_mouse_reporting(ctx),
             ToggleScrollReporting => self.toggle_scroll_reporting(ctx),
             ToggleFocusReporting => self.toggle_focus_reporting(ctx),
-            StartTabDrag => {
+            StartTabDrag(source) => {
+                self.start_docking_tab_drag(*source, ctx);
                 // Drag supersedes any multi-selection; clear it to avoid stale highlights.
                 self.clear_tab_multi_selection(ctx);
                 // If we are renaming a tab, finish the rename before dragging.
@@ -25386,7 +25412,14 @@ impl TypedActionView for Workspace {
                 tab_index,
                 tab_position,
             } => self.on_tab_drag(*tab_index, *tab_position, ctx),
-            DropTab => {
+            DropTab {
+                source,
+                tab_position,
+                cursor_position,
+            } => {
+                if self.finish_docking_tab_drag(*source, *tab_position, *cursor_position, ctx) {
+                    return;
+                }
                 let is_cross_window = CrossWindowTabDrag::as_ref(ctx).is_active();
                 let handed_off_tab_index =
                     CrossWindowTabDrag::as_ref(ctx)
@@ -27091,6 +27124,7 @@ impl View for Workspace {
                 .with_uniform_padding(WORKSPACE_PADDING)
                 .finish(),
         );
+        self.render_docking_tab_overlay(&mut stack, appearance, app);
 
         if !use_simplified_wasm_tab_bar
             && FeatureFlag::VerticalTabs.is_enabled()
@@ -28854,6 +28888,9 @@ impl Workspace {
         position: RectF,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.docking_tab_drag.is_some() {
+            return;
+        }
         const DETACH_SENSITIVITY: f32 = 10.0;
         // `current_index` was captured by the tab's `Draggable` closure at
         // render time. Mid-drag mutations (swaps, hops over collapsed
@@ -29070,6 +29107,15 @@ impl Workspace {
             return;
         }
 
+        self.reorder_tab_in_tab_bar(current_index, position, ctx);
+    }
+
+    fn reorder_tab_in_tab_bar(
+        &mut self,
+        current_index: usize,
+        position: RectF,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let use_vertical_tabs =
             FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
         let groups_enabled = FeatureFlag::GroupedTabs.is_enabled();

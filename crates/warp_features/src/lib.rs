@@ -174,6 +174,7 @@ pub enum FeatureFlag {
 
     SshDragAndDrop,
     DragTabsToWindows,
+    EnhancedPaneManagement,
 
     /// Enables the overflow menu on AI blocks.
     AIBlockOverflowMenu,

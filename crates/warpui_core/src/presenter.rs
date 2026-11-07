@@ -279,8 +279,11 @@ pub struct SizeConstraint {
     pub max: Vector2F,
 }
 
+type ChildEventFilter = Box<dyn Fn(&Event, &AppContext) -> bool>;
+
 pub struct ChildView<T> {
     view_id: EntityId,
+    event_filter: Option<ChildEventFilter>,
     size: Option<Vector2F>,
     origin: Option<Point>,
     phantom_data: PhantomData<T>,
@@ -817,10 +820,20 @@ impl<T: View> ChildView<T> {
     pub fn with_id(view_id: EntityId) -> Self {
         Self {
             view_id,
+            event_filter: None,
             size: None,
             origin: None,
             phantom_data: Default::default(),
         }
+    }
+
+    /// Forward only events accepted by the filter to the embedded view.
+    pub fn with_event_filter(
+        mut self,
+        filter: impl Fn(&Event, &AppContext) -> bool + 'static,
+    ) -> Self {
+        self.event_filter = Some(Box::new(filter));
+        self
     }
 }
 
@@ -851,6 +864,13 @@ impl<T> Element for ChildView<T> {
         ctx: &mut EventContext,
         app: &AppContext,
     ) -> bool {
+        if self
+            .event_filter
+            .as_ref()
+            .is_some_and(|filter| !filter(event.raw_event(), app))
+        {
+            return false;
+        }
         ctx.dispatch_event_on_view(self.view_id, event, app)
     }
 

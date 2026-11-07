@@ -589,7 +589,7 @@ pub enum RepaintTrigger {
     AssetLoaded { asset_handle: AssetHandle },
 }
 
-type EventMunger = dyn Fn(&mut Event, &mut AppContext);
+type EventMunger = dyn Fn(&mut Event, WindowId, &mut AppContext) -> bool;
 
 pub type DrawFrameErrorCallback = dyn Fn(&mut AppContext, WindowId);
 
@@ -835,7 +835,7 @@ impl AppContext {
             frame_drawn_callback: None,
             global_shortcuts: Default::default(),
             next_frame_callbacks: Default::default(),
-            event_munger: Box::new(|_evt, _ctx| {}),
+            event_munger: Box::new(|_, _, _| false),
             before_open_url_callback: Box::new(|url, _ctx| url.to_owned()),
             a11y_verbosity: Default::default(),
             platform_modal_data_map: Default::default(),
@@ -1269,10 +1269,10 @@ impl AppContext {
         entry.push(Box::new(callback));
     }
 
-    /// Sets a function which gets to inspect and modify events before they are dispatched.
+    /// Sets a function that can modify or consume events before dispatch.
     pub fn set_event_munger<F>(&mut self, handler: F)
     where
-        F: 'static + Fn(&mut Event, &mut AppContext),
+        F: 'static + Fn(&mut Event, WindowId, &mut AppContext) -> bool,
     {
         self.event_munger = Box::new(handler)
     }
@@ -3547,13 +3547,19 @@ impl AppContext {
         window_id: WindowId,
         presenter: Rc<RefCell<Presenter>>,
     ) -> crate::windowing::EventDispatchResult {
-        let mut event_munger: Box<EventMunger> = Box::new(|_, _| {});
+        let mut event_munger: Box<EventMunger> = Box::new(|_, _, _| false);
         std::mem::swap(&mut event_munger, &mut self.event_munger);
         // Give the app a chance to modify the event first. The closure had to be moved out of
         // `self.event_munger` to avoid a double-borrow error, so swapped it into `event_munger`
         // local variable, then swap it back after.
-        event_munger(&mut event, self);
+        let consumed = event_munger(&mut event, window_id, self);
         std::mem::swap(&mut event_munger, &mut self.event_munger);
+        if consumed {
+            return crate::windowing::EventDispatchResult {
+                handled: true,
+                ..Default::default()
+            };
+        }
 
         let mut keystroke_handled = false;
         if self.key_bindings_enabled(window_id) {

@@ -2350,9 +2350,11 @@ impl UiComponent for TabComponent<'_> {
         // We only want the on_click action to take effect on the tab, if it's not being renamed at a moment.
         // Note that clicking on other tabs is still ok.
         if !is_tab_being_renamed {
-            // Modifier-aware mouse-down: shift extends the selection range,
-            // cmd toggles a tab in/out of the selection, plain press
-            // activates.
+            let activate_on_click = FeatureFlag::EnhancedPaneManagement.is_enabled()
+                && !sole_grouped_member
+                && !for_drag_ghost;
+            let close_click_state = mouse_close_state.clone();
+            // Docking needs the destination to stay visible until a plain click is confirmed.
             tab = tab.on_mouse_down_with_modifiers(move |ctx, _, _, modifiers| {
                 let close_hovered = mouse_close_state
                     .lock()
@@ -2365,10 +2367,24 @@ impl UiComponent for TabComponent<'_> {
                     ctx.dispatch_typed_action(WorkspaceAction::ShiftSelectTabRange { locator });
                 } else if modifiers.cmd && FeatureFlag::GroupedTabs.is_enabled() {
                     ctx.dispatch_typed_action(WorkspaceAction::ToggleTabMultiSelection { locator });
-                } else {
+                } else if !activate_on_click {
                     ctx.dispatch_typed_action(WorkspaceAction::ActivateTab(tab_index));
                 }
             });
+            if activate_on_click {
+                tab = tab.on_click_with_modifiers(move |ctx, _, _, modifiers| {
+                    let close_hovered = close_click_state
+                        .lock()
+                        .expect("lock acquired")
+                        .is_hovered();
+                    if !close_hovered
+                        && !(FeatureFlag::GroupedTabs.is_enabled()
+                            && (modifiers.shift || modifiers.cmd))
+                    {
+                        ctx.dispatch_typed_action(WorkspaceAction::ActivateTab(tab_index));
+                    }
+                });
+            }
 
             tab = tab.on_double_click(move |ctx, _app, _| {
                 ctx.dispatch_typed_action(WorkspaceAction::RenameTab(tab_index));
@@ -2433,15 +2449,25 @@ impl UiComponent for TabComponent<'_> {
             // so dragging fires `DragTab`; the workspace's `on_tab_drag`
             // handles cross-group reassignment.
             let draggable = Draggable::new(draggable_state, constrained_tab)
-                .on_drag_start(|ctx, _, _| ctx.dispatch_typed_action(WorkspaceAction::StartTabDrag))
+                .on_drag_start(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::StartTabDrag(locator.pane_group_id));
+                })
                 .on_drag(move |ctx, _, rect, _| {
                     ctx.dispatch_typed_action(WorkspaceAction::DragTab {
                         tab_index,
                         tab_position: rect,
                     });
                 })
-                .on_drop(|ctx, _, _, _| ctx.dispatch_typed_action(WorkspaceAction::DropTab));
-            let draggable = if FeatureFlag::DragTabsToWindows.is_enabled() {
+                .on_drop_at(move |ctx, _, tab_position, _, cursor_position| {
+                    ctx.dispatch_typed_action(WorkspaceAction::DropTab {
+                        source: locator.pane_group_id,
+                        tab_position,
+                        cursor_position,
+                    });
+                });
+            let draggable = if FeatureFlag::DragTabsToWindows.is_enabled()
+                || FeatureFlag::EnhancedPaneManagement.is_enabled()
+            {
                 draggable
             } else {
                 draggable.with_drag_axis(DragAxis::HorizontalOnly)

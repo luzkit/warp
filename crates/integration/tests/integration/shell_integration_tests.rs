@@ -14,6 +14,8 @@ integration_tests! {
     test_single_command,
     // Test shell process terminates when session is closed.
     test_add_and_close_session,
+    // Test existing bash and zsh processes survive docking.
+    test_dock_tab_preserves_running_processes,
     // Test powerlevel10k detection (via bootstrap script logic).
     test_detect_powerlevel10k,
     // Test properties of bootstrap.

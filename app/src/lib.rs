@@ -1971,10 +1971,11 @@ pub(crate) fn initialize_app(
     );
 
     // Teach our app that sometimes option means meta.
-    ctx.set_event_munger(move |event, ctx| {
+    ctx.set_event_munger(move |event, window_id, ctx| {
         let extra_meta_keys = *KeysSettings::as_ref(ctx).extra_meta_keys;
         apply_extra_meta_keys(event, extra_meta_keys);
         apply_scroll_multiplier(event, ctx);
+        workspace::view::handle_docking_input(event, window_id, ctx)
     });
 
     // Rewrite recognized Warp web URLs (sessions, Drive, settings, home) into local

@@ -190,6 +190,24 @@ impl TerminalPane {
         self.view.to_owned()
     }
 
+    pub(in crate::pane_group) fn supports_terminal_docking(&self, ctx: &AppContext) -> bool {
+        if self.view.as_ref(ctx).pane_stack().as_ref(ctx).depth() != 1 {
+            return false;
+        }
+
+        let view = self.terminal_view(ctx);
+        let view = view.as_ref(ctx);
+        if view.agent_view_controller().as_ref(ctx).is_active()
+            || view.is_ambient_agent_session(ctx)
+            || view.is_orchestration_split_off()
+        {
+            return false;
+        }
+
+        let model = view.model.lock();
+        !model.is_read_only() && !model.shared_session_status().is_sharer_or_viewer()
+    }
+
     /// The [`TerminalView`] backing the [`PaneView`] for this terminal pane.
     pub(crate) fn terminal_view(&self, ctx: &AppContext) -> ViewHandle<TerminalView> {
         self.view.as_ref(ctx).child(ctx)

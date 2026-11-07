@@ -367,12 +367,16 @@ pub enum WorkspaceAction {
     ToggleMouseReporting,
     ToggleScrollReporting,
     ToggleFocusReporting,
-    StartTabDrag,
+    StartTabDrag(EntityId),
     DragTab {
         tab_index: usize,
         tab_position: RectF,
     },
-    DropTab,
+    DropTab {
+        source: EntityId,
+        tab_position: RectF,
+        cursor_position: Vector2F,
+    },
     StartGroupDrag(TabGroupId),
     DragGroup {
         group_id: TabGroupId,
@@ -953,7 +957,7 @@ impl WorkspaceAction {
             | MoveActiveTabRight
             | MoveTabLeft(_)
             | MoveTabRight(_)
-            | DropTab
+            | DropTab { .. }
             | DropGroup
             | RenameTab(_)
             | ResetTabName(_)
@@ -1096,7 +1100,7 @@ impl WorkspaceAction {
             | CreateTeamAIPrompt
             | OpenInExplorer { .. }
             | DragTab { .. }
-            | StartTabDrag
+            | StartTabDrag(_)
             | DragGroup { .. }
             | StartGroupDrag(_)
             | ToggleLeftPanel

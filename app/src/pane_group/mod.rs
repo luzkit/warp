@@ -178,6 +178,7 @@ use crate::{cmd_or_ctrl_shift, send_telemetry_from_ctx};
 
 mod ambient_pane_restoration;
 mod child_agent;
+mod enhanced_docking;
 pub(crate) use child_agent::materialization::{
     ChildPaneMaterialization, decide_child_pane_materialization,
 };
@@ -231,7 +232,7 @@ const MINIMUM_PANE_SIZE: f32 = 50.;
 const MINIMUM_PANE_SIZE_UDI: f32 = 190.;
 const KEYBOARD_RESIZE_DELTA: f32 = 10.;
 
-fn get_minimum_pane_size(app: &AppContext) -> f32 {
+pub(crate) fn get_minimum_pane_size(app: &AppContext) -> f32 {
     use crate::settings::InputSettings;
     if InputSettings::as_ref(app).is_universal_developer_input_enabled(app) {
         MINIMUM_PANE_SIZE_UDI

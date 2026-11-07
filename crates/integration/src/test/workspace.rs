@@ -1,8 +1,10 @@
 //! Integration tests for workspace-level behavior.
 
+mod docking;
 use std::fs;
 use std::time::Duration;
 
+pub use docking::test_dock_tab_preserves_running_processes;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use settings::Setting as _;

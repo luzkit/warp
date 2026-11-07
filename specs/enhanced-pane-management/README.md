@@ -95,7 +95,7 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | --- | --- | --- |
 | 1. Existing tab to split | Same-window single-terminal tab source, four directional targets, live split preview, cancel, live identity transfer, normal source-tab cleanup. | Implemented and verified in the isolated macOS development build. See the evidence log. |
 | 2. Rearrangement and docking | Intra-tab and inter-tab moves, swap, center Swap/Stack, pane-to-tab, atomic multi-pane layout moves, nested structure and optional flattening. | Implemented and verified with focused macOS integration and unit tests. See the evidence log. |
-| 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Pending |
+| 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Implemented and verified with focused macOS tests. See the evidence log. |
 | 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Pending |
 | 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Pending |
 | 6. Advanced interaction | Multi-selection and temporary groups, drag handles, explicit keyboard docking, searchable Pane and Workspace Navigator, focus options and accessibility. | Pending |
@@ -138,11 +138,9 @@ Transfers rebind focus observers to the new pane group. After detaching from a t
 
 Stack members retain their original `PaneId`, `TerminalPane`, metadata, and lifecycle subscriptions. One member occupies the visible slot. Workspace snapshots save all members as ordinary splits, so a restored stack uses split layout. Persistent members use the existing persistent owner restore behavior. An attached hidden member can be found and revealed by its owner UUID.
 
-The next milestone is adaptive resizing and transactional layout history. Undo and redo should resolve existing pane and session IDs and handle exited sessions without starting a replacement process.
-
 ### Moving a split pane back to a tab
 
-Open the terminal pane's header overflow and choose **Move pane to new tab**. The command moves the pane whose menu you opened, preserves its terminal view and process, and focuses the new tab. The existing drag back to the tab list remains available. The menu action uses the opt-in enhanced pane management flag.
+Open the terminal pane's header overflow and choose **Move to own tab**. The command moves the pane whose menu you opened, preserves its terminal view and process, and focuses the new tab. The existing drag back to the tab list remains available. The menu action uses the opt-in enhanced pane management flag.
 
 Docking into existing splits has no fixed pane count. Available space and the minimum usable size of each pane determine whether a layout fits.
 
@@ -150,10 +148,17 @@ Docking into existing splits has no fixed pane count. Available space and the mi
 
 - Drag an inactive tab to an edge of a visible terminal pane. If the source tab has multiple eligible terminals, the move keeps its nested splits and proportions. Hold **Option** on macOS or **Alt** on other platforms during the drag to flatten the incoming layout along the drop direction.
 - Drag a pane title to another pane in the same tab. To target a different tab, hover over its row first, then continue onto an edge in the layout outline. Hover shows pane geometry without rendering the inactive terminals or changing the active tab.
-- Drop on **Swap** or **Stack** in the center for two eligible terminals. A swap keeps both slots. A stack shares one slot and lists the original terminals in the pane menu. Close the visible member to reveal another, or choose **Move pane to new tab** to extract it.
+- Drop on **Swap** or **Stack** in the center for two eligible terminals. A swap keeps both slots. A stack shares one slot and lists the original terminals in the pane menu. Close the visible member to reveal another, or choose **Move to own tab** to extract it.
 - Drop a pane into a gap in the tab list to move it to its own tab. The pane menu provides the same operation.
 
 Cross-tab previews require an inactive destination whose pane area is clear of open side panels. Docking checks the size of each affected slot. Existing stacks can accept eligible terminals. For split or swap involving a stack member, move the member into its own tab first.
+
+### Resizing and layout history
+
+- Drag a divider to preview its new position. Release to commit, or press **Escape** to cancel. Double-click the divider to reset the proportions of its two neighbors.
+- Run **Balance Panes** from the Command Palette to rebalance the active tab. Use **Undo Pane Layout Change** and **Redo Pane Layout Change** to step through supported layout edits. All three commands support custom keybindings.
+- Each window keeps up to 32 recent layout edits until restart. History checks the tab order and the affected pane and session IDs before applying a change. A tab or session change can make an entry stale. If the layout needs a larger window, the entry remains available to try again.
+- History can replay docking, stacking, swapping, moving panes to tabs, and resizing. It moves or resizes existing panes and preserves their processes.
 
 ## Build and validation
 
@@ -172,7 +177,14 @@ docking_app="$CARGO_TARGET_DIR/debug/bundle/osx/WarpOss.app"
 
 Verify the bundle identifies itself as `dev.warp.WarpOss` before launching it. Set `HOME` and `ZDOTDIR` to a disposable directory for the binary launch to separate its shell startup and preferences from the production profile. For the feature-off control, omit `enhanced_pane_management` from `FEATURES` and use a distinct target and debug profile. An OSS build uses a persistent runtime by default on eligible macOS paths. For the ordinary-PTY control, set `WARP_PERSISTENT_PTY_DIR` to an existing regular file in the disposable runtime directory before launch and verify that the app logs its direct local PTY fallback. Turning off auto-reattach alone leaves the default runtime behavior in place.
 
-To launch the signed Milestone 2 build with an isolated shell and data profile on this Mac:
+Launch the signed Milestone 3 build with its isolated shell and data profile on this Mac.
+
+```sh
+/private/tmp/warp-docking-m3.GPjX9s/start
+```
+
+The launcher reuses the same private runtime directory across launches. The earlier
+Milestone 2 build has a separate profile and runtime.
 
 ```sh
 dock_stage=/private/tmp/warp-docking-m2.ea53i9
@@ -217,13 +229,22 @@ cargo clippy --locked -p integration --lib --bin integration \
   --features drag_tabs_to_windows -- -D warnings
 ```
 
+Milestone 3 adds the `test(test_pane_layout_)` filter to the integration run and
+`test(docking_layout_history)` to the app unit run. The stack regression also undoes
+the member extraction and the original stack. The resize test checks the actual
+divider gesture, terminal column count, and the three Command Palette actions.
+
 Run focused tests, then relevant lint checks, then format, in the order in [AGENTS.md](../../AGENTS.md). Keep one record per milestone with the exact commands, build and commit, platform, process-identity evidence, failures or unavailable tests, and the next milestone. Production installation and profiles stay separate from the development run.
 
 ### Evidence log
 
 | Item | Result |
 | --- | --- |
-| Move pane to new tab | The macOS integration test opened the unfocused pane's menu, checked its placement below **Maximize pane**, moved it, and verified both original terminal view and session IDs and the shell and foreground process IDs and start times. The new test and the tab docking regression passed on zsh and Bash. Both targeted Clippy checks passed. |
+| Milestone 3 integration checks | All 10 focused tests passed on Apple Silicon macOS with zsh and Bash. They verified the **Move to own tab** menu item, docking and stack undo, redo, stale history after shell exit, divider preview and Escape, committed terminal dimensions, divider reset, Balance Panes, and feature-off tab reordering. Process checks compared terminal view and session IDs and shell and foreground process IDs and start times. |
+| Milestone 3 app unit checks | All 44 focused tests passed. Coverage included nested pane minimums, maintaining preferred proportions as space returns, clamped divider movement, layout history limits, redo invalidation, and persistent stack routing. The app fixtures ran with native macOS system access. |
+| Milestone 3 WarpUI checks | All 25 focused Flex and wrap tests passed with `cargo nextest run --locked -p warpui_core --lib -E 'test(elements::gui::flex)'`. |
+| Milestone 3 lint and build | Targeted Clippy passed for the app, WarpUI core, and integration harness with warnings denied. The `dev.warp.WarpOss` development bundle passed strict code signature verification. The bundle CDHash is `78942cad369034288924248a12b29cd3e2afb69e`. The gestures were verified through the integration harness. |
+| Move to own tab | The macOS integration test opened the unfocused pane's menu, checked its placement below **Maximize pane**, moved it, and verified both original terminal view and session IDs and the shell and foreground process IDs and start times. The new test and the tab docking regression passed on zsh and Bash. Both targeted Clippy checks passed. |
 | Milestone 2 integration checks | All eight focused tests passed on Apple Silicon macOS with zsh and Bash 3.2. The tests covered directional docking, nested destinations, cross-tab preview and move, a whole nested layout, Swap, Stack and member extraction, the pane menu, and feature-off tab reorder. They compared live terminal views, sessions, shell and foreground process IDs, and process start times across the moves. |
 | Milestone 2 macOS development build | `/private/tmp/warp-docking-m2.ea53i9/WarpOss.app` was built as `dev.warp.WarpOss` with the enhanced pane management feature, signed and verified with strict code signature checks. The bundle CDHash is `6aad2dc6909d1a3dcbe599a23c17fe3f33755c34`. The Milestone 2 gestures were exercised through the integration harness. Manual checks of this bundle are pending. |
 | Milestone 2 unit checks | All 35 focused tests passed, covering the split tree, including layout flattening and minimum sizes, stack switching, closing and snapshot projection, and persistent close routing. The app fixtures required access to the macOS system configuration outside the filesystem sandbox. |
@@ -233,7 +254,7 @@ Run focused tests, then relevant lint checks, then format, in the order in [AGEN
 | Other platforms | Linux, Windows and the remaining platform matrix are pending. |
 | Compatibility with the persistent-session backend and ordinary PTY | The native run used the disposable runtime `/tmp/wpdock.9YetIM`, which retained both owner sockets after the move. The integration runner verified ordinary local PTYs under its isolated Integration channel. |
 | Performance | No measurements yet. Before rollout, measure busy workspaces at 10, 50 and 100 panes, recording preview frame time, planner cost, allocation or memory data, CPU overhead and input/output latency. Derive budgets from a feature-off baseline on the same hardware. |
-| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. |
+| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. |
 
 ## Contribution boundaries
 

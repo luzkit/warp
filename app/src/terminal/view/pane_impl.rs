@@ -68,6 +68,18 @@ impl TerminalView {
         self.focus_handle.as_ref()
     }
 
+    pub(crate) fn supports_terminal_docking(&self, ctx: &AppContext) -> bool {
+        if self.agent_view_controller.as_ref(ctx).is_active()
+            || self.is_ambient_agent_session(ctx)
+            || self.is_orchestration_split_off()
+        {
+            return false;
+        }
+
+        let model = self.model.lock();
+        !model.is_read_only() && !model.shared_session_status().is_sharer_or_viewer()
+    }
+
     fn handle_focus_state_event(
         &mut self,
         _focus_state: ModelHandle<PaneGroupFocusState>,
@@ -651,6 +663,15 @@ impl BackingView for TerminalView {
         &self,
         ctx: &AppContext,
     ) -> Vec<MenuItem<Self::PaneHeaderOverflowMenuAction>> {
+        let pane_state = self.split_pane_state(ctx);
+        let can_move_to_new_tab = FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && pane_state.is_in_split_pane()
+            && self
+                .pane_stack
+                .as_ref()
+                .and_then(|stack| stack.upgrade(ctx))
+                .is_some_and(|stack| stack.as_ref(ctx).depth() == 1)
+            && self.supports_terminal_docking(ctx);
         let model = self.model.lock();
         let mut items = vec![];
         let source = SharedSessionActionSource::PaneHeader;
@@ -704,12 +725,12 @@ impl BackingView for TerminalView {
         }
 
         // Split-pane related items.
-        if self.split_pane_state(ctx).is_in_split_pane() {
+        if pane_state.is_in_split_pane() {
             if !items.is_empty() {
                 items.push(MenuItem::Separator);
             }
 
-            let is_maximized = self.split_pane_state(ctx).is_maximized();
+            let is_maximized = pane_state.is_maximized();
             items.push(
                 MenuItemFields::toggle_pane_action(is_maximized)
                     .with_on_select_action(TerminalAction::ToggleMaximizePane)
@@ -719,6 +740,13 @@ impl BackingView for TerminalView {
                     ))
                     .into_item(),
             );
+            if can_move_to_new_tab {
+                items.push(
+                    MenuItemFields::new("Move pane to new tab")
+                        .with_on_select_action(TerminalAction::MovePaneToNewTab)
+                        .into_item(),
+                );
+            }
         }
 
         items
@@ -753,6 +781,9 @@ impl BackingView for TerminalView {
 
     /// Sets the focus handle for this terminal view, enabling it to track its split pane state.
     fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, ctx: &mut ViewContext<Self>) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         self.focus_handle = Some(focus_handle.clone());
         // Subscribe to focus state changes to update pane state when focus/split state changes
         ctx.subscribe_to_model(

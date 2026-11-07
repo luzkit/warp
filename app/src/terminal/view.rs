@@ -27871,6 +27871,7 @@ impl TypedActionView for TerminalView {
             | AltSelect(_)
             | AltMouseAction(_)
             | ToggleMaximizePane
+            | MovePaneToNewTab
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
             | InputContextMenuItem(_)
@@ -28184,6 +28185,13 @@ impl TypedActionView for TerminalView {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
+            MovePaneToNewTab => {
+                if let Some(focus_handle) = self.focus_handle() {
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::MovePaneToNewTab(
+                        focus_handle.pane_id(),
+                    ));
+                }
+            }
             PromptContextMenu {
                 position_offset_from_prompt,
             } => self.show_prompt_context_menu(*position_offset_from_prompt, ctx),

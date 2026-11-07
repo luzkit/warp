@@ -88,7 +88,7 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | Milestone | Planned work | Status |
 | --- | --- | --- |
 | 1. Existing tab to split | Same-window single-terminal tab source, four directional targets, live split preview, cancel, live identity transfer, normal source-tab cleanup. | Implemented and verified in the isolated macOS development build. See the evidence log. |
-| 2. Rearrangement and docking | Intra-tab and inter-tab moves, swap, center Swap/Stack, pane-to-tab, atomic multi-pane layout moves, nested structure and optional flattening. | Pending |
+| 2. Rearrangement and docking | Intra-tab and inter-tab moves, swap, center Swap/Stack, pane-to-tab, atomic multi-pane layout moves, nested structure and optional flattening. | The pane header menu action is implemented and verified. Other rearrangement work is in progress. |
 | 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Pending |
 | 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Pending |
 | 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Pending |
@@ -132,6 +132,12 @@ Before detaching one terminal from a nonempty group, move shared-session and AI 
 
 Stack should retain each member's existing `PaneId`, `TerminalPane`, metadata, and lifecycle subscriptions. The terminal view's existing navigation stack is for nested agent views and stores active-child state under the outer pane. A docking stack needs a layout slot with an active member, promotion when a member closes, and snapshot representation for all members.
 
+### Moving a split pane back to a tab
+
+Open the terminal pane's header overflow and choose **Move pane to new tab**. The command moves the pane whose menu you opened, preserves its terminal view and process, and focuses the new tab. The existing drag back to the tab list remains available. The menu action uses the opt-in enhanced pane management flag.
+
+Docking into existing splits has no fixed pane count. Available space and the minimum usable size of each pane determine whether a layout fits.
+
 ## Build and validation
 
 Build from the isolated worktree with the pinned Rust toolchain, Protobuf, Xcode and Metal tools, and the repository's macOS bundling prerequisites. This invokes the macOS runner directly to select the OSS binary and keep the debug bundle in the worktree.
@@ -174,6 +180,7 @@ Run focused tests, then relevant lint checks, then format, in the order in [AGEN
 
 | Item | Result |
 | --- | --- |
+| Move pane to new tab | The macOS integration test opened the unfocused pane's menu, checked its placement below **Maximize pane**, moved it, and verified both original terminal view and session IDs and the shell and foreground process IDs and start times. The new test and the tab docking regression passed on zsh and Bash. Both targeted Clippy checks passed. |
 | Milestone 1 automated checks | Final macOS nextest runs passed for zsh and Bash 3.2. `test_dock_tab_preserves_running_processes` covered all four previews, center rejection, Escape, and shell, workload, terminal view and session identity after a right split. `test_reorder_tabs_with_drag` passed with enhanced docking disabled. |
 | Milestone 1 macOS development build and process-identity comparison | Signed debug `WarpOss.app` on Apple Silicon. Native vertical-tab drag moved the source into the right split and focused it. Both command blocks retained their pre-move output and continued printing. Destination shell/workload PIDs were `84311` and `84496`. Source shell/workload PIDs were `84611` and `84746`. `ps` snapshots of all four PIDs, parent PIDs and start times were byte-identical before and after. |
 | Targeted lint and formatting | App and integration Clippy passed with warnings denied. Repository Rust formatting and the whitespace diff check passed. |

@@ -3142,22 +3142,8 @@ impl PaneGroup {
             me.discard_pane(*pane_id, ctx);
         });
 
-        // Catch-up share for children that existed before the parent
-        // started sharing — `inherit_share_for_local_child` only fires at
-        // child-pane creation time.
         #[cfg(not(target_family = "wasm"))]
-        ctx.subscribe_to_model(
-            &BlocklistAIHistoryModel::handle(ctx),
-            |me, _, event, ctx| {
-                if let BlocklistAIHistoryEvent::LocalSharedSessionEstablished {
-                    conversation_id,
-                    ..
-                } = event
-                {
-                    me.transitively_share_existing_local_children(*conversation_id, ctx);
-                }
-            },
-        );
+        Self::subscribe_to_child_sharing_events(ctx);
 
         let active_file_model = ctx.add_model(|_| ActiveFileModel::new());
 
@@ -3207,6 +3193,25 @@ impl PaneGroup {
         ctx.notify();
 
         pane_group
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn subscribe_to_child_sharing_events(ctx: &mut ViewContext<Self>) {
+        // Catch-up share for children that existed before the parent
+        // started sharing — `inherit_share_for_local_child` only fires at
+        // child-pane creation time.
+        ctx.subscribe_to_model(
+            &BlocklistAIHistoryModel::handle(ctx),
+            |me, _, event, ctx| {
+                if let BlocklistAIHistoryEvent::LocalSharedSessionEstablished {
+                    conversation_id,
+                    ..
+                } = event
+                {
+                    me.transitively_share_existing_local_children(*conversation_id, ctx);
+                }
+            },
+        );
     }
 
     /// Returns the conversation's owner, excluding panes detached for undo-close.

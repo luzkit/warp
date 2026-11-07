@@ -30,7 +30,7 @@ use crate::auth::auth_manager::LoginGatedFeature;
 use crate::drive::CloudObjectTypeAndId;
 use crate::drive::items::WarpDriveItemId;
 use crate::palette::PaletteMode;
-use crate::pane_group::PaneGroup;
+use crate::pane_group::{PaneGroup, PaneId};
 use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
 use crate::search;
 use crate::server::ids::{ServerId, SyncId};
@@ -147,6 +147,7 @@ pub enum WorkspaceAction {
     MoveActiveTabRight,
     MoveTabLeft(usize),
     MoveTabRight(usize),
+    MovePaneToNewTab(PaneId),
     RenameTab(usize),
     ResetTabName(usize),
     RenamePane(PaneViewLocator),
@@ -957,6 +958,7 @@ impl WorkspaceAction {
             | MoveActiveTabRight
             | MoveTabLeft(_)
             | MoveTabRight(_)
+            | MovePaneToNewTab(_)
             | DropTab { .. }
             | DropGroup
             | RenameTab(_)

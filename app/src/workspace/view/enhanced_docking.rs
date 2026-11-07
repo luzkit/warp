@@ -5,6 +5,35 @@ use crate::features::FeatureFlag;
 use crate::pane_group::{Direction, PaneGroup, PaneId};
 
 impl Workspace {
+    pub(super) fn move_pane_to_new_tab(&mut self, pane: PaneId, ctx: &mut ViewContext<Self>) {
+        if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            return;
+        }
+        let Some(active_tab) = self.tabs.get(self.active_tab_index) else {
+            return;
+        };
+        let source = active_tab.pane_group.clone();
+        if active_tab.detached
+            || (FeatureFlag::AgentManagementView.is_enabled()
+                && self.current_workspace_state.is_agent_management_view_open)
+            || self.tabs.iter().any(|tab| {
+                tab.pane_group
+                    .as_ref(ctx)
+                    .child_agent_origin()
+                    .is_some_and(|origin| origin.source_pane_group.id() == source.id())
+            })
+        {
+            return;
+        }
+
+        let (new_index, group) = self.new_tab_index_and_group(ctx);
+        if let Some(content) = source.update(ctx, |source, ctx| {
+            source.take_terminal_pane_for_new_tab(pane, ctx)
+        }) {
+            self.add_tab_from_existing_pane(content, new_index, group, ctx);
+        }
+    }
+
     fn terminal_tab_docking_source_index(
         &self,
         source: EntityId,

@@ -4,9 +4,11 @@ use pathfinder_geometry::vector::{Vector2F, vec2f};
 use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
 use warp::cmd_or_ctrl_shift;
 use warp::features::FeatureFlag;
+use warp::integration_testing::pane_group::{assert_focused_pane_index, assert_num_panes_in_tab};
 use warp::integration_testing::terminal::util::current_shell_starter_and_version;
 use warp::integration_testing::terminal::{
-    execute_long_running_command, wait_until_bootstrapped_single_pane_for_tab,
+    execute_long_running_command, execute_long_running_command_for_pane,
+    wait_until_bootstrapped_pane, wait_until_bootstrapped_single_pane_for_tab,
 };
 use warp::integration_testing::view_getters::{pane_group_view, terminal_view, workspace_view};
 use warp::integration_testing::workspace::{assert_focused_tab_index, assert_tab_count};
@@ -22,9 +24,10 @@ use warpui_core::{App, EntityId, TypedActionView, WindowId, async_assert, async_
 use super::{dispatch_mouse_event, tab_center};
 use crate::Builder;
 
-const PROCESS_SNAPSHOT: &str = "processes before docking";
+const PROCESS_SNAPSHOT: &str = "processes before transfer";
 const DOCK_POINT: &str = "dock point";
 const PREVIEW_POSITION: &str = "workspace_view:docking_preview";
+const MOVE_PANE_TO_NEW_TAB: &str = "Move pane to new tab";
 const COMMAND: &str = r#"sh -c 'printf "dock-child=%s\n" "$$"; exec sleep 120'"#;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,7 +96,7 @@ fn assert_processes_preserved(
 ) -> AssertionOutcome {
     let expected = data
         .get::<_, [TerminalProcesses; 2]>(PROCESS_SNAPSHOT)
-        .expect("Both terminals must have been observed before docking");
+        .expect("Both terminals must have been observed before the transfer");
     match terminal_processes(app, window_id, 0, 0).and_then(|destination| {
         Ok([
             destination,
@@ -103,6 +106,36 @@ fn assert_processes_preserved(
         Ok(actual) => async_assert_eq!(&actual, expected),
         Err(error) => AssertionOutcome::failure(error.to_string()),
     }
+}
+
+fn record_processes(source_tab: usize, source_pane: usize) -> TestStep {
+    TestStep::new("Record both live shells and commands")
+        .add_named_assertion_with_data_from_prior_step(
+            "Each terminal has its original live shell and command",
+            move |app, window_id, data| {
+                let snapshot = terminal_processes(app, window_id, 0, 0).and_then(|destination| {
+                    Ok([
+                        destination,
+                        terminal_processes(app, window_id, source_tab, source_pane)?,
+                    ])
+                });
+                match snapshot {
+                    Ok(snapshot) => {
+                        data.insert(PROCESS_SNAPSHOT, snapshot);
+                        AssertionOutcome::Success
+                    }
+                    Err(error) => AssertionOutcome::failure(error.to_string()),
+                }
+            },
+        )
+}
+
+fn shell_supports_process_tests() -> bool {
+    cfg!(unix)
+        && matches!(
+            current_shell_starter_and_version().0.shell_type(),
+            ShellType::Bash | ShellType::Zsh
+        )
 }
 
 fn saved_bounds(app: &App, window_id: WindowId, position_id: &str) -> Option<RectF> {
@@ -248,13 +281,7 @@ fn release_unchanged(name: &str) -> TestStep {
 pub fn test_dock_tab_preserves_running_processes() -> Builder {
     FeatureFlag::EnhancedPaneManagement.set_enabled(true);
     Builder::new()
-        .set_should_run_test(|| {
-            cfg!(unix)
-                && matches!(
-                    current_shell_starter_and_version().0.shell_type(),
-                    ShellType::Bash | ShellType::Zsh
-                )
-        })
+        .set_should_run_test(shell_supports_process_tests)
         .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
         .with_step(TestStep::new("Open a second tab").with_keystrokes(&[cmd_or_ctrl_shift("t")]))
         .with_step(wait_until_bootstrapped_single_pane_for_tab(1))
@@ -269,24 +296,7 @@ pub fn test_dock_tab_preserves_running_processes() -> Builder {
                 .add_assertion(assert_focused_tab_index(0)),
         )
         .with_step(execute_long_running_command(0, COMMAND.to_owned()))
-        .with_step(
-            TestStep::new("Record both live shells and commands")
-                .add_named_assertion_with_data_from_prior_step(
-                    "Each terminal has its original live shell and command",
-                    |app, window_id, data| {
-                        let snapshot = terminal_processes(app, window_id, 0, 0).and_then(
-                            |destination| Ok([destination, terminal_processes(app, window_id, 1, 0)?]),
-                        );
-                        match snapshot {
-                            Ok(snapshot) => {
-                                data.insert(PROCESS_SNAPSHOT, snapshot);
-                                AssertionOutcome::Success
-                            }
-                            Err(error) => AssertionOutcome::failure(error.to_string()),
-                        }
-                    },
-                ),
-        )
+        .with_step(record_processes(1, 0))
         .with_step(preview_right())
         .with_steps(preview_steps())
         .with_step(
@@ -326,6 +336,89 @@ pub fn test_dock_tab_preserves_running_processes() -> Builder {
                         }
                         outcome
                     },
+                ),
+        )
+}
+
+fn right_pane_overflow_button_id(app: &mut App, window_id: WindowId) -> String {
+    pane_group_view(app, window_id, 0).read(app, |group, _| {
+        let pane_id = group.pane_id_from_index(1).expect("Right pane exists");
+        let configuration_id = group
+            .pane_by_id(pane_id)
+            .expect("Right terminal exists")
+            .pane_configuration()
+            .id();
+        format!("pane_header_overflow_button:{configuration_id}")
+    })
+}
+
+pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
+    FeatureFlag::EnhancedPaneManagement.set_enabled(true);
+    Builder::new()
+        .set_should_run_test(shell_supports_process_tests)
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(
+            TestStep::new("Split the terminal to the right")
+                .with_keystrokes(&[cmd_or_ctrl_shift("d")])
+                .add_assertion(assert_focused_pane_index(0, 1)),
+        )
+        .with_step(wait_until_bootstrapped_pane(0, 1))
+        .with_step(execute_long_running_command_for_pane(0, 1, COMMAND))
+        .with_step(
+            TestStep::new("Focus the left pane")
+                .with_action(|app, window_id, _| {
+                    pane_group_view(app, window_id, 0).update(app, |group, ctx| {
+                        let pane = group.pane_id_from_index(0).expect("Left pane exists");
+                        group.focus_pane(pane, true, ctx);
+                    });
+                })
+                .add_assertion(assert_focused_pane_index(0, 0)),
+        )
+        .with_step(execute_long_running_command_for_pane(0, 0, COMMAND))
+        .with_step(record_processes(0, 1))
+        .with_step(
+            TestStep::new("Reveal the inactive pane's header controls")
+                .with_event_fn(|app, window_id| {
+                    let bounds = pane_bounds(app, window_id, 1);
+                    Event::MouseMoved {
+                        position: vec2f(bounds.center().x(), bounds.min_y() + 10.0),
+                        cmd: false,
+                        shift: false,
+                        is_synthetic: false,
+                    }
+                })
+                .add_assertion(assert_focused_pane_index(0, 0))
+                .add_named_assertion("Right pane overflow button is visible", |app, window_id| {
+                    let button_id = right_pane_overflow_button_id(app, window_id);
+                    async_assert!(saved_bounds(app, window_id, &button_id).is_some())
+                }),
+        )
+        .with_step(
+            TestStep::new("Open the inactive right pane's overflow menu")
+                .with_click_on_saved_position_fn(right_pane_overflow_button_id)
+                .add_named_assertion(
+                    "Move pane to new tab is below Maximize pane",
+                    |app, window_id| {
+                        let maximize = saved_bounds(app, window_id, "Maximize pane");
+                        let move_pane = saved_bounds(app, window_id, MOVE_PANE_TO_NEW_TAB);
+                        if let (Some(maximize), Some(move_pane)) = (maximize, move_pane) {
+                            async_assert!(move_pane.center().y() > maximize.center().y())
+                        } else {
+                            AssertionOutcome::failure("Expected both pane menu items".to_owned())
+                        }
+                    },
+                ),
+        )
+        .with_step(
+            TestStep::new("Move the right pane to a new tab")
+                .with_click_on_saved_position(MOVE_PANE_TO_NEW_TAB)
+                .add_assertion(assert_tab_count(2))
+                .add_assertion(assert_focused_tab_index(1))
+                .add_assertion(assert_num_panes_in_tab(0, 1))
+                .add_assertion(assert_num_panes_in_tab(1, 1))
+                .add_named_assertion_with_data_from_prior_step(
+                    "The selected pane and its original processes are now in the new tab",
+                    |app, window_id, data| assert_processes_preserved(app, window_id, data, 1, 0),
                 ),
         )
 }

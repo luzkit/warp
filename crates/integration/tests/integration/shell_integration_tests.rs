@@ -16,6 +16,8 @@ integration_tests! {
     test_add_and_close_session,
     // Test existing bash and zsh processes survive docking.
     test_dock_tab_preserves_running_processes,
+    // Test existing bash and zsh processes survive moving a split pane to a tab.
+    test_move_split_pane_to_new_tab_from_overflow,
     // Test powerlevel10k detection (via bootstrap script logic).
     test_detect_powerlevel10k,
     // Test properties of bootstrap.

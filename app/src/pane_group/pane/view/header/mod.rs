@@ -196,6 +196,9 @@ impl<P: BackingView> PaneHeader<P> {
         focus_handle: PaneFocusHandle,
         ctx: &mut ViewContext<Self>,
     ) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         ctx.subscribe_to_model(
             focus_handle.focus_state_handle(),
             |_me, _, event, ctx| match event {

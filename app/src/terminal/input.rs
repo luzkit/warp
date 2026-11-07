@@ -6768,6 +6768,9 @@ impl Input {
     }
 
     pub fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, ctx: &mut ViewContext<Self>) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         self.focus_handle = Some(focus_handle.clone());
         let focus_model = focus_handle.focus_state_handle().clone();
         ctx.subscribe_to_model(&focus_model, move |me, _, event, ctx| {

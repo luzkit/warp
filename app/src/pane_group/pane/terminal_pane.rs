@@ -195,17 +195,62 @@ impl TerminalPane {
             return false;
         }
 
-        let view = self.terminal_view(ctx);
-        let view = view.as_ref(ctx);
-        if view.agent_view_controller().as_ref(ctx).is_active()
-            || view.is_ambient_agent_session(ctx)
-            || view.is_orchestration_split_off()
-        {
-            return false;
-        }
+        self.terminal_view(ctx)
+            .as_ref(ctx)
+            .supports_terminal_docking(ctx)
+    }
 
-        let model = view.model.lock();
-        !model.is_read_only() && !model.shared_session_status().is_sharer_or_viewer()
+    pub(in crate::pane_group) fn subscribe_global_pane_models(
+        &self,
+        ctx: &mut ViewContext<PaneGroup>,
+    ) {
+        let terminal_pane_id = self.terminal_pane_id();
+        let terminal_view_id = self.terminal_view(ctx).id();
+        let manager_model = Manager::handle(ctx);
+        ctx.subscribe_to_model(&manager_model, move |group, model_handle, event, ctx| {
+            if let ManagerEvent::JoinedSession {
+                session_id: _,
+                view_id,
+            } = event
+            {
+                // only take action if the view id is ours
+                if *view_id == terminal_view_id {
+                    let url = retrieve_shared_session_link(model_handle.as_ref(ctx), view_id);
+                    group.handle_pane_link_updated(terminal_pane_id.into(), url, ctx);
+                }
+            }
+        });
+
+        #[cfg(feature = "local_fs")]
+        {
+            ctx.subscribe_to_model(
+                &BlocklistAIHistoryModel::handle(ctx),
+                move |group, _, event, ctx| {
+                    let Some(model_event_sender) = group.model_event_sender.clone() else {
+                        return;
+                    };
+
+                    let is_shared_ambient_agent_session = group
+                        .terminal_view_from_pane_id(terminal_pane_id, ctx)
+                        .map(|view| {
+                            view.as_ref(ctx)
+                                .model
+                                .lock()
+                                .is_shared_ambient_agent_session()
+                        })
+                        .unwrap_or(false);
+
+                    handle_ai_history_event(
+                        event,
+                        terminal_view_id,
+                        terminal_pane_id,
+                        model_event_sender,
+                        is_shared_ambient_agent_session,
+                        ctx,
+                    );
+                },
+            );
+        }
     }
 
     /// The [`TerminalView`] backing the [`PaneView`] for this terminal pane.
@@ -339,57 +384,13 @@ impl PaneContent for TerminalPane {
             group.send_sync_event_to_session(terminal_pane_id, &event, ctx);
         }
 
-        let terminal_view_id = self.terminal_view(ctx).id();
-        let manager_model = Manager::handle(ctx);
-        ctx.subscribe_to_model(&manager_model, move |group, model_handle, event, ctx| {
-            if let ManagerEvent::JoinedSession {
-                session_id: _,
-                view_id,
-            } = event
-            {
-                // only take action if the view id is ours
-                if *view_id == terminal_view_id {
-                    let url = retrieve_shared_session_link(model_handle.as_ref(ctx), view_id);
-                    group.handle_pane_link_updated(terminal_pane_id.into(), url, ctx);
-                }
-            }
-        });
-
-        #[cfg(feature = "local_fs")]
-        {
-            ctx.subscribe_to_model(
-                &BlocklistAIHistoryModel::handle(ctx),
-                move |group, _, event, ctx| {
-                    let Some(model_event_sender) = group.model_event_sender.clone() else {
-                        return;
-                    };
-
-                    let is_shared_ambient_agent_session = group
-                        .terminal_view_from_pane_id(terminal_pane_id, ctx)
-                        .map(|view| {
-                            view.as_ref(ctx)
-                                .model
-                                .lock()
-                                .is_shared_ambient_agent_session()
-                        })
-                        .unwrap_or(false);
-
-                    handle_ai_history_event(
-                        event,
-                        terminal_view_id,
-                        terminal_pane_id,
-                        model_event_sender,
-                        is_shared_ambient_agent_session,
-                        ctx,
-                    );
-                },
-            );
-        }
+        self.subscribe_global_pane_models(ctx);
 
         // Store the pane group entity ID on the agent view controller so the
         // message bar can perform pane-group-scoped visibility checks.
         let pane_group_id = ctx.view_id();
         let terminal_view = self.terminal_view(ctx);
+        let terminal_view_id = terminal_view.id();
         let agent_view_controller = terminal_view.as_ref(ctx).agent_view_controller().clone();
         agent_view_controller.update(ctx, |controller, _ctx| {
             controller.set_pane_group_id(pane_group_id);

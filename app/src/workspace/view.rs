@@ -24269,6 +24269,7 @@ impl TypedActionView for Workspace {
             MoveActiveTabRight => self.move_tab(self.active_tab_index, TabMovement::Right, ctx),
             MoveTabLeft(index) => self.move_tab(*index, TabMovement::Left, ctx),
             MoveTabRight(index) => self.move_tab(*index, TabMovement::Right, ctx),
+            MovePaneToNewTab(pane) => self.move_pane_to_new_tab(*pane, ctx),
             RenameTab(index) => self.rename_tab(*index, ctx),
             ResetTabName(index) => self.clear_tab_name(*index, ctx),
             RenamePane(locator) => self.rename_pane(*locator, ctx),

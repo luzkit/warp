@@ -139,6 +139,9 @@ impl<P: BackingView> PaneView<P> {
 
     /// Sets the focus handle for this pane view, enabling it to track its split pane state.
     pub fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, ctx: &mut ViewContext<Self>) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         ctx.subscribe_to_model(focus_handle.focus_state_handle(), |me, _, event, ctx| {
             me.handle_focus_state_event(event, ctx);
         });

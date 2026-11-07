@@ -1,0 +1,336 @@
+name: Notarized fork macOS release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing fork-vX.Y.Z tag at the current reviewed master commit
+        required: true
+        type: string
+      preflight_only:
+        description: Check the release source and Mac signing credentials without building
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-notarized-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: master
+          persist-credentials: false
+      - name: Freeze reviewed release source
+        id: source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: luzkit/warp
+        run: |
+          [[ "$RELEASE_TAG" =~ ^fork-v(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)$ ]]
+          git fetch --no-tags origin \
+            '+refs/heads/master:refs/remotes/origin/master' \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          source_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$source_sha" = "$(git rev-parse refs/remotes/origin/master)"
+          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          releases = json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text())
+          if any(release["tag_name"] == os.environ["RELEASE_TAG"] for page in releases for release in page):
+              raise SystemExit("A release already exists for this tag; use a new version")
+          PY
+          printf 'source_sha=%s\nversion=%s\n' "$source_sha" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  preflight:
+    needs: resolve
+    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: [self-hosted, macOS, ARM64, personal-mac]
+    timeout-minutes: 10
+    outputs:
+      signing_identity: ${{ steps.signing.outputs.identity }}
+      signing_team: ${{ steps.signing.outputs.team }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-preflight
+          persist-credentials: false
+          sparse-checkout: script/macos
+      - name: Resolve the existing signing identity and team
+        id: signing
+        env:
+          CONFIGURED_IDENTITY: ${{ vars.MAC_SIGNING_IDENTITY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+
+          identity = os.environ["CONFIGURED_IDENTITY"].removeprefix("Developer ID Application: ")
+          match = re.fullmatch(r"[^\r\n]+ \(([A-Z0-9]{10})\)", identity)
+          if not match:
+              raise SystemExit("MAC_SIGNING_IDENTITY must name a Developer ID identity with its ten-character team suffix")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"identity=Developer ID Application: {identity}\nteam={match[1]}\n")
+          PY
+      - name: Check Developer ID identity and Keychain profile
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-preflight
+        env:
+          MAC_SIGNING_IDENTITY: ${{ steps.signing.outputs.identity }}
+          APPLE_TEAM_ID: ${{ steps.signing.outputs.team }}
+          APPLE_KEYCHAIN_PROFILE: ${{ vars.APPLE_KEYCHAIN_PROFILE }}
+        run: python3 script/macos/fork_signing.py preflight
+
+  build:
+    needs: [resolve, preflight]
+    if: ${{ !inputs.preflight_only }}
+    runs-on: macos-15
+    timeout-minutes: 180
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      unsigned_sha256: ${{ steps.digest.outputs.sha256 }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'false'
+      CARGO_INCREMENTAL: '0'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+          lfs: true
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: '26'
+      - name: Install build tools
+        run: |
+          test "$(uname -m)" = arm64
+          rustup show active-toolchain
+          brew install protobuf jq pkgconf
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: fork-macos-arm64-release-v1
+          cache-all-crates: false
+          cache-on-failure: true
+      - name: Install packaging tools
+        run: |
+          ./script/install_cargo_bundle
+          ./script/install_cargo_release_deps --no-build-deps
+      - name: Build unsigned installer
+        id: bundle
+        env:
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          WARP_FORK_SIGNING_MODE: ad-hoc
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          ./script/macos/bundle-fork "$RELEASE_VERSION" "$RUNNER_TEMP/fork-unsigned"
+      - name: Record unsigned installer digest
+        id: digest
+        env:
+          ARTIFACT_DIR: ${{ steps.bundle.outputs.artifact_dir }}
+          ARTIFACT_NAME: ${{ steps.bundle.outputs.artifact_name }}
+        run: |
+          digest="$(shasum -a 256 "$ARTIFACT_DIR/$ARTIFACT_NAME.dmg")"
+          printf 'sha256=%s\n' "${digest%% *}" >> "$GITHUB_OUTPUT"
+      - name: Upload exact unsigned installer
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.bundle.outputs.artifact_dir }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  sign:
+    needs: [resolve, preflight, build]
+    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && !inputs.preflight_only }}
+    runs-on: [self-hosted, macOS, ARM64, personal-mac]
+    timeout-minutes: 60
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-sign
+          persist-credentials: false
+          sparse-checkout: |
+            script/macos
+            script/Entitlements.plist
+          sparse-checkout-cone-mode: false
+      - name: Allocate fresh signing paths
+        id: paths
+        run: |
+          signing_root="$(mktemp -d "$RUNNER_TEMP/fork-sign-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")"
+          printf 'input=%s/unsigned\noutput=%s/signed\n' "$signing_root" "$signing_root" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          merge-multiple: true
+          path: ${{ steps.paths.outputs.input }}
+      - name: Sign and notarize the verified hosted artifact
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-sign
+        env:
+          MAC_SIGNING_IDENTITY: ${{ needs.preflight.outputs.signing_identity }}
+          APPLE_TEAM_ID: ${{ needs.preflight.outputs.signing_team }}
+          APPLE_KEYCHAIN_PROFILE: ${{ vars.APPLE_KEYCHAIN_PROFILE }}
+          INPUT_DIR: ${{ steps.paths.outputs.input }}
+          OUTPUT_DIR: ${{ steps.paths.outputs.output }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          EXPECTED_UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+        run: |
+          digest="$(shasum -a 256 "$INPUT_DIR/WarpOss-macos-arm64-$RELEASE_VERSION.dmg")"
+          test "${digest%% *}" = "$EXPECTED_UNSIGNED_SHA256"
+          python3 script/macos/notarize_fork.py "$INPUT_DIR" "$OUTPUT_DIR" \
+            --expected-source-sha "$SOURCE_SHA" --expected-version "$RELEASE_VERSION"
+      - name: Upload signed installer and receipts
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-notarized-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.paths.outputs.output }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Preserve safe notarization receipts on failure
+        if: ${{ failure() && steps.paths.outputs.output != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-notarization-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.paths.outputs.output }}/*-notarization.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  verify:
+    needs: [resolve, preflight, build, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.sign.outputs.artifact_id }}
+          merge-multiple: true
+          path: installer
+      - name: Verify signed provenance and final checksum
+        id: verify
+        env:
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          UNSIGNED_SHA256: ${{ needs.build.outputs.unsigned_sha256 }}
+          APPLE_TEAM_ID: ${{ needs.preflight.outputs.signing_team }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          directory = Path("installer")
+          base = f"WarpOss-macos-arm64-{os.environ['RELEASE_VERSION']}"
+          suffixes = (".dmg", ".dmg.sha256", ".json", ".app-notarization.json", ".dmg-notarization.json")
+          if {path.name for path in directory.iterdir()} != {base + suffix for suffix in suffixes}:
+              raise SystemExit("Unexpected signed release assets")
+          if any(path.is_symlink() or not path.is_file() for path in directory.iterdir()):
+              raise SystemExit("Release assets must be regular files")
+          metadata = json.loads((directory / f"{base}.json").read_text())
+          expected = {
+              "repository": "luzkit/warp", "version": os.environ["RELEASE_VERSION"],
+              "commit": os.environ["SOURCE_SHA"], "target": "aarch64-apple-darwin",
+              "profile": "release", "signing": "developer-id", "signing_team": os.environ["APPLE_TEAM_ID"],
+              "unsigned_installer_sha256": os.environ["UNSIGNED_SHA256"],
+              "signing_workflow": {
+                  "repository": "luzkit/nab-release-app", "run_id": os.environ["GITHUB_RUN_ID"],
+                  "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+                  "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+              },
+          }
+          if any(metadata.get(key) != value for key, value in expected.items()):
+              raise SystemExit("Signed release provenance does not match this run")
+          if metadata.get("source_dirty") is not False or metadata.get("notarized") is not True:
+              raise SystemExit("The release must be a clean, notarized build")
+          if sorted(metadata.get("features", [])) != ["extern_plist", "gui", "release_bundle"]:
+              raise SystemExit("Unexpected release build features")
+          if not re.fullmatch(r"[A-Z0-9]{10}", os.environ["APPLE_TEAM_ID"]):
+              raise SystemExit("Invalid expected signing team")
+          for kind in ("app", "dmg"):
+              receipt = json.loads((directory / f"{base}.{kind}-notarization.json").read_text())
+              submission = receipt.get("id", "")
+              if receipt.get("status") != "Accepted" or not re.fullmatch(r"[0-9a-fA-F-]{36}", submission):
+                  raise SystemExit("Missing accepted notarization receipt")
+              if metadata.get("notarization", {}).get(f"{kind}_submission_id") != submission:
+                  raise SystemExit("Notarization receipt differs from release provenance")
+          image = directory / f"{base}.dmg"
+          with image.open("rb") as stream:
+              digest = hashlib.file_digest(stream, "sha256").hexdigest()
+          if (directory / f"{base}.dmg.sha256").read_text() != f"{digest}  {image.name}\n":
+              raise SystemExit("Final signed installer checksum mismatch")
+          print("Signed release source, notarization receipts, and checksum verified")
+          PY
+      - name: Recheck tag and summarize verified release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: luzkit/warp
+          RELEASE_TAG: ${{ needs.resolve.outputs.version }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
+          SIGNED_ARTIFACT_ID: ${{ needs.sign.outputs.artifact_id }}
+        run: |
+          git fetch --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
+          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          releases = json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text())
+          if any(release["tag_name"] == os.environ["RELEASE_TAG"] for page in releases for release in page):
+              raise SystemExit("A release already exists; refusing to replace it")
+          PY
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          Verified Developer ID signed, Apple-notarized and stapled Apple Silicon installer.
+
+          Source: [luzkit/warp $RELEASE_TAG](https://github.com/luzkit/warp/tree/$SOURCE_SHA).
+
+          Commit: \`$SOURCE_SHA\`.
+
+          [Download the signed installer, final checksum, provenance and receipts](https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts/$SIGNED_ARTIFACT_ID).
+
+          No public release was created. Before publishing, verify this successful run and recheck the tag and any existing public or draft release with an account authorized for luzkit/warp.
+          EOF

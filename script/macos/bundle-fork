@@ -26,6 +26,26 @@ fi
 output_dir="${2:-$repo_root/dist/fork}"
 mkdir -p "$output_dir"
 output_dir="$(cd "$output_dir" && pwd)"
+artifact_name="WarpOss-macos-arm64-$version"
+signing_mode="${WARP_FORK_SIGNING_MODE:-ad-hoc}"
+signing_helper="$repo_root/script/macos/fork_signing.py"
+python3 "$signing_helper" validate-version "$version"
+case "$signing_mode" in
+    ad-hoc) ;;
+    developer-id)
+        for existing in "$output_dir/$artifact_name".*; do
+            if [[ -e "$existing" ]]; then
+                echo "Signed release output already exists; use a fresh output directory: $existing" >&2
+                exit 1
+            fi
+        done
+        python3 "$signing_helper" preflight
+        ;;
+    *)
+        echo "WARP_FORK_SIGNING_MODE must be ad-hoc or developer-id." >&2
+        exit 1
+        ;;
+esac
 
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_PROFILE_RELEASE_DEBUG=0
@@ -44,6 +64,7 @@ rm -rf "$app_bundle"
 )
 ./script/macos/add_framework_rpath "$binary"
 WARP_PLIST_PATH="$app_bundle/Contents/Info.plist" WARP_SCHEME_NAME=warposs ./script/update_plist
+python3 "$signing_helper" set-version "$app_bundle" "$version"
 
 plugin="$target_dir/release/WarpDockTilePlugin.docktileplugin"
 mkdir -p "$app_bundle/Contents/PlugIns"
@@ -71,8 +92,14 @@ entitlements.pop("com.apple.security.application-groups", None)
 with open(sys.argv[2], "wb") as destination:
     plistlib.dump(entitlements, destination)
 PY
-codesign --force --deep --options runtime --sign - \
-    --entitlements "$packaging_dir/entitlements.plist" "$app_bundle"
+if [[ "$signing_mode" == developer-id ]]; then
+    python3 "$signing_helper" sign-app "$app_bundle" "$packaging_dir/entitlements.plist"
+    python3 "$signing_helper" notarize-app "$app_bundle" "$packaging_dir/app.zip" \
+        "$output_dir/$artifact_name.app-notarization.json"
+else
+    codesign --force --deep --options runtime --sign - \
+        --entitlements "$packaging_dir/entitlements.plist" "$app_bundle"
+fi
 codesign --verify --deep --strict "$app_bundle"
 test "$(lipo -archs "$binary")" = arm64
 test -s "$app_bundle/Contents/Resources/THIRD_PARTY_LICENSES.txt"
@@ -81,33 +108,37 @@ test -s "$app_bundle/Contents/Resources/settings_schema.json"
 mkdir "$packaging_dir/image"
 ditto "$app_bundle" "$packaging_dir/image/WarpOss.app"
 ln -s /Applications "$packaging_dir/image/Applications"
-cat > "$packaging_dir/image/README.txt" <<'EOF'
-WarpOss — luzkit/warp fork for Apple Silicon
+if [[ "$signing_mode" == developer-id ]]; then
+    python3 "$signing_helper" write-readme "$packaging_dir/image/README.txt" --notarized
+else
+    python3 "$signing_helper" write-readme "$packaging_dir/image/README.txt"
+fi
 
-Drag WarpOss.app into Applications, then open it from Applications.
-This build is ad hoc signed and is not notarized by Apple. macOS may require
-approval in System Settings > Privacy & Security before its first launch.
-
-Persistent sessions: use the terminal pane menu to name or detach a session.
-Use Attach to Session in Warp search to reconnect. End Session stops the shell.
-Sessions survive closing the app after being retained, but not a reboot or loss
-of their owning process. Scrollback is bounded.
-
-Source and installation details: https://github.com/luzkit/warp
-EOF
-
-artifact_name="WarpOss-macos-arm64-$version"
 dmg_path="$output_dir/$artifact_name.dmg"
 hdiutil create -ov -volname WarpOss -srcfolder "$packaging_dir/image" \
     -fs APFS -format UDZO "$dmg_path"
+if [[ "$signing_mode" == developer-id ]]; then
+    python3 "$signing_helper" finish-dmg "$dmg_path" "$output_dir/$artifact_name.dmg-notarization.json"
+fi
 hdiutil verify "$dmg_path"
 (
     cd "$output_dir"
     shasum -a 256 "$artifact_name.dmg" > "$artifact_name.dmg.sha256"
 )
-python3 - "$output_dir/$artifact_name.json" "$version" "$(git rev-parse HEAD)" "$(rustc --version)" "$features" "$source_dirty" <<'PY'
+python3 - "$output_dir/$artifact_name.json" "$version" "$(git rev-parse HEAD)" "$(rustc --version)" "$features" "$source_dirty" "$signing_mode" <<'PY'
 import json
+import os
+from pathlib import Path
 import sys
+
+notarization = {}
+if sys.argv[7] == "developer-id":
+    artifact_base = Path(sys.argv[1]).with_suffix("")
+    for kind in ("app", "dmg"):
+        evidence = json.loads(Path(f"{artifact_base}.{kind}-notarization.json").read_text())
+        if evidence["status"] != "Accepted":
+            raise SystemExit("Refusing release metadata without accepted notarization")
+        notarization[f"{kind}_submission_id"] = evidence["id"]
 
 with open(sys.argv[1], "w") as destination:
     json.dump({
@@ -119,8 +150,10 @@ with open(sys.argv[1], "w") as destination:
         "features": sys.argv[5].split(","),
         "target": "aarch64-apple-darwin",
         "profile": "release",
-        "signing": "ad-hoc",
-        "notarized": False,
+        "signing": sys.argv[7],
+        "signing_team": os.environ["APPLE_TEAM_ID"] if notarization else None,
+        "notarized": bool(notarization),
+        "notarization": notarization,
     }, destination, indent=2)
     destination.write("\n")
 PY

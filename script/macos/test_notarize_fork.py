@@ -16,6 +16,9 @@ import notarize_fork as installer
 
 class NotarizeForkTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

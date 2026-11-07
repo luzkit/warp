@@ -70,14 +70,13 @@ jobs:
             "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           source_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
           test "$source_sha" = "$(git rev-parse refs/remotes/origin/master)"
-          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags.txt"
           python3 - <<'PY'
-          import json
           import os
           from pathlib import Path
 
-          releases = json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text())
-          if any(release["tag_name"] == os.environ["RELEASE_TAG"] for page in releases for release in page):
+          tags = (Path(os.environ["RUNNER_TEMP"]) / "release-tags.txt").read_text().splitlines()
+          if os.environ["RELEASE_TAG"] in tags:
               raise SystemExit("A release already exists for this tag; use a new version")
           PY
           printf 'source_sha=%s\nversion=%s\n' "$source_sha" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
@@ -381,14 +380,13 @@ jobs:
         run: |
           git fetch --no-tags origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
-          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' > "$RUNNER_TEMP/release-tags.txt"
           python3 - <<'PY'
-          import json
           import os
           from pathlib import Path
 
-          releases = json.loads((Path(os.environ["RUNNER_TEMP"]) / "releases.json").read_text())
-          if any(release["tag_name"] == os.environ["RELEASE_TAG"] for page in releases for release in page):
+          tags = (Path(os.environ["RUNNER_TEMP"]) / "release-tags.txt").read_text().splitlines()
+          if os.environ["RELEASE_TAG"] in tags:
               raise SystemExit("A release already exists; refusing to replace it")
           PY
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF

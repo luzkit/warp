@@ -27872,6 +27872,7 @@ impl TypedActionView for TerminalView {
             | AltMouseAction(_)
             | ToggleMaximizePane
             | MovePaneToNewTab
+            | ShowStackedPane(_)
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
             | InputContextMenuItem(_)
@@ -28191,6 +28192,9 @@ impl TypedActionView for TerminalView {
                         focus_handle.pane_id(),
                     ));
                 }
+            }
+            ShowStackedPane(locator) => {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::FocusPane(*locator));
             }
             PromptContextMenu {
                 position_offset_from_prompt,

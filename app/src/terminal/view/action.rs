@@ -46,6 +46,7 @@ use crate::terminal::view::RichContentSecretTooltipInfo;
 use crate::terminal::view::inline_banner::AgentModeSetupSpeedbumpBannerAction;
 use crate::terminal::view::passive_suggestions::PromptSuggestionResolution;
 use crate::workflows::workflow::Workflow;
+use crate::workspace::PaneViewLocator;
 
 /// Version of the agent onboarding flow (non-legacy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,6 +204,7 @@ pub enum TerminalAction {
     Close,
     ToggleMaximizePane,
     MovePaneToNewTab,
+    ShowStackedPane(PaneViewLocator),
     SplitRight(Option<AvailableShell>),
     SplitLeft(Option<AvailableShell>),
     SplitDown(Option<AvailableShell>),
@@ -568,6 +570,7 @@ impl fmt::Debug for TerminalAction {
             SplitUp(_) => f.write_str("SplitUp"),
             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
             MovePaneToNewTab => f.write_str("MovePaneToNewTab"),
+            ShowStackedPane(_) => f.write_str("ShowStackedPane"),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => write!(

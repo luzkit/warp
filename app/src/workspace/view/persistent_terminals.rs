@@ -95,6 +95,20 @@ impl Workspace {
     }
 
     fn open_persistent_terminal(&mut self, path: PathBuf, id: Uuid, ctx: &mut ViewContext<Self>) {
+        if let Some((tab, pane)) = self.find_persistent_terminal(id, ctx)
+            && self.focus_attached_stack_member(tab, pane, ctx)
+        {
+            return;
+        }
+        if let Some((workspace, tab, pane)) =
+            Self::find_persistent_terminal_in_other_window(id, ctx)
+            && workspace.update(ctx, |workspace, ctx| {
+                workspace.focus_attached_stack_member(tab, pane, ctx)
+            })
+        {
+            return;
+        }
+
         ctx.spawn(
             persistent_request(move || {
                 let runtime = Runtime::new(path)?;
@@ -143,17 +157,9 @@ impl Workspace {
             self.replace_persistent_terminal(tab, pane, layout, ctx);
             return;
         }
-        let existing = WorkspaceRegistry::as_ref(ctx)
-            .all_workspaces(ctx)
-            .into_iter()
-            .filter(|(id, _)| *id != ctx.window_id())
-            .find_map(|(_, workspace)| {
-                let (tab, pane) = workspace
-                    .as_ref(ctx)
-                    .find_persistent_terminal(layout.id, ctx)?;
-                Some((workspace, tab, pane))
-            });
-        if let Some((workspace, tab, pane)) = existing {
+        if let Some((workspace, tab, pane)) =
+            Self::find_persistent_terminal_in_other_window(layout.id, ctx)
+        {
             workspace.update(ctx, |workspace, ctx| {
                 workspace.replace_persistent_terminal(tab, pane, layout, ctx);
             });
@@ -176,6 +182,44 @@ impl Workspace {
                 .find_persistent_session(id, ctx)?;
             Some((tab, pane))
         })
+    }
+
+    fn find_persistent_terminal_in_other_window(
+        id: Uuid,
+        ctx: &ViewContext<Self>,
+    ) -> Option<(ViewHandle<Self>, usize, PaneId)> {
+        WorkspaceRegistry::as_ref(ctx)
+            .all_workspaces(ctx)
+            .into_iter()
+            .filter(|(id, _)| *id != ctx.window_id())
+            .find_map(|(_, workspace)| {
+                let (tab, pane) = workspace.as_ref(ctx).find_persistent_terminal(id, ctx)?;
+                Some((workspace, tab, pane))
+            })
+    }
+
+    fn focus_attached_stack_member(
+        &mut self,
+        tab: usize,
+        pane: PaneId,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let group = &self.tabs[tab].pane_group;
+        let pane_group = group.as_ref(ctx);
+        if pane_group.docked_stack_members(pane).is_none()
+            || !pane_group.persistent_session_is_attached(pane, ctx)
+        {
+            return false;
+        }
+
+        self.focus_pane(
+            PaneViewLocator {
+                pane_group_id: group.id(),
+                pane_id: pane,
+            },
+            ctx,
+        );
+        true
     }
 
     fn replace_persistent_terminal(
@@ -336,7 +380,7 @@ impl Workspace {
                 }
                 Err(err) => {
                     if let Some(group) =
-                        workspace.get_pane_group_view_with_id(locator.pane_group_id)
+                        workspace.persistent_pane_for_request(locator.pane_id, id, ctx)
                     {
                         group.update(ctx, |group, ctx| {
                             group.set_persistent_session_ending(locator.pane_id, id, false, ctx);
@@ -354,17 +398,12 @@ impl Workspace {
         id: Uuid,
         ctx: &mut ViewContext<Self>,
     ) -> Option<ViewHandle<PaneGroup>> {
-        let group = self
-            .get_pane_group_view_with_id(locator.pane_group_id)?
-            .clone();
-        if group
-            .as_ref(ctx)
-            .persistent_session_id(locator.pane_id, ctx)
-            != Some(id)
+        let group = self.persistent_pane_for_request(locator.pane_id, id, ctx)?;
+        let pane_group = group.as_ref(ctx);
+        if self.tabs.len() == 1
+            && pane_group.visible_pane_count() == 1
+            && pane_group.docked_stack_members(locator.pane_id).is_none()
         {
-            return None;
-        }
-        if self.tabs.len() == 1 && group.as_ref(ctx).visible_pane_count() == 1 {
             self.add_new_session_tab_internal_with_default_session_mode_behavior(
                 NewSessionSource::Tab,
                 Some(ctx.window_id()),
@@ -376,6 +415,17 @@ impl Workspace {
             );
         }
         Some(group)
+    }
+
+    fn persistent_pane_for_request(
+        &self,
+        pane: PaneId,
+        id: Uuid,
+        ctx: &AppContext,
+    ) -> Option<ViewHandle<PaneGroup>> {
+        self.tab_views()
+            .find(|group| group.as_ref(ctx).persistent_session_id(pane, ctx) == Some(id))
+            .cloned()
     }
 
     fn persistent_terminal_error(&self, err: anyhow::Error, ctx: &mut ViewContext<Self>) {

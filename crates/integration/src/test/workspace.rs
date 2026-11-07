@@ -5,7 +5,9 @@ use std::fs;
 use std::time::Duration;
 
 pub use docking::{
+    test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
     test_dock_tab_preserves_running_processes, test_move_split_pane_to_new_tab_from_overflow,
+    test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
 };
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};

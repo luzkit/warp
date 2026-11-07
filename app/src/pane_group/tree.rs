@@ -34,6 +34,10 @@ pub fn get_divider_thickness() -> f32 {
     }
 }
 
+pub(crate) fn get_divider_layout_extent() -> f32 {
+    get_divider_thickness() - 1.0
+}
+
 // Extra padding for the divider to make it easier to resize.
 // This is added around each side of the divider. Only used
 // when minimalist UI is enabled.
@@ -462,6 +466,126 @@ impl PaneData {
         successful_split
     }
 
+    /// Splits a visible leaf's existing slot, optionally flattening the incoming layout.
+    /// Returns the incoming tree unchanged if it cannot be inserted.
+    pub(super) fn insert_docked_subtree(
+        &mut self,
+        target: PaneId,
+        incoming: Self,
+        direction: Direction,
+        flatten: bool,
+    ) -> Result<(), Self> {
+        if incoming.is_empty() || !incoming.hidden_panes.is_empty() || !self.can_dock_leaf(target) {
+            return Err(incoming);
+        }
+
+        let mut pane_ids: HashSet<_> = self
+            .pane_ids()
+            .into_iter()
+            .chain(self.hidden_panes.iter().map(|pane| pane.pane_id))
+            .collect();
+        let incoming_ids = incoming.pane_ids();
+        let incoming_len = incoming.len();
+        if incoming_ids.len() != incoming_len || !incoming_ids.iter().all(|id| pane_ids.insert(*id))
+        {
+            return Err(incoming);
+        }
+
+        let Some(leaf) = self.root.find_leaf_mut(target) else {
+            return Err(incoming);
+        };
+        let incoming_root = if flatten && incoming_len > 1 {
+            let leaves = incoming_ids
+                .into_iter()
+                .map(|id| (DEFAULT_FLEX_SIZE, PaneNode::Leaf(id)))
+                .collect();
+            Self::new_branch(direction.axis(), leaves, incoming_len).root
+        } else {
+            incoming.root
+        };
+        *leaf = PaneNode::Branch(PaneBranch::new(
+            PaneNode::Leaf(target),
+            incoming_root,
+            direction,
+        ));
+        self.len += incoming_len;
+        Ok(())
+    }
+
+    /// Checks the minimum size of each leaf in a proposed subtree allocation.
+    pub(super) fn docked_subtree_fits(
+        &self,
+        size: Vector2F,
+        minimum: f32,
+        flatten_along: Option<Direction>,
+    ) -> bool {
+        if self.is_empty() || !self.hidden_panes.is_empty() {
+            return false;
+        }
+
+        let divider = get_divider_layout_extent();
+        if let Some(direction) = flatten_along {
+            let (along, across) = match direction.axis() {
+                SplitDirection::Horizontal => (size.x(), size.y()),
+                SplitDirection::Vertical => (size.y(), size.x()),
+            };
+            let count = self.len() as f32;
+            across >= minimum && along >= count * minimum + (count - 1.) * divider
+        } else {
+            self.root.fits_docking_size(size, minimum, divider)
+        }
+    }
+
+    /// Computes visible leaf geometry without laying out the associated views.
+    pub(super) fn docking_preview_rects(&self, bounds: RectF) -> Vec<(PaneId, RectF)> {
+        if self.is_empty() || !self.hidden_panes.is_empty() {
+            return Vec::new();
+        }
+        let mut panes = Vec::with_capacity(self.len());
+        self.root
+            .collect_docking_rects(bounds, get_divider_layout_extent(), &mut panes);
+        panes
+    }
+
+    /// Moves a visible pane into a nested split at another leaf's slot.
+    pub(super) fn move_pane_to_split(
+        &mut self,
+        moved: PaneId,
+        target: PaneId,
+        direction: Direction,
+    ) -> bool {
+        if moved == target
+            || !self.can_dock_leaf(moved)
+            || !self.can_dock_leaf(target)
+            || self.sibling_by_direction(target, direction) == Some(moved)
+            || !self.remove(moved)
+        {
+            return false;
+        }
+
+        let leaf = self
+            .root
+            .find_leaf_mut(target)
+            .expect("removing a different leaf preserves the docking target");
+        *leaf = PaneNode::Branch(PaneBranch::for_leaves(target, moved, direction));
+        self.len += 1;
+        true
+    }
+
+    /// Exchanges two visible panes without changing the shape or proportions of the layout.
+    pub(super) fn swap_panes(&mut self, first: PaneId, second: PaneId) -> bool {
+        if first == second || !self.can_dock_leaf(first) || !self.can_dock_leaf(second) {
+            return false;
+        }
+
+        self.root.swap_leaf_ids(first, second);
+        true
+    }
+
+    fn can_dock_leaf(&self, id: PaneId) -> bool {
+        !self.is_pane_hidden(&id) && !self.is_temporary_replacement(id) && self.is_pane_in_tree(id)
+    }
+
     /// Split the root of the pane tree, inserting `new_id` according to the given direction.
     pub fn split_root(&mut self, new_id: PaneId, direction: Direction) {
         self.root.insert(new_id, direction);
@@ -864,6 +988,66 @@ impl PaneNode {
         }
     }
 
+    fn fits_docking_size(&self, size: Vector2F, minimum: f32, divider: f32) -> bool {
+        match self {
+            PaneNode::Leaf(_) => size.x() >= minimum && size.y() >= minimum,
+            PaneNode::Branch(branch) => {
+                branch
+                    .docking_child_sizes(size, divider)
+                    .is_some_and(|mut children| {
+                        children
+                            .all(|(child, size)| child.fits_docking_size(size, minimum, divider))
+                    })
+            }
+        }
+    }
+
+    fn collect_docking_rects(&self, bounds: RectF, divider: f32, panes: &mut Vec<(PaneId, RectF)>) {
+        if !(bounds.width() > 0. && bounds.height() > 0.) {
+            return;
+        }
+        match self {
+            PaneNode::Leaf(id) => panes.push((*id, bounds)),
+            PaneNode::Branch(branch) => {
+                let Some(children) = branch.docking_child_sizes(bounds.size(), divider) else {
+                    return;
+                };
+                let mut origin = bounds.origin();
+                for (child, size) in children {
+                    child.collect_docking_rects(RectF::new(origin, size), divider, panes);
+                    origin += match branch.axis {
+                        SplitDirection::Horizontal => Vector2F::new(size.x() + divider, 0.),
+                        SplitDirection::Vertical => Vector2F::new(0., size.y() + divider),
+                    };
+                }
+            }
+        }
+    }
+
+    fn find_leaf_mut(&mut self, pane_id: PaneId) -> Option<&mut Self> {
+        match self {
+            PaneNode::Leaf(id) if *id == pane_id => Some(self),
+            PaneNode::Leaf(_) => None,
+            PaneNode::Branch(branch) => branch
+                .nodes
+                .iter_mut()
+                .find_map(|(_, node)| node.find_leaf_mut(pane_id)),
+        }
+    }
+
+    fn swap_leaf_ids(&mut self, first: PaneId, second: PaneId) {
+        match self {
+            PaneNode::Leaf(id) if *id == first => *id = second,
+            PaneNode::Leaf(id) if *id == second => *id = first,
+            PaneNode::Leaf(_) => {}
+            PaneNode::Branch(branch) => {
+                for (_, node) in &mut branch.nodes {
+                    node.swap_leaf_ids(first, second);
+                }
+            }
+        }
+    }
+
     fn replace_pane(&mut self, old_pane_id: PaneId, new_pane_id: PaneId) -> bool {
         match self {
             PaneNode::Leaf(id) => {
@@ -899,6 +1083,33 @@ impl FindPaneByDirection for PaneNode {
 }
 
 impl PaneBranch {
+    fn docking_child_sizes(
+        &self,
+        size: Vector2F,
+        divider: f32,
+    ) -> Option<impl Iterator<Item = (&PaneNode, Vector2F)> + '_> {
+        let total_flex: f32 = self.nodes.iter().map(|(flex, _)| flex.0).sum();
+        if !total_flex.is_finite()
+            || total_flex <= 0.
+            || self.nodes.iter().any(|(flex, _)| flex.0 <= 0.)
+        {
+            return None;
+        }
+        let reserved = divider * self.dividers.len() as f32;
+        Some(self.nodes.iter().map(move |(flex, child)| {
+            let share = flex.0 / total_flex;
+            let size = match self.axis {
+                SplitDirection::Horizontal => {
+                    Vector2F::new((size.x() - reserved).max(0.) * share, size.y())
+                }
+                SplitDirection::Vertical => {
+                    Vector2F::new(size.x(), (size.y() - reserved).max(0.) * share)
+                }
+            };
+            (child, size)
+        }))
+    }
+
     fn new(old_pane: PaneNode, new_pane: PaneNode, direction: Direction) -> Self {
         let axis = direction.axis();
         PaneBranch {
@@ -1387,7 +1598,7 @@ impl FindPaneByDirection for PaneBranch {
 /// Create an invisible placeholder element that occupies the same space as the divider
 /// and saves its position so the actual divider can be anchored to it.
 fn create_divider_placeholder(direction: SplitDirection, position_id: &str) -> Box<dyn Element> {
-    let divider_thickness = get_divider_thickness() - 1.0;
+    let divider_thickness = get_divider_layout_extent();
 
     let placeholder = match direction {
         SplitDirection::Horizontal => ConstrainedBox::new(Empty::new().finish())

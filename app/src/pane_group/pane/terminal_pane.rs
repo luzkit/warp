@@ -12,6 +12,7 @@ use url::Url;
 use warp_cli::agent::Harness;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_errors::report_error;
+use warpui::elements::DraggableState;
 use warpui::{
     AppContext, EntityId, ModelHandle, SingletonEntity, ViewContext, ViewHandle, WeakViewHandle,
     WindowId,
@@ -185,9 +186,17 @@ impl TerminalPane {
     }
 
     /// The [`PaneView<TerminalView>`] for this pane.
-    #[cfg(any(test, feature = "integration_tests"))]
     pub(in crate::pane_group) fn pane_view(&self) -> ViewHandle<TerminalPaneView> {
         self.view.to_owned()
+    }
+
+    pub(in crate::pane_group) fn header_drag_state(&self, ctx: &AppContext) -> DraggableState {
+        self.view
+            .as_ref(ctx)
+            .header()
+            .as_ref(ctx)
+            .drag_state()
+            .clone()
     }
 
     pub(in crate::pane_group) fn supports_terminal_docking(&self, ctx: &AppContext) -> bool {

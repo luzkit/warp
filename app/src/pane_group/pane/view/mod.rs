@@ -23,12 +23,14 @@ use super::{
     BackingView, PaneConfiguration, PaneConfigurationEvent, PaneId, PaneStack, PaneStackEvent,
 };
 use crate::appearance::Appearance;
+use crate::features::FeatureFlag;
 use crate::pane_group::focus_state::{PaneFocusHandle, PaneGroupFocusEvent};
 use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::{Direction, SplitPaneState, TabBarHoverIndex};
 use crate::server::telemetry::SharingDialogSource;
 use crate::settings::{PaneSettings, PaneSettingsChangedEvent};
 use crate::util::bindings::CustomAction;
+use crate::workspace::view::pane_drag_owns_pointer;
 
 const HAS_SHARED_OBJECT_CONTEXT_KEY: &str = "PaneView_HasSharedObject";
 
@@ -417,7 +419,16 @@ impl<P: BackingView> View for PaneView<P> {
         }
 
         // Add the underlying pane view.
-        column.add_child(Shrinkable::new(1., ChildView::new(&active_child).finish()).finish());
+        let content = ChildView::new(&active_child);
+        let content = if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            let window_id = active_child.window_id(app);
+            content
+                .with_event_filter(move |event, app| !pane_drag_owns_pointer(event, window_id, app))
+                .finish()
+        } else {
+            content.finish()
+        };
+        column.add_child(Shrinkable::new(1., content).finish());
 
         let mut container = Container::new(column.finish());
         if pane_configuration.show_accent_border {

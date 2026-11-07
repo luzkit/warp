@@ -4223,3 +4223,130 @@ fn test_undo_close_keeps_a_file_pane_watching_its_file() {
         });
     });
 }
+
+#[test]
+fn docked_stack_snapshot_keeps_every_member() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            let original = [
+                panes.snapshot_for_leaf(ctx, first),
+                panes.snapshot_for_leaf(ctx, second),
+            ];
+
+            assert!(panes.stack_existing_pane(second, first, ctx));
+
+            let PaneNodeSnapshot::Branch(snapshot) = panes.snapshot(ctx) else {
+                panic!("both stack members should be saved");
+            };
+            let saved: Vec<_> = snapshot
+                .children
+                .into_iter()
+                .map(|(_, pane)| pane)
+                .collect();
+            assert_eq!(saved, original);
+        });
+    });
+}
+
+#[test]
+fn closing_visible_docked_stack_member_promotes_the_same_surviving_pane() {
+    let _undo = FeatureFlag::UndoClosedPanes.override_enabled(true);
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            let surviving_view = panes.terminal_view_from_pane_id(first, ctx).unwrap().id();
+            assert!(panes.stack_existing_pane(second, first, ctx));
+
+            panes.close_pane(second, ctx);
+
+            assert_eq!(panes.visible_pane_ids(), [first]);
+            assert_eq!(panes.focused_pane_id(ctx), first);
+            assert_eq!(panes.docked_stack_members(first), None);
+            assert!(!panes.has_pane_id(second));
+            assert_eq!(
+                panes.terminal_view_from_pane_id(first, ctx).unwrap().id(),
+                surviving_view
+            );
+        });
+    });
+}
+
+#[test]
+fn switching_docked_stack_member_reuses_its_original_view() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let first = get_newly_created_pane_id(panes, &[]);
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let second = get_newly_created_pane_id(panes, &[first]);
+            let first_view = panes.terminal_view_from_pane_id(first, ctx).unwrap().id();
+            assert!(panes.stack_existing_pane(second, first, ctx));
+            assert_eq!(panes.visible_pane_ids(), [second]);
+
+            panes.focus_pane_by_id(first, ctx);
+
+            assert_eq!(panes.visible_pane_ids(), [first]);
+            assert_eq!(panes.focused_pane_id(ctx), first);
+            assert_eq!(
+                panes.docked_stack_members(first),
+                Some([first, second].as_slice())
+            );
+            assert_eq!(
+                panes.terminal_view_from_pane_id(first, ctx).unwrap().id(),
+                first_view
+            );
+        });
+    });
+}
+
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+#[test]
+fn persistent_close_completion_targets_the_inactive_stack_member() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let id = Uuid::new_v4();
+        let pane_group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::PersistentTerminal(Box::new(PersistentTerminalLayout {
+                    id,
+                    name: None,
+                    snapshot: None,
+                    live_conversations: Vec::new(),
+                    connection: PersistentPtyConnection::Disconnected,
+                })),
+                ..Default::default()
+            },
+        );
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let persistent = panes.find_persistent_session(id, ctx).unwrap();
+            panes.add_terminal_pane(Direction::Right, None, ctx);
+            let sibling = get_newly_created_pane_id(panes, &[persistent]);
+            assert!(panes.stack_existing_pane(sibling, persistent, ctx));
+            assert_eq!(panes.visible_pane_ids(), [sibling]);
+            assert_eq!(panes.find_persistent_session(id, ctx), Some(persistent));
+
+            panes.close_ended_persistent_session(sibling, id, ctx);
+            assert!(panes.has_pane_id(persistent));
+            panes.close_ended_persistent_session(persistent, id, ctx);
+
+            assert_eq!(panes.find_persistent_session(id, ctx), None);
+            assert_eq!(panes.visible_pane_ids(), [sibling]);
+            assert_eq!(panes.docked_stack_members(sibling), None);
+        });
+    });
+}

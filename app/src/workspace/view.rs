@@ -124,8 +124,8 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
-use self::docking_overlay::DockingTabDrag;
-pub(crate) use self::docking_overlay::handle_docking_input;
+use self::docking_overlay::{DockingPaneDrag, DockingTabDrag};
+pub(crate) use self::docking_overlay::{handle_docking_input, pane_drag_owns_pointer};
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     SummaryPaneKind, SummaryPaneKindIcons, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID,
@@ -1108,6 +1108,7 @@ pub struct Workspace {
     reward_modal_pending: Option<RewardKind>,
     pub(crate) current_workspace_state: WorkspaceState,
     docking_tab_drag: Option<DockingTabDrag>,
+    docking_pane_drag: Option<DockingPaneDrag>,
     previous_workspace_state: Option<WorkspaceState>,
     welcome_tips_view_state: WelcomeTipsViewState,
     welcome_tips_view: ViewHandle<TipsView>,
@@ -3530,6 +3531,7 @@ impl Workspace {
             reward_modal_pending: None,
             current_workspace_state: Default::default(),
             docking_tab_drag: None,
+            docking_pane_drag: None,
             previous_workspace_state: None,
             model_event_sender,
             launch_config_save_modal,
@@ -11699,7 +11701,10 @@ impl Workspace {
     }
 
     /// Returns the pane group with the matching EntityId, or None if it doesn't exist.
-    fn get_pane_group_view_with_id(&self, id: EntityId) -> Option<&ViewHandle<PaneGroup>> {
+    pub(crate) fn get_pane_group_view_with_id(
+        &self,
+        id: EntityId,
+    ) -> Option<&ViewHandle<PaneGroup>> {
         self.tab_views().find(|view| view.id() == id)
     }
 
@@ -22389,26 +22394,36 @@ impl Workspace {
         app: &AppContext,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
-        let active_tab_data = &self.tabs[self.active_tab_index];
-
         let active_content = if FeatureFlag::AgentManagementView.is_enabled()
             && self.current_workspace_state.is_agent_management_view_open
         {
             ChildView::new(&self.agent_management_view).finish()
         } else {
-            let pane_group = ChildView::new(&active_tab_data.pane_group);
+            let pane_group = ChildView::new(self.active_tab_pane_group());
             if FeatureFlag::EnhancedPaneManagement.is_enabled() {
                 let window_id = self.window_id;
-                pane_group
+                let source = pane_group
                     .with_event_filter(move |event, app| {
                         !docking_overlay::tab_drag_owns_pointer(event, window_id, app)
                     })
-                    .finish()
+                    .finish();
+                if let Some(preview) = self.render_docking_destination_preview(appearance, app) {
+                    Stack::new().with_child(source).with_child(preview).finish()
+                } else {
+                    source
+                }
             } else {
                 pane_group.finish()
             }
         };
 
+        let active_content = if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            SavePosition::new(active_content, docking_overlay::DOCKING_SURFACE_POSITION)
+                .for_single_frame()
+                .finish()
+        } else {
+            active_content
+        };
         let terminal_content = match self.maybe_render_workspace_banner(app, appearance) {
             Some(banner_element) => Flex::column()
                 .with_child(banner_element)
@@ -24988,6 +25003,7 @@ impl TypedActionView for Workspace {
             ToggleMouseReporting => self.toggle_mouse_reporting(ctx),
             ToggleScrollReporting => self.toggle_scroll_reporting(ctx),
             ToggleFocusReporting => self.toggle_focus_reporting(ctx),
+            StartPaneDockingDrag(pane) => self.start_docking_pane_drag(*pane, ctx),
             StartTabDrag(source) => {
                 self.start_docking_tab_drag(*source, ctx);
                 // Drag supersedes any multi-selection; clear it to avoid stale highlights.
@@ -27125,7 +27141,7 @@ impl View for Workspace {
                 .with_uniform_padding(WORKSPACE_PADDING)
                 .finish(),
         );
-        self.render_docking_tab_overlay(&mut stack, appearance, app);
+        self.render_docking_overlay(&mut stack, appearance, app);
 
         if !use_simplified_wasm_tab_bar
             && FeatureFlag::VerticalTabs.is_enabled()

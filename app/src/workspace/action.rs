@@ -369,6 +369,7 @@ pub enum WorkspaceAction {
     ToggleScrollReporting,
     ToggleFocusReporting,
     StartTabDrag(EntityId),
+    StartPaneDockingDrag(PaneId),
     DragTab {
         tab_index: usize,
         tab_position: RectF,
@@ -1103,6 +1104,7 @@ impl WorkspaceAction {
             | OpenInExplorer { .. }
             | DragTab { .. }
             | StartTabDrag(_)
+            | StartPaneDockingDrag(_)
             | DragGroup { .. }
             | StartGroupDrag(_)
             | ToggleLeftPanel

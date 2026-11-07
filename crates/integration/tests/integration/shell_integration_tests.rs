@@ -18,6 +18,13 @@ integration_tests! {
     test_dock_tab_preserves_running_processes,
     // Test existing bash and zsh processes survive moving a split pane to a tab.
     test_move_split_pane_to_new_tab_from_overflow,
+    // Test running shells and commands survive nested docking, Swap, and cross-tab docking.
+    test_dock_tab_into_nested_split,
+    test_dock_entire_tab_layout,
+    test_swap_panes_from_header_drag,
+    test_dock_pane_across_tabs,
+    // Test both members keep running when stacked, selected, and extracted.
+    test_stack_terminal_tabs_and_extract_member,
     // Test powerlevel10k detection (via bootstrap script logic).
     test_detect_powerlevel10k,
     // Test properties of bootstrap.

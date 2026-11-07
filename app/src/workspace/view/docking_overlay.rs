@@ -1,33 +1,52 @@
 use pathfinder_geometry::rect::RectF;
 use warpui::elements::{
-    Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, OffsetPositioning,
-    PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Rect, SavePosition, Stack,
-    Text,
+    Align, Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, DraggableState,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, PositionedElementAnchor,
+    PositionedElementOffsetBounds, Radius, Rect, SavePosition, Stack, Text,
 };
 use warpui::event::Event;
 use warpui::geometry::vector::{Vector2F, vec2f};
-use warpui::{AppContext, Element, EntityId, SingletonEntity, ViewContext, WindowId};
+use warpui::zoom::Scale;
+use warpui::{AppContext, Element, EntityId, SingletonEntity, ViewContext, ViewHandle, WindowId};
 
-use super::{Workspace, tab_bar_rects_for_window};
+use super::enhanced_docking::{DockingOperation, DockingSource};
+use super::{Workspace, tab_bar_rects_for_window, tab_position_id};
 use crate::appearance::Appearance;
 use crate::features::FeatureFlag;
-use crate::pane_group::tree::get_divider_thickness;
+use crate::pane_group::tree::get_divider_layout_extent;
 use crate::pane_group::{Direction, PaneGroup, PaneId, get_minimum_pane_size};
-use crate::workspace::WorkspaceRegistry;
+use crate::tab::uses_vertical_tabs;
+use crate::workspace::{PaneViewLocator, WorkspaceRegistry};
+
+pub(super) const DOCKING_SURFACE_POSITION: &str = "workspace_view:docking_surface";
+
+fn docking_placeholder_position(pane: PaneId) -> String {
+    format!("workspace_view:docking_placeholder:{}", pane.position_id())
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct DockingTabDrag {
     pub(super) source: EntityId,
     destination: EntityId,
-    pane: Option<PaneId>,
+    flatten: bool,
+    canceled: bool,
+}
+
+pub(super) struct DockingPaneDrag {
+    source: PaneViewLocator,
+    destination: EntityId,
+    state: DraggableState,
+    cursor: Vector2F,
     canceled: bool,
 }
 
 struct DockingTarget {
-    pane: PaneId,
+    locator: PaneViewLocator,
     bounds: RectF,
     horizontal: bool,
     vertical: bool,
+    swap: bool,
+    stack: bool,
 }
 
 impl DockingTarget {
@@ -47,8 +66,41 @@ impl DockingTarget {
         .map(|(direction, _, _)| direction)
     }
 
+    fn center_choices(&self) -> [(DockingOperation, &'static str, RectF, bool); 2] {
+        let button_size = vec2f(64., 28.);
+        let center = self.bounds.size() / 2.;
+        [
+            (
+                DockingOperation::Swap,
+                "Swap",
+                RectF::new(
+                    center - vec2f(button_size.x() + 4., button_size.y() / 2.),
+                    button_size,
+                ),
+                self.swap,
+            ),
+            (
+                DockingOperation::Stack,
+                "Stack",
+                RectF::new(center + vec2f(4., -button_size.y() / 2.), button_size),
+                self.stack,
+            ),
+        ]
+    }
+
+    fn operation_at(&self, cursor: Vector2F, flatten: bool) -> Option<DockingOperation> {
+        let local_cursor = cursor - self.bounds.origin();
+        for (operation, _, bounds, enabled) in self.center_choices() {
+            if enabled && bounds.contains_point(local_cursor) {
+                return Some(operation);
+            }
+        }
+        self.direction_at(cursor)
+            .map(|direction| DockingOperation::Split { direction, flatten })
+    }
+
     fn preview(&self, direction: Direction) -> RectF {
-        let divider = get_divider_thickness();
+        let divider = get_divider_layout_extent();
         let width = (self.bounds.width() - divider) / 2.;
         let height = (self.bounds.height() - divider) / 2.;
         let (offset, size) = match direction {
@@ -82,8 +134,29 @@ pub(super) fn tab_drag_owns_pointer(event: &Event, window_id: WindowId, app: &Ap
                 || workspace.tabs.iter().enumerate().any(|(index, tab)| {
                     index != workspace.active_tab_index
                         && tab.draggable_state.is_tracking_pointer()
-                        && PaneGroup::dockable_single_terminal(&tab.pane_group, app).is_some()
+                        && workspace.can_start_dock(DockingSource::Tab(tab.pane_group.id()), app)
                 })
+        })
+}
+
+pub(crate) fn pane_drag_owns_pointer(event: &Event, window_id: WindowId, app: &AppContext) -> bool {
+    if !matches!(
+        event,
+        Event::LeftMouseDragged { .. } | Event::LeftMouseUp { .. }
+    ) {
+        return false;
+    }
+    WorkspaceRegistry::as_ref(app)
+        .get(window_id, app)
+        .is_some_and(|workspace| {
+            let workspace = workspace.as_ref(app);
+            let group = workspace.active_tab_pane_group();
+            let pane_group = group.as_ref(app);
+            pane_group.visible_pane_ids().into_iter().any(|pane| {
+                pane_group
+                    .terminal_pane_header_drag_state(pane, app)
+                    .is_some_and(|state| state.is_tracking_pointer())
+            })
         })
 }
 
@@ -96,19 +169,39 @@ pub(crate) fn handle_docking_input(
         event,
         Event::KeyDown { keystroke, .. } if keystroke.is_unmodified_key("escape")
     );
+    let flatten = match event {
+        Event::LeftMouseDragged { modifiers, .. } | Event::LeftMouseUp { modifiers, .. } => {
+            Some(modifiers.alt)
+        }
+        _ => None,
+    };
     if !FeatureFlag::EnhancedPaneManagement.is_enabled()
-        || !(cancel || matches!(event, Event::LeftMouseDown { .. }))
+        || !(cancel || flatten.is_some() || matches!(event, Event::LeftMouseDown { .. }))
     {
         return false;
     }
     let Some(workspace) = WorkspaceRegistry::as_ref(ctx).get(window_id, ctx) else {
         return false;
     };
-    if workspace.as_ref(ctx).docking_tab_drag.is_none() {
-        return false;
+    if workspace.as_ref(ctx).docking_pane_drag.is_some() {
+        return workspace.update(ctx, |workspace, ctx| {
+            workspace.handle_pane_docking_input(event, cancel, ctx)
+        });
     }
+    let Some(drag) = workspace.as_ref(ctx).docking_tab_drag else {
+        return false;
+    };
     if cancel {
         workspace.update(ctx, Workspace::cancel_docking_tab_drag);
+    } else if let Some(flatten) = flatten {
+        if drag.flatten != flatten {
+            workspace.update(ctx, |workspace, ctx| {
+                if let Some(drag) = &mut workspace.docking_tab_drag {
+                    drag.flatten = flatten;
+                    ctx.notify();
+                }
+            });
+        }
     } else {
         // A new press can recover a gesture whose source stopped receiving mouse events.
         workspace.update(ctx, Workspace::reset_docking_tab_drag);
@@ -117,6 +210,216 @@ pub(crate) fn handle_docking_input(
 }
 
 impl Workspace {
+    pub(super) fn start_docking_pane_drag(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+        let group = self.active_tab_pane_group();
+        let source = PaneViewLocator {
+            pane_group_id: group.id(),
+            pane_id,
+        };
+        if !self.can_start_dock(DockingSource::Pane(source), ctx) {
+            return;
+        }
+        let Some(state) = group
+            .as_ref(ctx)
+            .terminal_pane_header_drag_state(pane_id, ctx)
+        else {
+            return;
+        };
+        let Some(cursor) = state.dragging_mouse_position() else {
+            return;
+        };
+        self.docking_pane_drag = Some(DockingPaneDrag {
+            source,
+            destination: source.pane_group_id,
+            state,
+            cursor,
+            canceled: false,
+        });
+        ctx.notify();
+    }
+
+    fn handle_pane_docking_input(
+        &mut self,
+        event: &Event,
+        cancel: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(mut drag) = self.docking_pane_drag.take() else {
+            return false;
+        };
+        match event {
+            Event::LeftMouseDragged { position, .. } => {
+                let cursor = position.scale_down(ctx.zoom_factor());
+                if !drag.canceled {
+                    if let Some(destination) = self.docking_tab_at(cursor, ctx) {
+                        drag.destination = destination;
+                    }
+                    drag.state.adjust_mouse_position(cursor - drag.cursor);
+                    drag.cursor = cursor;
+                    ctx.notify();
+                }
+                self.docking_pane_drag = Some(drag);
+                true
+            }
+            Event::LeftMouseUp { position, .. } => {
+                drag.state.cancel_drag();
+                drag.state.set_suppress_overlay_paint(false);
+                if !drag.canceled {
+                    self.finish_docking_pane_drag(
+                        &drag,
+                        position.scale_down(ctx.zoom_factor()),
+                        ctx,
+                    );
+                }
+                ctx.notify();
+                true
+            }
+            Event::KeyDown { .. } if cancel => {
+                drag.canceled = true;
+                drag.state.set_suppress_overlay_paint(true);
+                self.docking_pane_drag = Some(drag);
+                ctx.notify();
+                true
+            }
+            Event::LeftMouseDown { .. } => {
+                drag.state.cancel_drag();
+                drag.state.set_suppress_overlay_paint(false);
+                ctx.notify();
+                false
+            }
+            _ => {
+                self.docking_pane_drag = Some(drag);
+                false
+            }
+        }
+    }
+
+    fn docking_tab_at(&self, cursor: Vector2F, app: &AppContext) -> Option<EntityId> {
+        let bars = tab_bar_rects_for_window(self.window_id, app);
+        if !bars.iter().any(|bounds| bounds.contains_point(cursor)) {
+            return None;
+        }
+        let vertical = uses_vertical_tabs(app);
+        self.tabs.iter().enumerate().find_map(|(index, tab)| {
+            if tab.detached
+                || tab
+                    .group_id
+                    .is_some_and(|id| self.tab_groups.get(&id).is_some_and(|g| g.collapsed))
+            {
+                return None;
+            }
+            let bounds =
+                app.element_position_by_id_at_last_frame(self.window_id, tab_position_id(index))?;
+            let point = if vertical { cursor.y() } else { cursor.x() };
+            let center = if vertical {
+                bounds.center().y()
+            } else {
+                bounds.center().x()
+            };
+            let extent = if vertical {
+                bounds.height()
+            } else {
+                bounds.width()
+            };
+            (bounds.contains_point(cursor) && (point - center).abs() <= extent * 0.3)
+                .then_some(tab.pane_group.id())
+        })
+    }
+
+    fn previewed_docking_group(&self) -> Option<&ViewHandle<PaneGroup>> {
+        let drag = self.docking_pane_drag.as_ref()?;
+        if drag.canceled || drag.destination == drag.source.pane_group_id {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .find(|tab| tab.pane_group.id() == drag.destination && !tab.detached)
+            .map(|tab| &tab.pane_group)
+    }
+
+    pub(super) fn render_docking_destination_preview(
+        &self,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let group = self.previewed_docking_group()?.as_ref(app);
+        let bounds =
+            app.element_position_by_id_at_last_frame(self.window_id, DOCKING_SURFACE_POSITION)?;
+        let rectangles = group.docking_preview_rects(bounds, app);
+        if rectangles.is_empty() {
+            return None;
+        }
+        let theme = appearance.theme();
+        let mut preview =
+            Stack::new().with_child(Rect::new().with_background(theme.background()).finish());
+        for (pane, pane_bounds) in rectangles {
+            let title = group
+                .pane_by_id(pane)
+                .map(|pane| {
+                    let configuration = pane.pane_configuration();
+                    let configuration = configuration.as_ref(app);
+                    configuration
+                        .custom_vertical_tabs_title()
+                        .unwrap_or_else(|| configuration.title())
+                        .to_owned()
+                })
+                .filter(|title| !title.is_empty());
+            let label = title.map_or_else(
+                || "Terminal pane".to_owned(),
+                |title| format!("Terminal pane ({title})"),
+            );
+            let color = theme.surface_2();
+            let box_element = Container::new(
+                Align::new(
+                    Text::new_inline(label, appearance.ui_font_family(), 12.)
+                        .with_color(theme.main_text_color(color).into())
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_background(color)
+            .with_border(Border::all(1.).with_border_fill(theme.accent().with_opacity(45)))
+            .finish();
+            let element = ConstrainedBox::new(box_element)
+                .with_width(pane_bounds.width())
+                .with_height(pane_bounds.height())
+                .finish();
+            preview.add_positioned_child(
+                SavePosition::new(element, &docking_placeholder_position(pane))
+                    .for_single_frame()
+                    .finish(),
+                OffsetPositioning::offset_from_parent(
+                    pane_bounds.origin() - bounds.origin(),
+                    ParentOffsetBounds::ParentByPosition,
+                    ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+        Some(preview.finish())
+    }
+
+    fn finish_docking_pane_drag(
+        &mut self,
+        drag: &DockingPaneDrag,
+        cursor: Vector2F,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let source = DockingSource::Pane(drag.source);
+        if let Some(target) = self.docking_target(source, drag.destination, cursor, false, ctx)
+            && let Some(operation) = target.operation_at(cursor, false)
+        {
+            self.dock(source, target.locator, operation, target.bounds, ctx);
+        } else if self.docking_tab_at(cursor, ctx).is_none()
+            && tab_bar_rects_for_window(self.window_id, ctx)
+                .iter()
+                .any(|bounds| bounds.contains_point(cursor))
+            && self.active_tab_pane_group().id() == drag.source.pane_group_id
+        {
+            self.move_pane_to_new_tab(drag.source.pane_id, ctx);
+        }
+    }
+
     pub(super) fn start_docking_tab_drag(&mut self, source: EntityId, app: &AppContext) {
         if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
             return;
@@ -125,8 +428,7 @@ impl Workspace {
         if source != destination.id()
             && let Some(tab) = self.tabs.iter().find(|tab| tab.pane_group.id() == source)
             && tab.draggable_state.is_dragging()
-            && !tab.detached
-            && PaneGroup::dockable_single_terminal(&tab.pane_group, app).is_some()
+            && self.can_start_dock(DockingSource::Tab(source), app)
         {
             for mouse_state in [
                 &tab.tab_mouse_state,
@@ -140,7 +442,7 @@ impl Workspace {
             self.docking_tab_drag = Some(DockingTabDrag {
                 source,
                 destination: destination.id(),
-                pane: PaneGroup::dockable_single_terminal(destination, app),
+                flatten: false,
                 canceled: false,
             });
         }
@@ -199,10 +501,12 @@ impl Workspace {
                 .draggable_state
                 .set_suppress_overlay_paint(false);
             if !drag.canceled {
-                if let Some(target) = self.docking_target(drag, cursor, ctx)
-                    && let Some(direction) = target.direction_at(cursor)
+                let source = DockingSource::Tab(drag.source);
+                if let Some(target) =
+                    self.docking_target(source, drag.destination, cursor, drag.flatten, ctx)
+                    && let Some(operation) = target.operation_at(cursor, drag.flatten)
                 {
-                    self.dock_terminal_tab(drag.source, target.pane, direction, ctx);
+                    self.dock(source, target.locator, operation, target.bounds, ctx);
                 } else if tab_bar_rects_for_window(self.window_id, ctx)
                     .iter()
                     .any(|rect| rect.contains_point(cursor))
@@ -226,61 +530,143 @@ impl Workspace {
 
     fn docking_target(
         &self,
-        drag: DockingTabDrag,
+        source: DockingSource,
+        destination: EntityId,
         cursor: Vector2F,
+        flatten: bool,
         app: &AppContext,
     ) -> Option<DockingTarget> {
-        let group = self.active_tab_pane_group();
-        let pane_group = group.as_ref(app);
-        if drag.canceled
-            || drag.destination != group.id()
-            || (pane_group.right_panel_open && pane_group.is_right_panel_maximized)
+        let group = self
+            .tabs
+            .iter()
+            .find(|tab| tab.pane_group.id() == destination && !tab.detached)?
+            .pane_group
+            .as_ref(app);
+        if (group.right_panel_open && group.is_right_panel_maximized)
             || (FeatureFlag::AgentManagementView.is_enabled()
                 && self.current_workspace_state.is_agent_management_view_open)
         {
             return None;
         }
-        let pane = drag.pane?;
-        let bounds =
-            app.element_position_by_id_at_last_frame(self.window_id, pane.position_id())?;
-        if !bounds.contains_point(cursor) || !self.can_dock_terminal_tab(drag.source, pane, app) {
-            return None;
-        }
-        let minimum = get_minimum_pane_size(app);
-        let split_minimum = minimum * 2. + get_divider_thickness();
-        let horizontal = bounds.width() >= split_minimum && bounds.height() >= minimum;
-        let vertical = bounds.height() >= split_minimum && bounds.width() >= minimum;
-        Some(DockingTarget {
-            pane,
+        let (pane_id, bounds) = if destination == self.active_tab_pane_group().id() {
+            group.visible_pane_ids().into_iter().find_map(|pane_id| {
+                let bounds = app
+                    .element_position_by_id_at_last_frame(self.window_id, pane_id.position_id())?;
+                bounds.contains_point(cursor).then_some((pane_id, bounds))
+            })
+        } else {
+            let surface =
+                app.element_position_by_id_at_last_frame(self.window_id, DOCKING_SURFACE_POSITION)?;
+            group
+                .docking_preview_rects(surface, app)
+                .into_iter()
+                .find(|(_, bounds)| bounds.contains_point(cursor))
+        }?;
+        let locator = PaneViewLocator {
+            pane_group_id: destination,
+            pane_id,
+        };
+        let mut target = DockingTarget {
+            locator,
             bounds,
-            horizontal,
-            vertical,
-        })
+            horizontal: false,
+            vertical: false,
+            swap: false,
+            stack: false,
+        };
+        let minimum = get_minimum_pane_size(app);
+        let split_minimum = minimum * 2. + get_divider_layout_extent();
+        let fits = |direction| {
+            let operation = DockingOperation::Split { direction, flatten };
+            self.can_dock(source, locator, operation, app)
+                && self.dock_source_fits(source, target.preview(direction), operation, app)
+        };
+        let horizontal =
+            bounds.width() >= split_minimum && bounds.height() >= minimum && fits(Direction::Right);
+        let vertical =
+            bounds.height() >= split_minimum && bounds.width() >= minimum && fits(Direction::Down);
+        target.horizontal = horizontal;
+        target.vertical = vertical;
+        if bounds.width() >= 160. && bounds.height() >= 100. {
+            target.swap = self.can_dock(source, locator, DockingOperation::Swap, app);
+            target.stack = self.can_dock(source, locator, DockingOperation::Stack, app);
+        }
+        Some(target)
     }
 
-    pub(super) fn render_docking_tab_overlay(
+    pub(super) fn render_docking_overlay(
         &self,
         stack: &mut Stack,
         appearance: &Appearance,
         app: &AppContext,
     ) {
-        let Some(drag) = self.docking_tab_drag else {
-            return;
-        };
-        let Some(cursor) = self
-            .tabs
-            .iter()
-            .find(|tab| tab.pane_group.id() == drag.source)
-            .and_then(|tab| tab.draggable_state.dragging_mouse_position())
-        else {
-            return;
-        };
-        let Some(target) = self.docking_target(drag, cursor, app) else {
+        let (source, destination, cursor, flatten) = if let Some(drag) = self
+            .docking_pane_drag
+            .as_ref()
+            .filter(|drag| !drag.canceled)
+        {
+            (
+                DockingSource::Pane(drag.source),
+                drag.destination,
+                drag.cursor,
+                false,
+            )
+        } else if let Some(drag) = self.docking_tab_drag.filter(|drag| !drag.canceled) {
+            let Some(cursor) = self
+                .tabs
+                .iter()
+                .find(|tab| tab.pane_group.id() == drag.source)
+                .and_then(|tab| tab.draggable_state.dragging_mouse_position())
+            else {
+                return;
+            };
+            (
+                DockingSource::Tab(drag.source),
+                drag.destination,
+                cursor,
+                drag.flatten,
+            )
+        } else {
             return;
         };
         let theme = appearance.theme();
-        let pane_position = target.pane.position_id();
-        let direction = target.direction_at(cursor);
+        let Some(target) = self.docking_target(source, destination, cursor, flatten, app) else {
+            if matches!(source, DockingSource::Pane(_))
+                && tab_bar_rects_for_window(self.window_id, app)
+                    .iter()
+                    .any(|bounds| bounds.contains_point(cursor))
+                && self.docking_tab_at(cursor, app).is_none()
+            {
+                stack.add_positioned_overlay_child(
+                    Container::new(
+                        Text::new_inline("Move pane to new tab", appearance.ui_font_family(), 12.)
+                            .with_color(theme.main_text_color(theme.accent()).into())
+                            .finish(),
+                    )
+                    .with_uniform_padding(6.)
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .with_background(theme.accent())
+                    .finish(),
+                    OffsetPositioning::offset_from_parent(
+                        cursor + vec2f(12., 12.),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                );
+            }
+            return;
+        };
+        let pane_position = if destination == self.active_tab_pane_group().id() {
+            target.locator.pane_id.position_id()
+        } else {
+            docking_placeholder_position(target.locator.pane_id)
+        };
+        let operation = target.operation_at(cursor, flatten);
+        let direction = match operation {
+            Some(DockingOperation::Split { direction, .. }) => Some(direction),
+            Some(DockingOperation::Swap | DockingOperation::Stack) | None => None,
+        };
         if let Some(direction) = direction {
             let preview = target.preview(direction);
             let preview_element = ConstrainedBox::new(
@@ -302,6 +688,79 @@ impl Workspace {
                     PositionedElementOffsetBounds::WindowByPosition,
                     PositionedElementAnchor::TopLeft,
                     ChildAnchor::TopLeft,
+                ),
+            );
+        }
+
+        for (choice, label, bounds, enabled) in target.center_choices() {
+            if !enabled {
+                continue;
+            }
+            let active = operation == Some(choice);
+            let background = if active {
+                theme.accent()
+            } else {
+                theme.surface_2()
+            };
+            let element = Container::new(
+                Align::new(
+                    Text::new_inline(label, appearance.ui_font_family(), 12.)
+                        .with_color(theme.main_text_color(background).into())
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_background(background)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+            .finish();
+            let position_id = match choice {
+                DockingOperation::Swap => "workspace_view:docking_swap",
+                DockingOperation::Stack => "workspace_view:docking_stack",
+                DockingOperation::Split { .. } => continue,
+            };
+            let element = ConstrainedBox::new(element)
+                .with_width(bounds.width())
+                .with_height(bounds.height())
+                .finish();
+            stack.add_positioned_overlay_child(
+                SavePosition::new(element, position_id)
+                    .for_single_frame()
+                    .finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    &pane_position,
+                    bounds.origin(),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+
+        if self.dock_source_is_layout(source, app) {
+            let label = if flatten {
+                "Flatten layout"
+            } else if cfg!(target_os = "macos") {
+                "Hold Option to flatten"
+            } else {
+                "Hold Alt to flatten"
+            };
+            let theme = appearance.theme();
+            stack.add_positioned_overlay_child(
+                Container::new(
+                    Text::new_inline(label, appearance.ui_font_family(), 12.)
+                        .with_color(theme.main_text_color(theme.surface_2()).into())
+                        .finish(),
+                )
+                .with_uniform_padding(6.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_background(theme.surface_2())
+                .finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    &pane_position,
+                    vec2f(0., 0.),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::Center,
+                    ChildAnchor::Center,
                 ),
             );
         }

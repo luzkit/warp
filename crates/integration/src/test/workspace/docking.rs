@@ -24,6 +24,12 @@ use warpui_core::{App, EntityId, TypedActionView, WindowId, async_assert, async_
 use super::{dispatch_mouse_event, tab_center};
 use crate::Builder;
 
+mod rearrangement;
+pub use rearrangement::{
+    test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
+    test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
+};
+
 const PROCESS_SNAPSHOT: &str = "processes before transfer";
 const DOCK_POINT: &str = "dock point";
 const PREVIEW_POSITION: &str = "workspace_view:docking_preview";
@@ -91,43 +97,39 @@ fn assert_processes_preserved(
     app: &mut App,
     window_id: WindowId,
     data: &mut StepDataMap,
-    source_tab: usize,
-    source_pane: usize,
+    layout: &[(usize, usize)],
 ) -> AssertionOutcome {
     let expected = data
-        .get::<_, [TerminalProcesses; 2]>(PROCESS_SNAPSHOT)
-        .expect("Both terminals must have been observed before the transfer");
-    match terminal_processes(app, window_id, 0, 0).and_then(|destination| {
-        Ok([
-            destination,
-            terminal_processes(app, window_id, source_tab, source_pane)?,
-        ])
-    }) {
+        .get::<_, Vec<TerminalProcesses>>(PROCESS_SNAPSHOT)
+        .expect("The terminals must have been observed before the transfer");
+    match processes_at(app, window_id, layout) {
         Ok(actual) => async_assert_eq!(&actual, expected),
         Err(error) => AssertionOutcome::failure(error.to_string()),
     }
 }
 
-fn record_processes(source_tab: usize, source_pane: usize) -> TestStep {
-    TestStep::new("Record both live shells and commands")
-        .add_named_assertion_with_data_from_prior_step(
-            "Each terminal has its original live shell and command",
-            move |app, window_id, data| {
-                let snapshot = terminal_processes(app, window_id, 0, 0).and_then(|destination| {
-                    Ok([
-                        destination,
-                        terminal_processes(app, window_id, source_tab, source_pane)?,
-                    ])
-                });
-                match snapshot {
-                    Ok(snapshot) => {
-                        data.insert(PROCESS_SNAPSHOT, snapshot);
-                        AssertionOutcome::Success
-                    }
-                    Err(error) => AssertionOutcome::failure(error.to_string()),
-                }
-            },
-        )
+fn processes_at(
+    app: &App,
+    window_id: WindowId,
+    layout: &[(usize, usize)],
+) -> Result<Vec<TerminalProcesses>> {
+    layout
+        .iter()
+        .map(|&(tab, pane)| terminal_processes(app, window_id, tab, pane))
+        .collect()
+}
+
+fn record_processes(layout: &'static [(usize, usize)]) -> TestStep {
+    TestStep::new("Record live shells and commands").add_named_assertion_with_data_from_prior_step(
+        "Each terminal has its original live shell and command",
+        move |app, window_id, data| match processes_at(app, window_id, layout) {
+            Ok(snapshot) => {
+                data.insert(PROCESS_SNAPSHOT, snapshot);
+                AssertionOutcome::Success
+            }
+            Err(error) => AssertionOutcome::failure(error.to_string()),
+        },
+    )
 }
 
 fn shell_supports_process_tests() -> bool {
@@ -148,14 +150,18 @@ fn saved_bounds(app: &App, window_id: WindowId, position_id: &str) -> Option<Rec
         .get_position(position_id)
 }
 
-fn pane_bounds(app: &App, window_id: WindowId, pane: usize) -> RectF {
-    let position_id = pane_group_view(app, window_id, 0).read(app, |group, _| {
+fn pane_bounds(app: &App, window_id: WindowId, tab: usize, pane: usize) -> RectF {
+    let position_id = pane_position_id(app, window_id, tab, pane);
+    saved_bounds(app, window_id, &position_id).expect("Pane must be visible")
+}
+
+fn pane_position_id(app: &App, window_id: WindowId, tab: usize, pane: usize) -> String {
+    pane_group_view(app, window_id, tab).read(app, |group, _| {
         group
             .pane_id_from_index(pane)
             .expect("Pane exists")
             .position_id()
-    });
-    saved_bounds(app, window_id, &position_id).expect("Pane must be visible")
+    })
 }
 
 fn drag_tab_to_right_edge(app: &mut App, window_id: WindowId, data: &mut StepDataMap) {
@@ -183,7 +189,7 @@ fn drag_tab_to_right_edge(app: &mut App, window_id: WindowId, data: &mut StepDat
 }
 
 fn move_drag_over_pane(app: &mut App, window_id: WindowId, data: &mut StepDataMap, at: Vector2F) {
-    let pane = pane_bounds(app, window_id, 0);
+    let pane = pane_bounds(app, window_id, 0, 0);
     let position = pane.origin() + pane.size() * at;
     data.insert(DOCK_POINT, position);
     dispatch_mouse_event(
@@ -217,7 +223,7 @@ fn with_preview_assertion(step: TestStep, center: Vector2F, size: Vector2F) -> T
             let Some(preview) = saved_bounds(app, window_id, PREVIEW_POSITION) else {
                 return AssertionOutcome::failure("Docking preview is missing".to_owned());
             };
-            let pane = pane_bounds(app, window_id, 0);
+            let pane = pane_bounds(app, window_id, 0, 0);
             let center_delta = preview.center() - (pane.origin() + pane.size() * center);
             let size_delta = preview.size() - pane.size() * size;
             async_assert!(
@@ -274,11 +280,13 @@ fn release_unchanged(name: &str) -> TestStep {
         .add_assertion(assert_focused_tab_index(0))
         .add_named_assertion_with_data_from_prior_step(
             "Both terminals and processes remain in their original tabs",
-            |app, window_id, data| assert_processes_preserved(app, window_id, data, 1, 0),
+            |app, window_id, data| {
+                assert_processes_preserved(app, window_id, data, &[(0, 0), (1, 0)])
+            },
         )
 }
 
-pub fn test_dock_tab_preserves_running_processes() -> Builder {
+fn terminal_tabs_with_running_commands() -> Builder {
     FeatureFlag::EnhancedPaneManagement.set_enabled(true);
     Builder::new()
         .set_should_run_test(shell_supports_process_tests)
@@ -296,7 +304,11 @@ pub fn test_dock_tab_preserves_running_processes() -> Builder {
                 .add_assertion(assert_focused_tab_index(0)),
         )
         .with_step(execute_long_running_command(0, COMMAND.to_owned()))
-        .with_step(record_processes(1, 0))
+}
+
+pub fn test_dock_tab_preserves_running_processes() -> Builder {
+    terminal_tabs_with_running_commands()
+        .with_step(record_processes(&[(0, 0), (1, 0)]))
         .with_step(preview_right())
         .with_steps(preview_steps())
         .with_step(
@@ -324,11 +336,14 @@ pub fn test_dock_tab_preserves_running_processes() -> Builder {
                 .add_named_assertion_with_data_from_prior_step(
                     "The original shells, commands, views, and sessions survive docking",
                     |app, window_id, data| {
-                        let outcome = assert_processes_preserved(app, window_id, data, 0, 1);
+                        let outcome = assert_processes_preserved(app, window_id, data, &[(0, 0), (0, 1)]);
                         if matches!(outcome, AssertionOutcome::Success) {
                             let [destination, source] = data
-                                .get::<_, [TerminalProcesses; 2]>(PROCESS_SNAPSHOT)
-                                .expect("Both terminals must have been observed before docking");
+                                .get::<_, Vec<TerminalProcesses>>(PROCESS_SNAPSHOT)
+                                .expect("Both terminals must have been observed before docking")
+                                .as_slice() else {
+                                    panic!("Docking test records two terminals");
+                                };
                             println!(
                                 "Docking preserved destination shell PID {} and child PID {}, and source shell PID {} and child PID {}",
                                 destination.shell.0, destination.command.0, source.shell.0, source.command.0,
@@ -340,19 +355,25 @@ pub fn test_dock_tab_preserves_running_processes() -> Builder {
         )
 }
 
-fn right_pane_overflow_button_id(app: &mut App, window_id: WindowId) -> String {
-    pane_group_view(app, window_id, 0).read(app, |group, _| {
-        let pane_id = group.pane_id_from_index(1).expect("Right pane exists");
+fn pane_overflow_button_id(app: &App, window_id: WindowId, tab: usize, pane: usize) -> String {
+    pane_group_view(app, window_id, tab).read(app, |group, _| {
+        let pane_id = group
+            .pane_id_from_index(pane)
+            .expect("Terminal pane exists");
         let configuration_id = group
             .pane_by_id(pane_id)
-            .expect("Right terminal exists")
+            .expect("Terminal exists")
             .pane_configuration()
             .id();
         format!("pane_header_overflow_button:{configuration_id}")
     })
 }
 
-pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
+fn right_pane_overflow_button_id(app: &mut App, window_id: WindowId) -> String {
+    pane_overflow_button_id(app, window_id, 0, 1)
+}
+
+fn split_terminal_builder() -> Builder {
     FeatureFlag::EnhancedPaneManagement.set_enabled(true);
     Builder::new()
         .set_should_run_test(shell_supports_process_tests)
@@ -363,6 +384,10 @@ pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
                 .add_assertion(assert_focused_pane_index(0, 1)),
         )
         .with_step(wait_until_bootstrapped_pane(0, 1))
+}
+
+fn with_split_commands(builder: Builder) -> Builder {
+    builder
         .with_step(execute_long_running_command_for_pane(0, 1, COMMAND))
         .with_step(
             TestStep::new("Focus the left pane")
@@ -375,11 +400,15 @@ pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
                 .add_assertion(assert_focused_pane_index(0, 0)),
         )
         .with_step(execute_long_running_command_for_pane(0, 0, COMMAND))
-        .with_step(record_processes(0, 1))
+}
+
+pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
+    with_split_commands(split_terminal_builder())
+        .with_step(record_processes(&[(0, 0), (0, 1)]))
         .with_step(
             TestStep::new("Reveal the inactive pane's header controls")
                 .with_event_fn(|app, window_id| {
-                    let bounds = pane_bounds(app, window_id, 1);
+                    let bounds = pane_bounds(app, window_id, 0, 1);
                     Event::MouseMoved {
                         position: vec2f(bounds.center().x(), bounds.min_y() + 10.0),
                         cmd: false,
@@ -418,7 +447,9 @@ pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
                 .add_assertion(assert_num_panes_in_tab(1, 1))
                 .add_named_assertion_with_data_from_prior_step(
                     "The selected pane and its original processes are now in the new tab",
-                    |app, window_id, data| assert_processes_preserved(app, window_id, data, 1, 0),
+                    |app, window_id, data| {
+                        assert_processes_preserved(app, window_id, data, &[(0, 0), (1, 0)])
+                    },
                 ),
         )
 }

@@ -38,7 +38,9 @@ use crate::settings::CodeSettings;
 use crate::tab::tab_position_id;
 use crate::terminal::view::TerminalAction;
 use crate::view_components::{FeaturePopup, NewFeaturePopupEvent, NewFeaturePopupLabel};
-use crate::workspace::{TabBarDropTargetData, TabBarLocation, VerticalTabsPaneDropTargetData};
+use crate::workspace::{
+    TabBarDropTargetData, TabBarLocation, VerticalTabsPaneDropTargetData, WorkspaceAction,
+};
 
 mod sharing;
 
@@ -268,6 +270,10 @@ impl<P: BackingView> PaneHeader<P> {
     #[cfg(feature = "integration_tests")]
     pub fn is_overlay_open(&self) -> bool {
         !matches!(self.open_overlay, OpenOverlay::None)
+    }
+
+    pub(crate) fn drag_state(&self) -> &DraggableState {
+        &self.mouse_state_handles.draggable_state
     }
 
     pub fn set_overflow_menu_items(
@@ -925,6 +931,14 @@ impl<P: BackingView> TypedActionView for PaneHeader<P> {
             }
             PaneHeaderAction::PaneHeaderDragStarted => {
                 send_telemetry_from_ctx!(TelemetryEvent::PaneDragInitiated, ctx);
+                if FeatureFlag::EnhancedPaneManagement.is_enabled()
+                    && let Some(focus_handle) = &self.focus_handle
+                    && focus_handle.pane_id().is_terminal_pane()
+                {
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::StartPaneDockingDrag(
+                        focus_handle.pane_id(),
+                    ));
+                }
             }
             PaneHeaderAction::PaneHeaderDragged {
                 origin,

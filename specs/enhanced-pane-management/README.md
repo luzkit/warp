@@ -63,6 +63,12 @@ Choose Left, Right, Top or Bottom from the pointer position and calculate the pr
 
 For later milestones, the planner should remain independent of live mutation. Templates describe geometry and constraints. Snapshots may additionally identify sessions. The transaction owns revalidation, transfer, registration and focus. Workspace snapshots reflect committed layouts and layout history holds only the references needed to reverse live moves.
 
+### Current scope
+
+This milestone covers the inactive-tab gesture when both tabs contain one eligible terminal. Dragging an eligible inactive tab reserves the gesture for same-window docking until release. A release in the tab bar can still reorder the tab using the existing adjacent-move and grouping rules. Full drag-through reordering and cross-window handoff for this gesture are deferred. Tabs with other content continue to use existing drag behavior. The source tab must have an individual draggable row.
+
+Center Swap and Stack, multiple panes, multiple windows, layout undo, and specialized content remain tracked in later milestones. The experimental feature is disabled by default and explicitly enabled in the isolated development build.
+
 ## Persistent-session integration contract
 
 | Contract | Responsibility |
@@ -81,7 +87,7 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 
 | Milestone | Planned work | Status |
 | --- | --- | --- |
-| 1. Existing tab to split | Same-window single-terminal tab source, four directional targets, live split preview, cancel, live identity transfer, normal source-tab cleanup. | Implementation in progress. Completion requires macOS drag and PID evidence. |
+| 1. Existing tab to split | Same-window single-terminal tab source, four directional targets, live split preview, cancel, live identity transfer, normal source-tab cleanup. | Implemented and verified in the isolated macOS development build. See the evidence log. |
 | 2. Rearrangement and docking | Intra-tab and inter-tab moves, swap, center Swap/Stack, pane-to-tab, atomic multi-pane layout moves, nested structure and optional flattening. | Pending |
 | 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Pending |
 | 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Pending |
@@ -118,6 +124,14 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | D24 | Production-grade validation with staged rollout | 1–8 |
 | D25 | Coordinated parallel development with staged integration | 1–8 |
 
+### Next implementation boundary
+
+Extend directional docking to a leaf in an existing split by replacing that leaf with a nested branch and preserving its flex in the enclosing branch. The current same-axis split routine distributes flex among siblings, so reusing it for this case would produce geometry different from a preview of half the target pane.
+
+Before detaching one terminal from a nonempty group, move shared-session and AI history event subscriptions to group ownership or give pane subscriptions independent removal handles. The current detach hook unsubscribes the group from each of those shared emitters and can remove handlers for its remaining terminals. Within-tab movement and Swap can edit the tree without detaching content.
+
+Stack should retain each member's existing `PaneId`, `TerminalPane`, metadata, and lifecycle subscriptions. The terminal view's existing navigation stack is for nested agent views and stores active-child state under the outer pane. A docking stack needs a layout slot with an active member, promotion when a member closes, and snapshot representation for all members.
+
 ## Build and validation
 
 Build from the isolated worktree with the pinned Rust toolchain, Protobuf, Xcode and Metal tools, and the repository's macOS bundling prerequisites. This invokes the macOS runner directly to select the OSS binary and keep the debug bundle in the worktree.
@@ -144,17 +158,29 @@ WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS=1 WARP_SHELL_PATH=/bin/zsh \
   cargo run --locked -p integration --bin integration -- test_dock_tab_preserves_running_processes
 ```
 
+The final test candidate also ran through the normal nextest registration. Use a real-display session for a native smoke test or the ordinary integration backend for repeatable process checks.
+
+```sh
+WARP_SHELL_PATH=/bin/zsh cargo nextest run --locked -p integration \
+  --features drag_tabs_to_windows \
+  -E 'test(test_dock_tab_preserves_running_processes) | test(test_reorder_tabs_with_drag)'
+WARP_SHELL_PATH=/bin/bash cargo nextest run --locked -p integration \
+  --features drag_tabs_to_windows -E 'test(test_dock_tab_preserves_running_processes)'
+```
+
 Run focused tests, then relevant lint checks, then format, in the order in [AGENTS.md](../../AGENTS.md). Keep one record per milestone with the exact commands, build and commit, platform, process-identity evidence, failures or unavailable tests, and the next milestone. Production installation and profiles stay separate from the development run.
 
 ### Evidence log
 
 | Item | Result |
 | --- | --- |
-| Milestone 1 automated checks | Pending |
-| Milestone 1 macOS development build and process-identity comparison | Pending |
-| Compatibility with the persistent-session backend and ordinary PTY | Pending |
+| Milestone 1 automated checks | Final macOS nextest runs passed for zsh and Bash 3.2. `test_dock_tab_preserves_running_processes` covered all four previews, center rejection, Escape, and shell, workload, terminal view and session identity after a right split. `test_reorder_tabs_with_drag` passed with enhanced docking disabled. |
+| Milestone 1 macOS development build and process-identity comparison | Signed debug `WarpOss.app` on Apple Silicon. Native vertical-tab drag moved the source into the right split and focused it. Both command blocks retained their pre-move output and continued printing. Destination shell/workload PIDs were `84311` and `84496`. Source shell/workload PIDs were `84611` and `84746`. `ps` snapshots of all four PIDs, parent PIDs and start times were byte-identical before and after. |
+| Targeted lint and formatting | App and integration Clippy passed with warnings denied. Repository Rust formatting and the whitespace diff check passed. |
+| Other platforms | Linux, Windows and the remaining platform matrix are pending. |
+| Compatibility with the persistent-session backend and ordinary PTY | The native run used the disposable runtime `/tmp/wpdock.9YetIM`, which retained both owner sockets after the move. The integration runner verified ordinary local PTYs under its isolated Integration channel. |
 | Performance | No measurements yet. Before rollout, measure busy workspaces at 10, 50 and 100 panes, recording preview frame time, planner cost, allocation or memory data, CPU overhead and input/output latency. Derive budgets from a feature-off baseline on the same hardware. |
-| Implementation and validation commit references | Pending |
+| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. |
 
 ## Contribution boundaries
 

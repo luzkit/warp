@@ -24,6 +24,8 @@ mod toast_stack;
 pub mod util;
 pub mod view;
 
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+pub use action::PersistentTerminalAction;
 pub use action::{
     AutoCloudHandoffTrigger, CommandSearchOptions, InitContent, RestoreConversationLayout,
     TabContextMenuAnchor, VerticalTabsPaneContextMenuTarget, WorkspaceAction,
@@ -74,11 +76,33 @@ use crate::workspace::view::{
     TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME, TOGGLE_WARP_DRIVE_BINDING_NAME,
 };
 
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+pub(crate) const DETACH_SESSION_BINDING_NAME: &str = "workspace:detach_persistent_session";
+
 pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
+
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "workspace:attach_persistent_session",
+            "Attach to Session…",
+            WorkspaceAction::PersistentTerminal(PersistentTerminalAction::OpenAttachPicker),
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_enabled(|| crate::persistent_terminals::runtime_dir().is_some()),
+        EditableBinding::new(
+            DETACH_SESSION_BINDING_NAME,
+            "Detach Session",
+            WorkspaceAction::PersistentTerminal(PersistentTerminalAction::Detach(None)),
+        )
+        .with_context_predicate(id!("Workspace") & id!("Workspace_PersistentTerminal"))
+        .with_mac_key_binding("cmd-alt-shift-D")
+        .with_enabled(|| crate::persistent_terminals::runtime_dir().is_some()),
+    ]);
 
     modal::init(app);
     native_modal::init(app);

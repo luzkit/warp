@@ -63,6 +63,25 @@ fn report_shell_typeahead(model: &mut TerminalModel, text: &str) {
     });
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn persistent_replay_preserves_escape_sequences_split_between_contiguous_buffers() {
+    let mut model = TerminalModel::mock(None, None);
+    let mut parser = Processor::new();
+
+    model.replay_persistent_pty(
+        &mut parser,
+        b"ed title\x07",
+        b"\x1b]2;persist".to_vec(),
+        false,
+        None,
+        None,
+    );
+
+    assert_eq!(model.title.as_deref(), Some("persisted title"));
+    assert!(!model.is_persistent_pty());
+}
+
 #[test]
 fn take_typeahead_for_input_advances_incremental_typeahead() {
     let mut model = TerminalModel::mock(None, None);
@@ -2408,4 +2427,75 @@ fn cloud_mode_setup_phase_ended_does_not_emit_when_not_sharing() {
     rx.close();
     let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(events.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn persistent_replay_marks_split_shell_hooks_as_historical() {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(event_tx)
+        .build();
+    let mut terminal = TerminalModel::mock(None, Some(event_proxy));
+    terminal.register_session_id(SessionId::from(0));
+    let mut parser = Processor::new();
+    while event_rx.try_recv().is_ok() {}
+
+    parser.replay_bytes(
+        &mut terminal,
+        b"\x1bP$f{\"hook\":\"InitShell\",\"value\":{\"session_id\":0,\"shell\":\"bash\",\"user\":\"test\",\"hostname\":\"local\"}}",
+    );
+    parser.parse_bytes(&mut terminal, b"\x1b\\", &mut std::io::sink());
+    let bootstrap = hex::encode(
+        r#"{"hook":"Bootstrapped","value":{"session_id":0,"shell":"bash","histfile":"","home_dir":"/tmp","path":"/bin:/usr/bin","aliases":"","abbreviations":"","function_names":"","env_var_names":"","builtins":"","keywords":"","shell_version":"5.2"}}"#,
+    );
+    parser.replay_bytes(&mut terminal, format!("\x1bP$d{bootstrap}").as_bytes());
+    parser.parse_bytes(&mut terminal, b"\x9c", &mut std::io::sink());
+
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            Event::PersistentReplayStarted => Some("started"),
+            Event::Handler(HandlerEvent::InitShell { .. }) => Some("init"),
+            Event::Handler(HandlerEvent::Bootstrapped(_)) => Some("bootstrapped"),
+            Event::PersistentReplayFinished { .. } => Some("finished"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events,
+        [
+            "started",
+            "init",
+            "finished",
+            "started",
+            "bootstrapped",
+            "finished"
+        ]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn persistent_replay_marks_key_value_shell_hook_completed_live_as_historical() {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(event_tx)
+        .build();
+    let mut terminal = TerminalModel::mock(None, Some(event_proxy));
+    terminal.register_session_id(SessionId::from(0));
+    let mut parser = Processor::new();
+    while event_rx.try_recv().is_ok() {}
+
+    parser.replay_bytes(&mut terminal, b"\x1b]9278;k;A;InitShell\x07");
+    parser.parse_bytes(&mut terminal, b"\x1b]9278;k;B;session_id;0\x07\x1b]9278;k;B;shell;bash\x07\x1b]9278;k;B;user;test\x07\x1b]9278;k;B;hostname;local\x07\x1b]9278;k;C\x07", &mut std::io::sink());
+
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok())
+        .filter_map(|event| match event {
+            Event::PersistentReplayStarted => Some("started"),
+            Event::Handler(HandlerEvent::InitShell { .. }) => Some("init"),
+            Event::PersistentReplayFinished { .. } => Some("finished"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(events, ["started", "init", "finished"]);
 }

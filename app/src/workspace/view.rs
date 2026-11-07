@@ -15,6 +15,8 @@ pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+mod persistent_terminals;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
@@ -1060,6 +1062,8 @@ pub struct Workspace {
     /// Per-group hover state for the horizontal tab bar.
     horizontal_tab_group_mouse_states: RefCell<HashMap<TabGroupId, HorizontalTabGroupMouseStates>>,
     tab_rename_editor: ViewHandle<EditorView>,
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    persistent_terminal_being_renamed: Option<(PaneViewLocator, uuid::Uuid)>,
     pane_rename_editor: ViewHandle<EditorView>,
     tab_group_rename_editor: ViewHandle<EditorView>,
     vertical_tabs_search_input: ViewHandle<EditorView>,
@@ -1564,6 +1568,16 @@ impl Workspace {
         if let Some(tab_index) = self.current_workspace_state.tab_being_renamed() {
             self.current_workspace_state.clear_tab_being_renamed();
             let title = self.tab_rename_editor.as_ref(ctx).buffer_text(ctx);
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            if let Some((locator, id)) = self.persistent_terminal_being_renamed.take() {
+                self.clear_tab_name_editor(ctx);
+                self.focus_active_tab(ctx);
+                if !title.trim().is_empty() {
+                    self.rename_persistent_terminal(locator, id, title.trim(), ctx);
+                }
+                ctx.notify();
+                return;
+            }
             let tab = &self.tabs[tab_index];
             tab.pane_group.update(ctx, |view, ctx| {
                 // Only update the title if it was actually changed. Otherwise, lets assume
@@ -1589,6 +1603,18 @@ impl Workspace {
 
         self.current_workspace_state.clear_pane_being_renamed();
         let title = self.pane_rename_editor.as_ref(ctx).buffer_text(ctx);
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        if let Some((session_locator, id)) = self.persistent_terminal_being_renamed.take()
+            && locator == session_locator
+        {
+            self.clear_pane_name_editor(ctx);
+            self.focus_pane(locator, ctx);
+            if !title.trim().is_empty() {
+                self.rename_persistent_terminal(locator, id, title.trim(), ctx);
+            }
+            ctx.notify();
+            return;
+        }
         self.set_custom_pane_name(locator, title, ctx);
         self.clear_pane_name_editor(ctx);
         self.focus_pane(locator, ctx);
@@ -1599,6 +1625,10 @@ impl Workspace {
     fn cancel_tab_rename(&mut self, ctx: &mut ViewContext<Self>) {
         if self.current_workspace_state.is_tab_being_renamed() {
             self.current_workspace_state.clear_tab_being_renamed();
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            {
+                self.persistent_terminal_being_renamed = None;
+            }
             self.clear_tab_name_editor(ctx);
             self.focus_active_tab(ctx);
             ctx.notify();
@@ -1608,6 +1638,10 @@ impl Workspace {
     fn cancel_pane_rename(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(locator) = self.current_workspace_state.pane_being_renamed() {
             self.current_workspace_state.clear_pane_being_renamed();
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            {
+                self.persistent_terminal_being_renamed = None;
+            }
             self.clear_pane_name_editor(ctx);
             self.focus_pane(locator, ctx);
             ctx.notify();
@@ -3459,6 +3493,8 @@ impl Workspace {
             tab_groups: HashMap::new(),
             horizontal_tab_group_mouse_states: RefCell::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            persistent_terminal_being_renamed: None,
             pane_rename_editor: Self::pane_rename_editor(ctx),
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
             vertical_tabs_search_input: Self::vertical_tabs_search_input(ctx),
@@ -5686,6 +5722,11 @@ impl Workspace {
 
         self.set_active_tab_index(index, ctx);
 
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        {
+            self.persistent_terminal_being_renamed = None;
+        }
+
         self.current_workspace_state.set_tab_being_renamed(index);
 
         // Clear the tab name editor to handle the case when another tab is already being renamed
@@ -5728,6 +5769,10 @@ impl Workspace {
 
         if self.current_workspace_state.is_tab_being_renamed() {
             self.current_workspace_state.clear_tab_being_renamed();
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            {
+                self.persistent_terminal_being_renamed = None;
+            }
             self.clear_tab_name_editor(ctx);
         }
 
@@ -5977,6 +6022,10 @@ impl Workspace {
             pane_group.focus_pane_by_id(locator.pane_id, ctx);
         });
         self.set_active_tab_index(index, ctx);
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        {
+            self.persistent_terminal_being_renamed = None;
+        }
         self.current_workspace_state.set_pane_being_renamed(locator);
         self.clear_pane_name_editor(ctx);
         self.pane_rename_editor.update(ctx, move |editor, ctx| {
@@ -24425,6 +24474,8 @@ impl TypedActionView for Workspace {
             SelectNewSessionMenuItem(new_session_menu_item) => {
                 self.open_launch_config_from_menu(new_session_menu_item.clone(), ctx)
             }
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            PersistentTerminal(action) => self.handle_persistent_terminal_action(action, ctx),
             SelectTabConfig(tab_config) => {
                 self.open_tab_config(tab_config.clone(), ctx);
             }
@@ -26710,6 +26761,11 @@ impl View for Workspace {
 
     fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {
         let mut context = Self::default_keymap_context();
+
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        if self.focused_persistent_terminal(app).is_some() {
+            context.set.insert("Workspace_PersistentTerminal");
+        }
 
         if NetworkStatus::as_ref(app).is_online() {
             context.set.insert("IsOnline");

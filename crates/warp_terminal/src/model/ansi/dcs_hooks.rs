@@ -42,7 +42,7 @@ pub type HookSessionId = Option<u64>;
 #[derive(Serialize, Debug)]
 #[allow(clippy::upper_case_acronyms)]
 #[serde(tag = "hook")]
-pub(super) enum DProtoHook {
+pub(crate) enum DProtoHook {
     CommandFinished {
         value: CommandFinishedValue,
     },
@@ -497,7 +497,7 @@ pub struct PrecmdValue {
 /// A decoded precmd payload, classified according to its completion evidence.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
-pub(super) enum PrecmdHookValue {
+pub(crate) enum PrecmdHookValue {
     WithCompletionMetadata(PrecmdValue),
     PromptOnly(PromptMetadata),
 }
@@ -1115,7 +1115,7 @@ impl PendingHook {
         }
     }
 
-    pub(super) fn finish(self) -> Result<DProtoHook, &'static str> {
+    pub(crate) fn finish(self) -> Result<DProtoHook, &'static str> {
         match self.value {
             PendingHookValue::Precmd(precmd) => {
                 precmd.classify().map(|value| DProtoHook::Precmd { value })

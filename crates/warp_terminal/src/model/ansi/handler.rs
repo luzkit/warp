@@ -23,6 +23,12 @@ use crate::model::{KeyboardModes, KeyboardModesApplyBehavior};
 /// Default implementations are provided for some methods to reduce the amount
 /// of necessary boilerplate required for a testing-only implementation.
 pub trait Handler {
+    /// Begins applying a historical control sequence completed by newly received bytes.
+    fn start_replay_continuation(&mut self) {}
+
+    /// Finishes applying a historical control sequence completed by newly received bytes.
+    fn finish_replay_continuation(&mut self) {}
+
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>);
 

@@ -34,6 +34,7 @@ concurrency:
 jobs:
   publish:
     name: Build and push agent-dev image
+    if: github.repository_owner == 'warpdotdev'
     # Namespace runners build linux/amd64 and linux/arm64 natively, so no QEMU
     # or Buildx setup step is needed (same runner profile as warp-server's
     # sidecar workflow).

@@ -39,6 +39,8 @@ pub enum CommandPaletteItemAction {
         pane_view_locator: PaneViewLocator,
         window_id: WindowId,
     },
+    #[cfg(all(target_os = "macos", feature = "local_tty"))]
+    AttachPersistentSession(uuid::Uuid),
     /// Navigate to a specific tab identified by its pane_group EntityId.
     NavigateToTab {
         pane_group_id: EntityId,
@@ -101,6 +103,8 @@ impl CommandPaletteItemAction {
             } => ItemSummary::Session {
                 pane_view_locator: *pane_view_locator,
             },
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            CommandPaletteItemAction::AttachPersistentSession(_) => ItemSummary::NoOp,
             CommandPaletteItemAction::NavigateToTab { pane_group_id, .. } => ItemSummary::Tab {
                 pane_group_id: *pane_group_id,
             },

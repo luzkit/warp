@@ -285,6 +285,76 @@ fn get_newly_created_pane_id(panes: &PaneGroup, existing_ids: &[PaneId]) -> Pane
         .unwrap()
 }
 
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+#[test]
+fn persistent_terminal_retry_preserves_all_conversation_ownership() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        pane_group.update(&mut app, |panes, ctx| {
+            let old_pane_id = get_newly_created_pane_id(panes, &[]);
+            let old_view_id = panes
+                .terminal_view_from_pane_id(old_pane_id, ctx)
+                .unwrap()
+                .id();
+            let first = AIConversation::new(false, false);
+            let second = AIConversation::new(false, false);
+            let expected_ids = vec![first.id(), second.id()];
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history, ctx| {
+                history.restore_conversations(old_view_id, vec![first, second], ctx);
+                history.set_active_conversation_id(expected_ids[0], old_view_id, ctx);
+            });
+
+            panes.attach_persistent_terminal(
+                PersistentTerminalLayout {
+                    id: Uuid::new_v4(),
+                    name: Some("retained project".to_owned()),
+                    snapshot: None,
+                    live_conversations: Vec::new(),
+                    connection: PersistentPtyConnection::Disconnected,
+                },
+                old_pane_id,
+                ctx,
+            );
+
+            let new_pane_id = get_newly_created_pane_id(panes, &[old_pane_id]);
+            let new_view_id = panes
+                .terminal_view_from_pane_id(new_pane_id, ctx)
+                .unwrap()
+                .id();
+            let history = BlocklistAIHistoryModel::as_ref(ctx);
+            assert_eq!(
+                history
+                    .all_live_conversations_for_terminal_surface(new_view_id)
+                    .map(AIConversation::id)
+                    .collect::<Vec<_>>(),
+                expected_ids,
+            );
+            assert!(
+                history
+                    .all_live_conversations_for_terminal_surface(old_view_id)
+                    .next()
+                    .is_none()
+            );
+            assert_eq!(
+                history
+                    .active_conversation(new_view_id)
+                    .map(AIConversation::id),
+                Some(expected_ids[0]),
+            );
+            let LeafContents::PersistentTerminal { snapshot, .. } = panes
+                .downcast_pane_by_id::<TerminalPane>(new_pane_id)
+                .unwrap()
+                .snapshot(ctx)
+            else {
+                panic!("the replacement should retain the persistent session snapshot");
+            };
+            assert_eq!(snapshot.conversation_ids_to_restore, expected_ids);
+        });
+    });
+}
+
 fn split_pane_state(panes: &PaneGroup, pane_id: PaneId, ctx: &AppContext) -> SplitPaneState {
     panes
         .focus_state_handle()

@@ -136,6 +136,10 @@ pub struct LeafSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LeafContents {
     Terminal(TerminalPaneSnapshot),
+    PersistentTerminal {
+        id: uuid::Uuid,
+        snapshot: TerminalPaneSnapshot,
+    },
     Notebook(NotebookPaneSnapshot),
     AIDocument(AIDocumentPaneSnapshot),
     Code(CodePaneSnapShot),
@@ -176,6 +180,7 @@ impl LeafContents {
             // actions and have no persistable state.
             | LeafContents::EnvironmentManagement(_) => false,
             LeafContents::Terminal(_)
+            | LeafContents::PersistentTerminal { .. }
             | LeafContents::Notebook(_)
             | LeafContents::AIDocument(_)
             | LeafContents::Code(_)

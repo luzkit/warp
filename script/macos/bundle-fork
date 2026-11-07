@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+source_dirty=false
+if [[ -n "$(git status --porcelain)" ]]; then
+    source_dirty=true
+fi
+
+if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
+    echo "This installer requires an Apple Silicon Mac with Xcode." >&2
+    exit 1
+fi
+if [[ $# -gt 2 ]]; then
+    echo "Usage: $0 [version] [output-directory]" >&2
+    exit 1
+fi
+
+version="${1:-snapshot-$(git rev-parse --short=12 HEAD)}"
+if [[ ! "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    echo "Version must contain only letters, digits, dots, underscores, and hyphens." >&2
+    exit 1
+fi
+output_dir="${2:-$repo_root/dist/fork}"
+mkdir -p "$output_dir"
+output_dir="$(cd "$output_dir" && pwd)"
+
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
+export CARGO_PROFILE_RELEASE_DEBUG=0
+export CARGO_PROFILE_RELEASE_LTO=false
+export GIT_RELEASE_TAG="$version"
+features="gui,release_bundle,extern_plist"
+target_dir="$(cargo metadata --no-deps --locked --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+app_bundle="$target_dir/release/bundle/osx/WarpOss.app"
+binary="$app_bundle/Contents/MacOS/warp-oss"
+
+cargo build --locked --release -p warp --bin warp-oss --features "$features"
+rm -rf "$app_bundle"
+(
+    cd app
+    CARGO_BUNDLE_SKIP_BUILD=1 cargo bundle --format osx --release --bin warp-oss --features "$features"
+)
+./script/macos/add_framework_rpath "$binary"
+WARP_PLIST_PATH="$app_bundle/Contents/Info.plist" WARP_SCHEME_NAME=warposs ./script/update_plist
+
+plugin="$target_dir/release/WarpDockTilePlugin.docktileplugin"
+mkdir -p "$app_bundle/Contents/PlugIns"
+cp -R "$plugin" "$app_bundle/Contents/PlugIns/"
+plutil -insert NSDockTilePlugIn -string WarpDockTilePlugin.docktileplugin "$app_bundle/Contents/Info.plist"
+plutil -insert MainAppBundleIdentifier -string dev.warp.WarpOss \
+    "$app_bundle/Contents/PlugIns/WarpDockTilePlugin.docktileplugin/Contents/Info.plist"
+codesign --force --sign - "$app_bundle/Contents/PlugIns/WarpDockTilePlugin.docktileplugin"
+
+# Changing the Mach-O rpath invalidates its signature before schema generation executes it.
+codesign --force --sign - "$binary"
+SETTINGS_SCHEMA_EXECUTABLE="$binary" ./script/prepare_bundled_resources "$app_bundle/Contents/Resources" oss
+./script/compile_icon oss "$app_bundle"
+
+packaging_dir="$(mktemp -d "${TMPDIR:-/tmp}/warp-fork.XXXXXX")"
+trap 'rm -rf "$packaging_dir"' EXIT
+# A fork has no entitlement to the upstream Apple developer team's shared app group.
+python3 - script/Entitlements.plist "$packaging_dir/entitlements.plist" <<'PY'
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as source:
+    entitlements = plistlib.load(source)
+entitlements.pop("com.apple.security.application-groups", None)
+with open(sys.argv[2], "wb") as destination:
+    plistlib.dump(entitlements, destination)
+PY
+codesign --force --deep --options runtime --sign - \
+    --entitlements "$packaging_dir/entitlements.plist" "$app_bundle"
+codesign --verify --deep --strict "$app_bundle"
+test "$(lipo -archs "$binary")" = arm64
+test -s "$app_bundle/Contents/Resources/THIRD_PARTY_LICENSES.txt"
+test -s "$app_bundle/Contents/Resources/settings_schema.json"
+
+mkdir "$packaging_dir/image"
+ditto "$app_bundle" "$packaging_dir/image/WarpOss.app"
+ln -s /Applications "$packaging_dir/image/Applications"
+cat > "$packaging_dir/image/README.txt" <<'EOF'
+WarpOss — luzkit/warp fork for Apple Silicon
+
+Drag WarpOss.app into Applications, then open it from Applications.
+This build is ad hoc signed and is not notarized by Apple. macOS may require
+approval in System Settings > Privacy & Security before its first launch.
+
+Persistent sessions: use the terminal pane menu to name or detach a session.
+Use Attach to Session in Warp search to reconnect. End Session stops the shell.
+Sessions survive closing the app after being retained, but not a reboot or loss
+of their owning process. Scrollback is bounded.
+
+Source and installation details: https://github.com/luzkit/warp
+EOF
+
+artifact_name="WarpOss-macos-arm64-$version"
+dmg_path="$output_dir/$artifact_name.dmg"
+hdiutil create -ov -volname WarpOss -srcfolder "$packaging_dir/image" \
+    -fs APFS -format UDZO "$dmg_path"
+hdiutil verify "$dmg_path"
+(
+    cd "$output_dir"
+    shasum -a 256 "$artifact_name.dmg" > "$artifact_name.dmg.sha256"
+)
+python3 - "$output_dir/$artifact_name.json" "$version" "$(git rev-parse HEAD)" "$(rustc --version)" "$features" "$source_dirty" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "w") as destination:
+    json.dump({
+        "repository": "luzkit/warp",
+        "version": sys.argv[2],
+        "commit": sys.argv[3],
+        "source_dirty": sys.argv[6] == "true",
+        "rustc": sys.argv[4],
+        "features": sys.argv[5].split(","),
+        "target": "aarch64-apple-darwin",
+        "profile": "release",
+        "signing": "ad-hoc",
+        "notarized": False,
+    }, destination, indent=2)
+    destination.write("\n")
+PY
+
+echo "Installer: $dmg_path"
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    echo "artifact_dir=$output_dir" >> "$GITHUB_OUTPUT"
+    echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+fi

@@ -23,7 +23,11 @@ struct MockHandler {
     charset: StandardCharset,
     attr: Option<Attr>,
     identity_reported: bool,
+    clipboard_writes: Vec<Vec<u8>>,
+    clipboard_read_count: usize,
+    bell_count: usize,
     d_proto_hooks: Vec<DProtoHook>,
+    pending_hook: Option<PendingHook>,
     pluggable_notifications: Vec<(Option<String>, String)>,
     hyperlink_events: Vec<Option<Hyperlink>>,
     cwd_updates: Vec<String>,
@@ -35,6 +39,20 @@ struct MockHandler {
 }
 
 impl Handler for MockHandler {
+    fn start_receiving_hook(&mut self, hook_name: String) {
+        self.pending_hook = PendingHook::create(&hook_name);
+    }
+
+    fn update_hook(&mut self, key: String, value: String) {
+        if let Some(hook) = &mut self.pending_hook {
+            hook.update(key, value);
+        }
+    }
+
+    fn finish_receiving_hook(&mut self) -> Option<PendingHook> {
+        self.pending_hook.take()
+    }
+
     fn is_registered_session(&self, session_id: SessionId) -> bool {
         self.registered_session_ids.contains(&session_id)
     }
@@ -55,8 +73,9 @@ impl Handler for MockHandler {
         self.index = index;
     }
 
-    fn identify_terminal<W: io::Write>(&mut self, _: &mut W, _intermediate: Option<char>) {
+    fn identify_terminal<W: io::Write>(&mut self, writer: &mut W, _intermediate: Option<char>) {
         self.identity_reported = true;
+        writer.write_all(b"\x1b[?1;2c").unwrap();
     }
 
     fn report_xtversion<W: io::Write>(&mut self, _: &mut W) {}
@@ -111,7 +130,9 @@ impl Handler for MockHandler {
         ScrollDelta::zero()
     }
 
-    fn bell(&mut self) {}
+    fn bell(&mut self) {
+        self.bell_count += 1;
+    }
 
     fn substitute(&mut self) {}
 
@@ -173,9 +194,13 @@ impl Handler for MockHandler {
 
     fn reset_color(&mut self, _: usize) {}
 
-    fn clipboard_store(&mut self, _: u8, _: &[u8]) {}
+    fn clipboard_store(&mut self, _: u8, data: &[u8]) {
+        self.clipboard_writes.push(data.to_vec());
+    }
 
-    fn clipboard_load(&mut self, _: u8, _: &str) {}
+    fn clipboard_load(&mut self, _: u8, _: &str) {
+        self.clipboard_read_count += 1;
+    }
 
     fn decaln(&mut self) {}
 
@@ -301,7 +326,11 @@ impl Default for MockHandler {
             charset: StandardCharset::Ascii,
             attr: None,
             identity_reported: false,
+            clipboard_writes: Vec::new(),
+            clipboard_read_count: 0,
+            bell_count: 0,
             d_proto_hooks: Vec::new(),
+            pending_hook: None,
             pluggable_notifications: Vec::new(),
             hyperlink_events: Vec::new(),
             cwd_updates: Vec::new(),
@@ -345,6 +374,177 @@ fn parse_bytes_with_registered_sessions_and_validation(
     parser.parse_bytes(&mut handler, bytes, &mut io::sink());
 
     (parser, handler)
+}
+
+#[test]
+fn raw_pty_sequences_do_not_trigger_external_actions() {
+    let mut parser = Processor::terminal_only();
+    let mut handler = MockHandler {
+        should_validate_dcs_hook_session_id: false,
+        ..Default::default()
+    };
+    let hook = hex_encoded_dcs_string(r#"{"hook":"Clear","value":{"session_id":167303092612201}}"#);
+    let controls = b"\x1b[1m\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07\x1b]9;hello\x07\x07";
+
+    parser.parse_bytes(&mut handler, &hook, &mut io::sink());
+    parser.parse_bytes(&mut handler, controls, &mut io::sink());
+
+    assert_eq!(handler.attr, Some(Attr::Bold));
+    assert_eq!(handler.clipboard_writes, Vec::<Vec<u8>>::new());
+    assert_eq!(handler.clipboard_read_count, 0);
+    assert_eq!(handler.bell_count, 0);
+    assert!(handler.d_proto_hooks.is_empty());
+    assert!(handler.pluggable_notifications.is_empty());
+}
+
+#[test]
+fn native_replay_keeps_block_hooks_and_suppresses_external_actions() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler {
+        should_validate_dcs_hook_session_id: false,
+        ..Default::default()
+    };
+    let mut bytes =
+        hex_encoded_dcs_string(r#"{"hook":"Clear","value":{"session_id":167303092612201}}"#);
+    bytes.extend_from_slice(b"\x1b[1m\x1b]52;c;aGVsbG8=\x07\x1b]52;c;?\x07\x1b]9;hello\x07\x07");
+
+    parser.replay_bytes(&mut handler, &bytes);
+
+    assert_eq!(handler.attr, Some(Attr::Bold));
+    assert!(matches!(
+        handler.d_proto_hooks.as_slice(),
+        [DProtoHook::Clear { .. }]
+    ));
+    assert!(handler.clipboard_writes.is_empty());
+    assert_eq!(handler.clipboard_read_count, 0);
+    assert_eq!(handler.bell_count, 0);
+    assert!(handler.pluggable_notifications.is_empty());
+
+    parser.parse_bytes(&mut handler, b"\x07", &mut io::sink());
+    assert_eq!(handler.bell_count, 1);
+}
+
+#[test]
+fn native_replay_keeps_split_clipboard_sequence_restricted() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler::default();
+
+    parser.replay_bytes(&mut handler, b"\x1b]52;c;aGV");
+    parser.parse_bytes(&mut handler, b"sbG8=\x07", &mut io::sink());
+
+    assert!(handler.clipboard_writes.is_empty());
+    parser.parse_bytes(&mut handler, b"\x1b]52;c;bGl2ZQ==\x07", &mut io::sink());
+    assert_eq!(handler.clipboard_writes, vec![b"bGl2ZQ==".to_vec()]);
+}
+
+#[test]
+fn native_replay_keeps_split_reply_out_of_live_writer() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler::default();
+    let mut replies = Vec::new();
+
+    parser.replay_bytes(&mut handler, b"\x1b[");
+    parser.parse_bytes(&mut handler, b"c", &mut replies);
+
+    assert!(handler.identity_reported);
+    assert!(replies.is_empty());
+    parser.parse_bytes(&mut handler, b"\x1b[c", &mut replies);
+    assert_eq!(replies, b"\x1b[?1;2c");
+}
+
+#[test]
+fn native_replay_keeps_split_hooks_restricted() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler {
+        should_validate_dcs_hook_session_id: false,
+        ..Default::default()
+    };
+    let hook = hex_encoded_dcs_string(
+        r#"{"hook":"InputBuffer","value":{"session_id":167303092612201,"buffer":"replayed"}}"#,
+    );
+
+    parser.replay_bytes(&mut handler, &hook[..hook.len() - 1]);
+    parser.parse_bytes(&mut handler, &hook[hook.len() - 1..], &mut io::sink());
+
+    assert!(handler.d_proto_hooks.is_empty());
+    parser.parse_bytes(&mut handler, &hook, &mut io::sink());
+    assert!(matches!(
+        handler.d_proto_hooks.as_slice(),
+        [DProtoHook::InputBuffer { .. }]
+    ));
+}
+
+#[test]
+fn native_replay_completes_split_block_hooks() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler {
+        should_validate_dcs_hook_session_id: false,
+        ..Default::default()
+    };
+    let hook = hex_encoded_dcs_string(r#"{"hook":"Clear","value":{"session_id":167303092612201}}"#);
+
+    parser.replay_bytes(&mut handler, &hook[..hook.len() - 1]);
+    parser.parse_bytes(&mut handler, &hook[hook.len() - 1..], &mut io::sink());
+
+    assert!(matches!(
+        handler.d_proto_hooks.as_slice(),
+        [DProtoHook::Clear { .. }]
+    ));
+}
+
+#[test]
+fn native_replay_does_not_taint_new_escape_after_unterminated_string() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler::default();
+
+    parser.replay_bytes(&mut handler, b"\x1b]52;c;aGVsbG8=");
+    parser.parse_bytes(&mut handler, b"\x1b]52;c;bGl2ZQ==\x07", &mut io::sink());
+
+    assert_eq!(handler.clipboard_writes, vec![b"bGl2ZQ==".to_vec()]);
+}
+
+#[test]
+fn native_replay_releases_restrictions_after_ignored_csi() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler::default();
+
+    parser.replay_bytes(&mut handler, b"\x1b[1?");
+    parser.parse_bytes(&mut handler, b"c\x07", &mut io::sink());
+
+    assert_eq!(handler.bell_count, 1);
+}
+
+#[test]
+fn native_replay_keeps_key_value_hook_provenance_between_frames() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler {
+        should_validate_dcs_hook_session_id: false,
+        ..Default::default()
+    };
+
+    parser.replay_bytes(&mut handler, b"\x1b]9278;k;A;InputBuffer\x07");
+    parser.parse_bytes(&mut handler, b"\x1b]52;c;bGl2ZQ==\x07", &mut io::sink());
+    parser.parse_bytes(
+        &mut handler,
+        b"\x1b]9278;k;B;buffer;historical\x07\x1b]9278;k;C\x07",
+        &mut io::sink(),
+    );
+
+    assert!(handler.d_proto_hooks.is_empty());
+    assert_eq!(handler.clipboard_writes, vec![b"bGl2ZQ==".to_vec()]);
+}
+
+#[test]
+fn native_replay_does_not_start_synchronized_buffering_from_a_split_sequence() {
+    let mut parser = Processor::new();
+    let mut handler = MockHandler::default();
+
+    parser.replay_bytes(&mut handler, b"\x1b[?2026");
+    parser.parse_bytes(&mut handler, b"h", &mut io::sink());
+
+    assert_eq!(parser.sync_output_buffer_len(), None);
+    parser.parse_bytes(&mut handler, b"\x1b]52;c;bGl2ZQ==\x07", &mut io::sink());
+    assert_eq!(handler.clipboard_writes, vec![b"bGl2ZQ==".to_vec()]);
 }
 
 #[test]

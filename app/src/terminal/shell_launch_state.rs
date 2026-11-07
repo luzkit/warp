@@ -5,6 +5,7 @@ use crate::terminal::shell::ShellType;
 /// The current state of launching a shell.
 #[derive(Clone, Debug)]
 pub enum ShellLaunchState {
+    PersistentPty,
     /// We are still determining the type of shell.
     DeterminingShell {
         /// The only reason this is an Option is to because the shared session viewer does not yet
@@ -25,6 +26,7 @@ pub enum ShellLaunchState {
 impl ShellLaunchState {
     pub fn display_name(&self) -> &str {
         match self {
+            Self::PersistentPty => "Persistent terminal",
             Self::DeterminingShell { display_name, .. } => display_name,
             Self::ShellSpawned {
                 display_name,
@@ -39,6 +41,7 @@ impl ShellLaunchState {
 
     pub fn available_shell(&self) -> Option<AvailableShell> {
         match self {
+            Self::PersistentPty => None,
             Self::DeterminingShell {
                 available_shell, ..
             }
@@ -50,6 +53,7 @@ impl ShellLaunchState {
 
     pub fn spawned_with_shell_type(self, shell_type: ShellType) -> Self {
         match self {
+            Self::PersistentPty => Self::PersistentPty,
             Self::DeterminingShell {
                 available_shell,
                 display_name,

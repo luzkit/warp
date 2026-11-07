@@ -94,6 +94,20 @@ impl DataSourceStore {
                 HashSet::from([QueryFilter::Sessions]),
             );
 
+            #[cfg(all(target_os = "macos", feature = "local_tty"))]
+            if let Some(path) = crate::persistent_terminals::runtime_dir() {
+                mixer.add_async_source(
+                    super::detached_sessions::DetachedSessionDataSource::new(path),
+                    HashSet::from([QueryFilter::DetachedSessions]),
+                    AddAsyncSourceOptions {
+                        debounce_interval: None,
+                        run_in_zero_state: true,
+                        run_when_unfiltered: false,
+                    },
+                    ctx,
+                );
+            }
+
             if WarpDriveSettings::is_warp_drive_enabled(ctx) {
                 let mut warp_drive_filters = HashSet::from([
                     QueryFilter::Notebooks,

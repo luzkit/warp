@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::fs::{DirBuilder, File};
 use std::mem::MaybeUninit;
 use std::os::unix::fs::DirBuilderExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::{io, ptr};
 
@@ -460,13 +460,14 @@ fn build_host_shell_command(
 /// The `pre_exec` hook has accumulated years of subtle bug fixes
 /// (signal mask handling, TIOCSCTTY cast, etc.); keeping a single copy
 /// ensures future fixes automatically apply to every session type.
-fn spawn_command_in_pty(
+pub(super) fn spawn_command_in_pty(
     mut command: Command,
     size: &SizeInfo,
     close_fds: bool,
 ) -> Result<PtySpawnInfo> {
     let (leader, follower) = make_pty(size.to_winsize())?;
 
+    let leader_file = unsafe { File::from_raw_fd(leader) };
     // Close the follower at the end of this function.
     // We need to keep it alive long enough for fork().
     let _file = unsafe { File::from_raw_fd(follower) };
@@ -581,7 +582,7 @@ fn spawn_command_in_pty(
     Ok(PtySpawnInfo {
         result: PtySpawnResult {
             pid: spawned.id(),
-            leader_fd: leader,
+            leader_fd: leader_file.into_raw_fd(),
         },
         child: spawned,
     })

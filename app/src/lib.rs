@@ -53,6 +53,8 @@ mod notebooks;
 mod notification;
 mod palette;
 mod persistence;
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+mod persistent_terminals;
 mod platform;
 mod prefix;
 #[cfg(target_os = "macos")]

@@ -1196,7 +1196,7 @@ fn save_pane_state(
     // The pane_leaves row must be inserted first to satisfy foreign key constraints on the
     // kind-specific tables.
     let kind = match &snapshot.contents {
-        LeafContents::Terminal(_) => TERMINAL_PANE_KIND,
+        LeafContents::Terminal(_) | LeafContents::PersistentTerminal { .. } => TERMINAL_PANE_KIND,
         LeafContents::Notebook(_) => NOTEBOOK_PANE_KIND,
         LeafContents::EnvVarCollection(_) => ENV_VAR_COLLECTION_PANE_KIND,
         LeafContents::Code(_) => CODE_PANE_KIND,
@@ -1236,7 +1236,17 @@ fn save_pane_state(
         .execute(conn)?;
 
     match &snapshot.contents {
-        LeafContents::Terminal(terminal_snapshot) => {
+        LeafContents::PersistentTerminal {
+            snapshot: terminal_snapshot,
+            ..
+        }
+        | LeafContents::Terminal(terminal_snapshot) => {
+            let persistent_id =
+                if let LeafContents::PersistentTerminal { id, .. } = &snapshot.contents {
+                    Some(id)
+                } else {
+                    None
+                };
             let conversation_ids = if terminal_snapshot.conversation_ids_to_restore.is_empty() {
                 None
             } else {
@@ -1250,7 +1260,10 @@ fn save_pane_state(
 
             let terminal = model::NewTerminalPane {
                 id,
-                uuid: terminal_snapshot.uuid.clone(),
+                uuid: persistent_id.map_or_else(
+                    || terminal_snapshot.uuid.clone(),
+                    |id| id.as_bytes().to_vec(),
+                ),
                 cwd: terminal_snapshot.cwd.clone(),
                 is_active: terminal_snapshot.is_active,
                 shell_launch_data: terminal_snapshot
@@ -1270,6 +1283,7 @@ fn save_pane_state(
                 active_conversation_id: terminal_snapshot
                     .active_conversation_id
                     .map(|id| id.to_string()),
+                is_persistent: persistent_id.is_some(),
             };
 
             diesel::insert_into(schema::terminal_panes::dsl::terminal_panes)
@@ -2222,6 +2236,10 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         .select(model::TerminalPane::as_select())
                         .first(conn)?;
 
+                    let persistent_session_id = terminal_pane
+                        .is_persistent
+                        .then(|| uuid::Uuid::from_slice(&terminal_pane.uuid))
+                        .transpose()?;
                     let shell_launch_data: Option<ShellLaunchData> = terminal_pane
                         .shell_launch_data
                         .and_then(|shell_str| serde_json::from_str(&shell_str).ok());
@@ -2240,7 +2258,7 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         .active_conversation_id
                         .and_then(|id_str| AIConversationId::try_from(id_str).ok());
 
-                    LeafContents::Terminal(TerminalPaneSnapshot {
+                    let snapshot = TerminalPaneSnapshot {
                         uuid: terminal_pane.uuid,
                         cwd: terminal_pane.cwd,
                         is_active: terminal_pane.is_active,
@@ -2251,7 +2269,12 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         active_profile_id,
                         conversation_ids_to_restore,
                         active_conversation_id,
-                    })
+                    };
+                    if let Some(id) = persistent_session_id {
+                        LeafContents::PersistentTerminal { id, snapshot }
+                    } else {
+                        LeafContents::Terminal(snapshot)
+                    }
                 }
                 NOTEBOOK_PANE_KIND => {
                     let notebook_pane = schema::notebook_panes::dsl::notebook_panes

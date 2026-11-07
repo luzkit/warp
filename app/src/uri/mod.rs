@@ -573,7 +573,7 @@ impl UriHost {
                         workspace.as_ref(ctx).tab_views().find_map(|pane_group| {
                             let pane_id = pane_group
                                 .as_ref(ctx)
-                                .find_terminal_pane_by_session_uuid(&uuid_bytes)?;
+                                .find_terminal_pane_by_session_uuid(&uuid_bytes, ctx)?;
                             Some((
                                 *win_id,
                                 PaneViewLocator {

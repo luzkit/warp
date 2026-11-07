@@ -40,6 +40,7 @@ impl SshRemoteServerSupport {
 /// entity within the UI framework.
 pub struct ModelEventDispatcher {
     last_start_prompt_marker: Option<PromptKind>,
+    replaying_persistent_pty: bool,
     active_session_id: Option<SessionId>,
     sessions: ModelHandle<Sessions>,
     ssh_remote_server_support: SshRemoteServerSupport,
@@ -73,6 +74,7 @@ impl ModelEventDispatcher {
         Self {
             active_session_id: None,
             last_start_prompt_marker: None,
+            replaying_persistent_pty: false,
             sessions,
             ssh_remote_server_support,
         }
@@ -101,6 +103,46 @@ impl ModelEventDispatcher {
     /// Emits the corresponding `ModelEvent` for the received `HandlerEvent` emitted by
     /// `TerminalModel` when some `ansi::Handler` method is called.
     fn handle_terminal_model_event(&mut self, event: Event, ctx: &mut ModelContext<Self>) {
+        match event {
+            Event::PersistentReplayStarted => {
+                self.replaying_persistent_pty = true;
+                return;
+            }
+            Event::PersistentReplayFinished {
+                at_prompt,
+                active_metadata,
+            } => {
+                self.replaying_persistent_pty = false;
+                if let Some(metadata) = active_metadata {
+                    ctx.emit(ModelEvent::BlockMetadataReceived(metadata));
+                }
+                ctx.emit(ModelEvent::PersistentReplayFinished { at_prompt });
+                return;
+            }
+            _ => {}
+        }
+        // Replay rebuilds the terminal model but may not repeat actions against the live shell
+        // or the host application. Only dispatch the events needed to recover the active surface.
+        if self.replaying_persistent_pty
+            && !matches!(
+                event,
+                Event::Handler(
+                    HandlerEvent::Bootstrapped(_)
+                        | HandlerEvent::Precmd { .. }
+                        | HandlerEvent::SetMode {
+                            mode: ansi::Mode::BracketedPaste
+                        }
+                        | HandlerEvent::UnsetMode {
+                            mode: ansi::Mode::BracketedPaste
+                        }
+                ) | Event::Title(_)
+                    | Event::CursorBlinkingChange(_)
+                    | Event::ImageReceived { .. }
+            )
+        {
+            return;
+        }
+
         let event_to_emit = match event {
             Event::Handler(HandlerEvent::InitShell {
                 pending_session_info,
@@ -124,6 +166,12 @@ impl ModelEventDispatcher {
             }
             Event::Handler(HandlerEvent::Bootstrapped(bootstrapped_event)) => {
                 let session_id = bootstrapped_event.session_info.session_id;
+                if self.replaying_persistent_pty {
+                    self.sessions.update(ctx, |sessions, ctx| {
+                        sessions.restore_persistent_session(*bootstrapped_event.session_info, ctx);
+                    });
+                    return;
+                }
                 let is_subshell = bootstrapped_event.session_info.subshell_info.is_some();
 
                 // Always initialize the session synchronously. When the
@@ -185,6 +233,9 @@ impl ModelEventDispatcher {
                     }
                 }
 
+                if self.replaying_persistent_pty {
+                    return;
+                }
                 ModelEvent::Handler(AnsiHandlerEvent::Precmd)
             }
             Event::Handler(HandlerEvent::Preexec) => ModelEvent::Handler(AnsiHandlerEvent::Preexec),
@@ -379,6 +430,9 @@ enum PromptKind {
 /// Set of events that were dispatched from the [`crate::terminal::TerminalModel`] while parsing
 /// PTY output.
 pub enum ModelEvent {
+    PersistentReplayFinished {
+        at_prompt: bool,
+    },
     MouseCursorDirty,
     Title(String),
     VisibleBootstrapBlock,

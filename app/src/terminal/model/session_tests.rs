@@ -7,6 +7,7 @@ use warpui::{App, AppContext, Element, Entity, ModelHandle, TypedActionView, Vie
 
 use super::command_executor::testing::TestCommandExecutor;
 use super::{BootstrapSessionType, Session, SessionId, SessionInfo, Sessions, SessionsEvent};
+use crate::test_util::terminal::initialize_app_for_terminal_view;
 
 struct TestView {
     events: Vec<SessionsEvent>,
@@ -37,6 +38,31 @@ impl TestView {
         });
         Self { events: Vec::new() }
     }
+}
+
+#[test]
+fn persistent_session_restore_does_not_emit_fresh_bootstrap() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let sessions = app.add_model(|_| Sessions::new_for_test());
+        let (_, events) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+            TestView::new(sessions.clone(), ctx)
+        });
+
+        sessions.update(&mut app, |sessions, ctx| {
+            sessions.restore_persistent_session(SessionInfo::new_for_test(), ctx);
+        });
+
+        sessions.read(&app, |sessions, _| {
+            assert!(sessions.get(SessionId::from(0)).is_some());
+        });
+        events.read(&app, |events, _| {
+            assert!(matches!(
+                events.events.as_slice(),
+                [SessionsEvent::SessionRestored { session_id }] if *session_id == SessionId::from(0)
+            ));
+        });
+    });
 }
 
 #[test]

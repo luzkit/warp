@@ -28,6 +28,11 @@ use crate::terminal::shell::ShellType;
 #[derive(Clone)]
 /// Events sent to the main thread by the terminal model & event loop.
 pub enum Event {
+    PersistentReplayStarted,
+    PersistentReplayFinished {
+        at_prompt: bool,
+        active_metadata: Option<BlockMetadataReceivedEvent>,
+    },
     CompletionsFinished(Vec<ShellCompletion>, Option<warp_completer::meta::Span>),
     MouseCursorDirty,
     Title(String),
@@ -417,6 +422,8 @@ impl UserBlockCompleted {
 impl Debug for Event {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
+            Event::PersistentReplayStarted => write!(f, "PersistentReplayStarted"),
+            Event::PersistentReplayFinished { .. } => write!(f, "PersistentReplayFinished"),
             Event::CompletionsFinished(..) => write!(f, "CompletionsFinished"),
             Event::MouseCursorDirty => write!(f, "MouseCursorDirty"),
             Event::BlockCompleted(_) => write!(f, "BlockCompleted"),

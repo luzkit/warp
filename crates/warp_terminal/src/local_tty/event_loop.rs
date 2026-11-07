@@ -141,6 +141,17 @@ enum ChannelResult {
     ReplaceShell,
 }
 
+type ReplayHandler<M> = Box<dyn FnOnce(&mut M, &mut ansi::Processor, &[u8]) + Send>;
+
+enum PersistentReplay<M> {
+    Raw(Vec<u8>),
+    NativeStartup(Vec<u8>),
+    NativeReattach {
+        bytes: Vec<u8>,
+        apply: ReplayHandler<M>,
+    },
+}
+
 impl<P, M> EventLoop<P, M>
 where
     P: local_tty::EventedPty + Send + 'static,
@@ -203,9 +214,10 @@ where
         state: &mut State,
         buf: &mut [u8],
         can_read: &mut bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let mut bytes_in_buffer = 0;
         let mut bytes_processed = 0;
+        let mut eof = false;
 
         let mut terminal = None;
 
@@ -215,6 +227,7 @@ where
         loop {
             match self.pty.reader().read(&mut buf[bytes_in_buffer..]) {
                 Ok(0) if bytes_in_buffer == 0 => {
+                    eof = true;
                     // If we get 0 here with an empty buffer (guaranteed if
                     // bytes_in_buffer == 0), it means the object is unable to
                     // receive reads.
@@ -283,7 +296,7 @@ where
             self.event_listener.send_wakeup_event();
         }
 
-        Ok(())
+        Ok(eof)
     }
 
     #[inline]
@@ -330,7 +343,33 @@ where
     /// Runs the event loop on its own thread until the shell exits or a shutdown is requested.
     /// The thread yields the loop's message receiver so the same channel can feed a replacement
     /// event loop.
-    pub fn spawn(mut self) -> JoinHandle<Receiver<Message>> {
+    pub fn spawn(self) -> JoinHandle<Receiver<Message>> {
+        self.spawn_inner(None)
+    }
+
+    /// Renders retained output before entering live I/O with a persistent PTY owner.
+    pub fn spawn_with_persistent_replay(self, replay: Vec<u8>) -> JoinHandle<Receiver<Message>> {
+        self.spawn_inner(Some(PersistentReplay::Raw(replay)))
+    }
+
+    /// Processes output from a newly launched Warp shell before entering live I/O.
+    pub fn spawn_with_native_persistent(self, buffered: Vec<u8>) -> JoinHandle<Receiver<Message>> {
+        self.spawn_inner(Some(PersistentReplay::NativeStartup(buffered)))
+    }
+
+    /// Applies native reattachment state before live PTY bytes can arrive.
+    pub fn spawn_with_native_persistent_replay(
+        self,
+        replay: Vec<u8>,
+        apply: impl FnOnce(&mut M, &mut ansi::Processor, &[u8]) + Send + 'static,
+    ) -> JoinHandle<Receiver<Message>> {
+        self.spawn_inner(Some(PersistentReplay::NativeReattach {
+            bytes: replay,
+            apply: Box::new(apply),
+        }))
+    }
+
+    fn spawn_inner(mut self, replay: Option<PersistentReplay<M>>) -> JoinHandle<Receiver<Message>> {
         #[cfg(test)]
         let feature_flag_overrides = warp_core::features::get_overrides();
 
@@ -342,7 +381,33 @@ where
                 #[cfg(test)]
                 warp_core::features::set_overrides(feature_flag_overrides);
 
+                let persistent = replay.is_some();
                 let mut state = State::default();
+                if let Some(replay) = replay {
+                    let mut model = self.terminal.lock();
+                    match replay {
+                        PersistentReplay::Raw(bytes) => {
+                            state.parser = ansi::Processor::terminal_only();
+                            let mut sink = io::sink();
+                            state.parser.parse_bytes(&mut *model, &bytes, &mut sink);
+                            state.parser.finish_sync_output(&mut *model, &mut sink);
+                        }
+                        PersistentReplay::NativeStartup(bytes) => {
+                            let mut responses = Vec::new();
+                            state
+                                .parser
+                                .parse_bytes(&mut *model, &bytes, &mut responses);
+                            if !responses.is_empty() {
+                                state.write_list.push_back(Cow::Owned(responses));
+                            }
+                        }
+                        PersistentReplay::NativeReattach { bytes, apply } => {
+                            apply(&mut *model, &mut state.parser, &bytes);
+                        }
+                    }
+                    self.event_listener.send_wakeup_event();
+                }
+                let mut disconnected = false;
                 let mut buf = [0u8; READ_BUFFER_SIZE];
 
                 // Keep track of whether we've "drained" read and write
@@ -443,12 +508,14 @@ where
                                     || token == self.pty.write_token() =>
                             {
                                 #[cfg(unix)]
-                                if event.is_read_closed() || event.is_write_closed() {
+                                if !persistent
+                                    && (event.is_read_closed() || event.is_write_closed())
+                                {
                                     // Don't try to do I/O on a dead PTY.
                                     continue;
                                 }
 
-                                if event.is_readable() {
+                                if event.is_readable() || (persistent && event.is_read_closed()) {
                                     can_read = true;
                                 }
                                 if event.is_writable() {
@@ -466,7 +533,16 @@ where
                     while can_read || (state.needs_write() && can_write) {
                         if can_read {
                             match self.pty_read(&mut state, &mut buf, &mut can_read) {
-                                Ok(_) => {}
+                                Ok(eof) => {
+                                    if persistent && eof {
+                                        disconnected = true;
+                                        break 'event_loop;
+                                    }
+                                }
+                                Err(_) if persistent => {
+                                    disconnected = true;
+                                    break 'event_loop;
+                                }
                                 Err(err) => {
                                     // On Linux, a `read` on the master side of a PTY can fail
                                     // with `EIO` if the client side hangs up.  In that case,
@@ -488,7 +564,11 @@ where
                             && can_write
                             && let Err(err) = self.pty_write(&mut state, &mut can_write)
                         {
-                            error!("Error writing to PTY in event loop: {err}");
+                            if persistent {
+                                disconnected = true;
+                            } else {
+                                error!("Error writing to PTY in event loop: {err}");
+                            }
                             break 'event_loop;
                         }
                     }
@@ -497,6 +577,17 @@ where
                 // The evented instances are not dropped here so deregister them explicitly.
                 let _ = self.poll.registry().deregister(&mut self.rx);
                 let _ = self.pty.deregister(&self.poll);
+
+                if persistent {
+                    let reason = if disconnected {
+                        self.pty.disconnect_reason()
+                    } else {
+                        ExitReason::PtyDisconnected
+                    };
+                    self.terminal.lock().exit(reason);
+                    self.event_listener.send_wakeup_event();
+                    return self.rx;
+                }
 
                 // Terminate the PTY process, if it's not the initiator of the shutdown.
                 if !child_exited {

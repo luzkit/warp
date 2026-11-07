@@ -1,0 +1,1 @@
+ALTER TABLE terminal_panes ADD COLUMN is_persistent BOOLEAN NOT NULL DEFAULT FALSE;

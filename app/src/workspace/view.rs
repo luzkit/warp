@@ -13,6 +13,7 @@ pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
 pub(crate) mod launch_modal;
+mod layout_history;
 pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
@@ -1109,6 +1110,7 @@ pub struct Workspace {
     pub(crate) current_workspace_state: WorkspaceState,
     docking_tab_drag: Option<DockingTabDrag>,
     docking_pane_drag: Option<DockingPaneDrag>,
+    layout_history: layout_history::LayoutHistory,
     previous_workspace_state: Option<WorkspaceState>,
     welcome_tips_view_state: WelcomeTipsViewState,
     welcome_tips_view: ViewHandle<TipsView>,
@@ -3532,6 +3534,7 @@ impl Workspace {
             current_workspace_state: Default::default(),
             docking_tab_drag: None,
             docking_pane_drag: None,
+            layout_history: Default::default(),
             previous_workspace_state: None,
             model_event_sender,
             launch_config_save_modal,
@@ -5646,6 +5649,13 @@ impl Workspace {
             index
         };
 
+        if index != self.active_tab_index
+            && FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && let Some(group) = self.get_pane_group_view(self.active_tab_index)
+            && group.as_ref(ctx).is_previewing_resize()
+        {
+            group.update(ctx, PaneGroup::cancel_resizing);
+        }
         self.active_tab_index = index;
 
         // The range selection's anchor is the active tab, so any change to
@@ -16730,6 +16740,9 @@ impl Workspace {
             pane_group::Event::MaximizePaneToggled => {
                 ctx.notify();
             }
+            pane_group::Event::LayoutResized { before } => {
+                self.record_pane_layout_resize(pane_group.id(), before.clone(), ctx);
+            }
             pane_group::Event::FocusPaneGroup => {
                 for (index, tab) in self.tabs.iter().enumerate() {
                     if tab.pane_group.id() == pane_group.id() {
@@ -24285,6 +24298,14 @@ impl TypedActionView for Workspace {
             MoveTabLeft(index) => self.move_tab(*index, TabMovement::Left, ctx),
             MoveTabRight(index) => self.move_tab(*index, TabMovement::Right, ctx),
             MovePaneToNewTab(pane) => self.move_pane_to_new_tab(*pane, ctx),
+            UndoPaneLayoutChange => self.undo_layout_change(ctx),
+            RedoPaneLayoutChange => self.redo_layout_change(ctx),
+            BalancePanes => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    self.active_tab_pane_group()
+                        .update(ctx, |group, ctx| group.balance_panes(ctx));
+                }
+            }
             RenameTab(index) => self.rename_tab(*index, ctx),
             ResetTabName(index) => self.clear_tab_name(*index, ctx),
             RenamePane(locator) => self.rename_pane(*locator, ctx),

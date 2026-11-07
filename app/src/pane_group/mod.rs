@@ -19,7 +19,7 @@ use session_sharing_protocol::common::{
     ParticipantId, Role, RoleRequestId, RoleRequestRejectedReason, RoleRequestResponse, SessionId,
 };
 use settings::Setting as _;
-use tree::DEFAULT_FLEX_VALUE;
+use tree::{DEFAULT_FLEX_VALUE, DividerAdjustment, PaneLayout, ResizePreview};
 use typed_path::TypedPath;
 use url::Url;
 use uuid::Uuid;
@@ -183,6 +183,7 @@ mod enhanced_docking;
 pub(crate) use child_agent::materialization::{
     ChildPaneMaterialization, decide_child_pane_materialization,
 };
+pub(crate) use enhanced_docking::DockingLayoutSnapshot;
 pub mod focus_state;
 pub mod pane;
 pub mod tree;
@@ -295,7 +296,7 @@ pub enum PaneGroupAction {
         target_pane_id: PaneId,
         direction: Direction,
     },
-    EndResizing,
+    EndResizing(Vector2F),
     ResizeLeft,
     ResizeRight,
     ResizeUp,
@@ -493,6 +494,9 @@ pub fn init(app: &mut AppContext) {
 
 pub enum Event {
     AppStateChanged,
+    LayoutResized {
+        before: PaneLayout,
+    },
     Escape,
     Exited {
         add_to_undo_stack: bool,
@@ -790,6 +794,11 @@ pub struct DraggedBorder {
     previous_mouse_location: Vector2F,
 }
 
+struct AdaptiveDividerDrag {
+    before: PaneLayout,
+    preview: Option<ResizePreview>,
+}
+
 /// Options that can be set when adding a new local terminal pane.
 #[derive(Debug, Default, Clone)]
 pub struct NewTerminalOptions {
@@ -907,6 +916,7 @@ pub struct PaneGroup {
     // the context menu event.
     share_block_modal: ViewHandle<ShareBlockModal>,
     dragged_border: Option<DraggedBorder>,
+    adaptive_divider_drag: Option<AdaptiveDividerDrag>,
     user_default_shell_changed_banner: ViewHandle<Banner<PaneGroupAction>>,
 
     /// If there is an open share session modal, the pane ID of its terminal. Only terminal panes
@@ -3178,6 +3188,7 @@ impl PaneGroup {
             terminal_with_open_share_block_modal: None,
             share_block_modal: share_modal,
             dragged_border: None,
+            adaptive_divider_drag: None,
             user_default_shell_changed_banner,
             terminal_with_open_share_session_modal: None,
             share_session_modal,
@@ -6236,6 +6247,9 @@ impl PaneGroup {
     /// Toggles whether or not the focused pane is maximized.
     fn toggle_maximize_pane(&mut self, ctx: &mut ViewContext<Self>) {
         if self.pane_count() > 1 {
+            if self.is_previewing_resize() {
+                self.cancel_resizing(ctx);
+            }
             self.focus_state.update(ctx, |focus_state, ctx| {
                 focus_state.toggle_focused_pane_maximized(ctx);
             });
@@ -6296,7 +6310,7 @@ impl PaneGroup {
         // If user clicks on a pane quickly after dragging the border, a race condition
         // could happen where the mouse down movement is considered as part of dragging.
         // We clear the dragging state here to avoid such conditions.
-        self.dragged_border = None;
+        self.cancel_resizing(ctx);
         if self.focus_pane_and_record_in_history(id, ctx) {
             ctx.emit(Event::AppStateChanged);
             ctx.emit(Event::PaneFocused);
@@ -6337,11 +6351,17 @@ impl PaneGroup {
         self.dragged_border.is_some()
     }
 
+    pub(crate) fn is_previewing_resize(&self) -> bool {
+        self.adaptive_divider_drag.is_some()
+    }
+
     // The drag event pertains to the divider being dragged between panes.
     // If there's no active dragging state on the pane, the event is propagated up
     // to workspace in case there the sidebar divider is being dragged.
     fn maybe_resize_pane(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
-        if self.dragged_border.is_some() {
+        if self.is_previewing_resize() {
+            self.preview_resize_at(position, ctx);
+        } else if self.dragged_border.is_some() {
             self.resize_pane(position, ctx);
         }
     }
@@ -6361,13 +6381,24 @@ impl PaneGroup {
     }
 
     pub fn start_resizing(&mut self, info: DraggedBorder, ctx: &mut ViewContext<Self>) {
-        // Clear hidden closed panes since resizing invalidates undo functionality
-        self.clear_hidden_closed_panes(ctx);
+        if self.panes.supports_adaptive_resize() {
+            self.adaptive_divider_drag = Some(AdaptiveDividerDrag {
+                before: self.panes.layout_snapshot(),
+                preview: None,
+            });
+        } else {
+            // The legacy resize commits on every mouse movement.
+            self.clear_hidden_closed_panes(ctx);
+        }
         self.dragged_border = Some(info);
     }
 
     pub fn reset_pane_sizes(&mut self, border_id: EntityId, ctx: &mut ViewContext<Self>) {
-        self.dragged_border = None;
+        self.cancel_resizing(ctx);
+        if self.panes.supports_adaptive_resize() {
+            self.adjust_divider(border_id, DividerAdjustment::Reset, ctx);
+            return;
+        }
         if self.panes.reset_pane_sizes(border_id) {
             self.clear_hidden_closed_panes(ctx);
             ctx.notify();
@@ -6375,53 +6406,128 @@ impl PaneGroup {
         }
     }
 
-    pub fn end_resizing(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn cancel_resizing(&mut self, ctx: &mut ViewContext<Self>) {
         self.dragged_border = None;
+        if self
+            .adaptive_divider_drag
+            .take()
+            .is_some_and(|drag| drag.preview.is_some())
+        {
+            ctx.notify();
+        }
+    }
+
+    pub(crate) fn preview_resize_at(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
+        let (Some(border), Some(drag)) = (self.dragged_border, &mut self.adaptive_divider_drag)
+        else {
+            return;
+        };
+        let delta = border
+            .direction
+            .along(position - border.previous_mouse_location);
+        let preview =
+            self.panes
+                .plan_divider_resize(border.border_id, DividerAdjustment::Move(delta), ctx);
+        if preview.map(|preview| preview.offset) != drag.preview.map(|preview| preview.offset) {
+            drag.preview = preview;
+            ctx.notify();
+        }
+    }
+
+    pub(crate) fn commit_resize_at(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
+        let border = self.dragged_border.take();
+        let Some(drag) = self.adaptive_divider_drag.take() else {
+            ctx.emit(Event::AppStateChanged);
+            return;
+        };
+        ctx.notify();
+        let Some(border) = border else {
+            return;
+        };
+        if !self.panes.supports_adaptive_resize()
+            || self.is_focused_pane_maximized(ctx)
+            || self.panes.layout_snapshot() != drag.before
+        {
+            return;
+        }
+        let delta = border
+            .direction
+            .along(position - border.previous_mouse_location);
+        if let Some(resize) =
+            self.panes
+                .plan_divider_resize(border.border_id, DividerAdjustment::Move(delta), ctx)
+            && self.panes.apply_divider_resize(resize, ctx)
+        {
+            self.finish_adaptive_resize(drag.before, ctx);
+        }
+    }
+
+    fn adjust_divider(
+        &mut self,
+        border_id: EntityId,
+        adjustment: DividerAdjustment,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(resize) = self.panes.plan_divider_resize(border_id, adjustment, ctx) else {
+            return;
+        };
+        let before = self.panes.layout_snapshot();
+        if self.panes.apply_divider_resize(resize, ctx) {
+            self.finish_adaptive_resize(before, ctx);
+        }
+    }
+
+    pub(crate) fn balance_panes(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.panes.supports_adaptive_resize() || self.is_focused_pane_maximized(ctx) {
+            return;
+        }
+        self.cancel_resizing(ctx);
+        let before = self.panes.layout_snapshot();
+        if self.panes.balance() {
+            self.finish_adaptive_resize(before, ctx);
+        }
+    }
+
+    fn finish_adaptive_resize(&mut self, before: PaneLayout, ctx: &mut ViewContext<Self>) {
+        self.clear_hidden_closed_panes(ctx);
+        ctx.notify();
+        ctx.emit(Event::LayoutResized { before });
+        ctx.emit(Event::AppStateChanged);
+    }
+
+    fn resize_by_keyboard(
+        &mut self,
+        axis: SplitDirection,
+        delta: f32,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let focused = self.focused_pane_id(ctx);
+        if self.panes.supports_adaptive_resize() {
+            self.cancel_resizing(ctx);
+            if let Some(divider) = self.panes.divider_for_pane(focused, axis) {
+                self.adjust_divider(divider, DividerAdjustment::Move(delta), ctx);
+            }
+            return;
+        }
+        self.panes.adjust_pane_size_by_id(focused, axis, delta, ctx);
+        ctx.notify();
         ctx.emit(Event::AppStateChanged);
     }
 
     pub fn resize_left(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Horizontal,
-            -KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Horizontal, -KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     pub fn resize_right(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Horizontal,
-            KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Horizontal, KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     pub fn resize_up(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Vertical,
-            -KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Vertical, -KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     pub fn resize_down(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Vertical,
-            KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Vertical, KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     fn handle_user_default_shell_changed_banner_event(
@@ -8618,7 +8724,7 @@ impl TypedActionView for PaneGroup {
             ResizeMove(position) => self.maybe_resize_pane(*position, ctx),
             StartResizing(border) => self.start_resizing(*border, ctx),
             ResetPaneSizes(border_id) => self.reset_pane_sizes(*border_id, ctx),
-            EndResizing => self.end_resizing(ctx),
+            EndResizing(position) => self.commit_resize_at(*position, ctx),
             ResizeLeft => self.resize_left(ctx),
             ResizeRight => self.resize_right(ctx),
             ResizeUp => self.resize_up(ctx),
@@ -8712,13 +8818,17 @@ impl View for PaneGroup {
         let main_content = if self.is_focused_pane_maximized(app) {
             self.focused_pane_id(app).render(app)
         } else {
-            EventHandler::new(self.panes.render(appearance.theme(), app))
+            let preview = self
+                .adaptive_divider_drag
+                .as_ref()
+                .and_then(|drag| drag.preview);
+            EventHandler::new(self.panes.render(appearance.theme(), preview, app))
                 .on_mouse_dragged(move |ctx, _, position| {
                     ctx.dispatch_typed_action(PaneGroupAction::ResizeMove(position));
                     DispatchEventResult::StopPropagation
                 })
-                .on_left_mouse_up(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(PaneGroupAction::EndResizing);
+                .on_left_mouse_up(move |ctx, _, position| {
+                    ctx.dispatch_typed_action(PaneGroupAction::EndResizing(position));
                     DispatchEventResult::StopPropagation
                 })
                 .finish()

@@ -53,11 +53,13 @@ impl Workspace {
             return;
         }
 
+        let before = self.capture_layout_state([source.id()], ctx);
         let (new_index, group) = self.new_tab_index_and_group(ctx);
         if let Some(content) = source.update(ctx, |source, ctx| {
             source.take_terminal_pane_for_new_tab(pane, ctx)
         }) {
             self.add_tab_from_existing_pane(content, new_index, group, ctx);
+            self.record_layout_change(before, Some(self.active_tab_pane_group().id()), None, ctx);
         }
     }
 
@@ -83,7 +85,7 @@ impl Workspace {
         })
     }
 
-    fn has_docking_child_tab(&self, group: EntityId, ctx: &AppContext) -> bool {
+    pub(super) fn has_docking_child_tab(&self, group: EntityId, ctx: &AppContext) -> bool {
         self.tabs.iter().any(|tab| {
             tab.pane_group
                 .as_ref(ctx)
@@ -234,6 +236,15 @@ impl Workspace {
         let source_group = &self.tabs[plan.source_index].pane_group;
         let destination = &self.tabs[plan.destination_index].pane_group;
         let same_tab = plan.source_index == plan.destination_index;
+        let before = self.capture_layout_state(
+            [
+                Some(source_group.id()),
+                (!same_tab).then_some(destination.id()),
+            ]
+            .into_iter()
+            .flatten(),
+            ctx,
+        );
         let moved = match (plan.source_pane, operation, same_tab) {
             (Some(pane), DockingOperation::Stack, true) => source_group
                 .update(ctx, |group, ctx| {
@@ -288,6 +299,8 @@ impl Workspace {
             return false;
         }
         let remove_source = source_group.as_ref(ctx).pane_ids().next().is_none();
+        let retired =
+            (remove_source && before.is_some()).then(|| self.retired_layout_tab(plan.source_index));
         if remove_source {
             self.cancel_tab_rename(ctx);
             self.remove_tab(plan.source_index, false, true, ctx);
@@ -295,6 +308,7 @@ impl Workspace {
         if self.active_tab_pane_group().id() != target.pane_group_id {
             self.activate_tab_by_pane_group_id(target.pane_group_id, ctx);
         }
+        self.record_layout_change(before, None, retired, ctx);
         true
     }
 }

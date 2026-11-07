@@ -57,7 +57,7 @@ use crate::util::bindings::keybinding_name_to_display_string;
 #[cfg(target_arch = "wasm32")]
 use crate::workspace::WorkspaceAction;
 use crate::workspace::tab_settings::TabSettings;
-use crate::workspace::{PaneViewLocator, WorkspaceRegistry};
+use crate::workspace::{MOVE_TO_OWN_TAB_LABEL, PaneViewLocator, WorkspaceRegistry};
 
 /// Total size of the agent icon-with-status component rendered in the pane header.
 /// Sub-components (circle, badge, cloud) are derived inside `render_icon_with_status`.
@@ -774,7 +774,7 @@ impl BackingView for TerminalView {
                 items.push(MenuItem::Separator);
             }
             items.push(
-                MenuItemFields::new("Move pane to new tab")
+                MenuItemFields::new(MOVE_TO_OWN_TAB_LABEL)
                     .with_on_select_action(TerminalAction::MovePaneToNewTab)
                     .into_item(),
             );

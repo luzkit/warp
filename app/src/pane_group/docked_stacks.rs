@@ -4,9 +4,10 @@ use super::pane::{AnyPaneContent, DetachType, PaneConfigurationEvent};
 use super::{Event, PaneGroup, PaneId};
 use crate::app_state::{self, BranchSnapshot, PaneNodeSnapshot};
 
+#[derive(Clone)]
 pub(super) struct DockedStack {
-    active: PaneId,
-    members: Vec<PaneId>,
+    pub(super) active: PaneId,
+    pub(super) members: Vec<PaneId>,
 }
 
 impl PaneGroup {
@@ -235,7 +236,7 @@ impl PaneGroup {
         content
     }
 
-    fn refresh_docked_stack_header(&self, pane: PaneId, ctx: &mut ViewContext<Self>) {
+    pub(super) fn refresh_docked_stack_header(&self, pane: PaneId, ctx: &mut ViewContext<Self>) {
         if let Some(content) = self.pane_by_id(pane) {
             content.pane_configuration().update(ctx, |_, ctx| {
                 ctx.emit(PaneConfigurationEvent::RefreshPaneHeaderOverflowMenuItems);

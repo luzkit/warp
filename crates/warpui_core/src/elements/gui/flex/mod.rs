@@ -115,18 +115,10 @@ impl Flex {
         self
     }
 
-    fn child_flex(child: &dyn Element) -> Option<f32> {
+    fn child_flex_data(child: &dyn Element) -> Option<&FlexParentData> {
         child
             .parent_data()
             .and_then(|d| d.downcast_ref::<FlexParentData>())
-            .map(|data| data.flex)
-    }
-
-    fn child_flex_fit(child: &dyn Element) -> Option<FlexFit> {
-        child
-            .parent_data()
-            .and_then(|d| d.downcast_ref::<FlexParentData>())
-            .map(|data| data.fit)
     }
 
     pub fn with_main_axis_size(mut self, main_axis_size: MainAxisSize) -> Self {
@@ -218,6 +210,7 @@ See https://www.notion.so/warpdev/Debugging-Flex-acc03383be5644a8af29d9c52b1142b
         }
 
         let mut total_flex = 0.0;
+        let mut has_flex_minimum = false;
         let mut fixed_space = self.spacing * (self.children.len().saturating_sub(1)) as f32;
 
         let cross_axis = self.axis.invert();
@@ -232,8 +225,9 @@ See https://www.notion.so/warpdev/Debugging-Flex-acc03383be5644a8af29d9c52b1142b
         // of 40 pixels.
         for child in &mut self.children {
             // If the element is flexible add to the total flex but don't lay out the child.
-            if let Some(flex) = Self::child_flex(child.as_ref()) {
-                total_flex += flex;
+            if let Some(data) = Self::child_flex_data(child.as_ref()) {
+                total_flex += data.flex;
+                has_flex_minimum |= data.minimum > 0.;
             } else {
                 // The child is not flexible. In this case, we want the main axis size constraint
                 // going from 0 to infinity, and:
@@ -286,13 +280,28 @@ See https://www.notion.so/warpdev/Debugging-Flex-acc03383be5644a8af29d9c52b1142b
 
             let mut remaining_space = (constraint.max_along(self.axis) - fixed_space).max(0.);
             let mut remaining_flex = total_flex;
+            let mut minimum_adjusted_sizes = has_flex_minimum.then(|| {
+                let flexible_children: Vec<_> = self
+                    .children
+                    .iter()
+                    .filter_map(|child| {
+                        let data = Self::child_flex_data(child.as_ref())?;
+                        Some((data.flex, data.minimum))
+                    })
+                    .collect();
+                flex_sizes_with_minimums(remaining_space, &flexible_children).into_iter()
+            });
             for child in &mut self.children {
-                let space_per_flex = remaining_space / remaining_flex;
-                if let Some(flex) = Self::child_flex(child.as_ref()) {
-                    let child_max = space_per_flex * flex;
-                    let child_min = match Self::child_flex_fit(child.as_ref()) {
-                        Some(FlexFit::Loose) | None => 0.0,
-                        Some(FlexFit::Tight) => child_max,
+                if let Some(data) = Self::child_flex_data(child.as_ref()) {
+                    let flex = data.flex;
+                    let child_max = minimum_adjusted_sizes
+                        .as_mut()
+                        .and_then(Iterator::next)
+                        .unwrap_or_else(|| remaining_space / remaining_flex * flex);
+                    let child_min = match data.fit {
+                        FlexFit::Loose if data.minimum > 0. => data.minimum.min(child_max),
+                        FlexFit::Loose => 0.0,
+                        FlexFit::Tight => child_max,
                     };
 
                     let child_constraint = match self.axis {
@@ -705,6 +714,53 @@ fn size_along_axis(coordinate: f32, axis: Axis) -> Vector2F {
 struct FlexParentData {
     flex: f32,
     fit: FlexFit,
+    minimum: f32,
+}
+
+/// Allocate space proportionally, pinning children that would otherwise fall below their
+/// minimums. When even the minimums cannot fit, shrink them proportionally.
+pub fn flex_sizes_with_minimums(available: f32, children: &[(f32, f32)]) -> Vec<f32> {
+    let minimum_total: f32 = children.iter().map(|(_, minimum)| minimum).sum();
+    if minimum_total > available {
+        return children
+            .iter()
+            .map(|(_, minimum)| available * minimum / minimum_total)
+            .collect();
+    }
+
+    let mut remaining_flex: f32 = children.iter().map(|(flex, _)| flex).sum();
+    let mut remaining_space = available;
+    let scale = remaining_space / remaining_flex;
+    if children
+        .iter()
+        .all(|(flex, minimum)| flex * scale >= *minimum)
+    {
+        return children.iter().map(|(flex, _)| flex * scale).collect();
+    }
+
+    let mut priorities: Vec<_> = children
+        .iter()
+        .filter(|(_, minimum)| *minimum > 0.)
+        .map(|&(flex, minimum)| (minimum / flex, flex, minimum))
+        .collect();
+    priorities.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+    for (threshold, flex, minimum) in priorities {
+        if remaining_flex <= 0. || threshold <= remaining_space / remaining_flex {
+            break;
+        }
+        remaining_flex -= flex;
+        remaining_space -= minimum;
+    }
+
+    let scale = if remaining_flex > 0. {
+        (remaining_space / remaining_flex).max(0.)
+    } else {
+        0.
+    };
+    children
+        .iter()
+        .map(|(flex, minimum)| (flex * scale).max(*minimum))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -765,9 +821,15 @@ impl Shrinkable {
             parent_data: FlexParentData {
                 flex,
                 fit: FlexFit::Loose,
+                minimum: 0.,
             },
             child,
         }
+    }
+
+    pub fn with_minimum_main_axis_size(mut self, size: f32) -> Self {
+        self.parent_data.minimum = size;
+        self
     }
 }
 
@@ -893,6 +955,7 @@ impl Expanded {
             parent_data: FlexParentData {
                 flex,
                 fit: FlexFit::Tight,
+                minimum: 0.,
             },
             child,
         }

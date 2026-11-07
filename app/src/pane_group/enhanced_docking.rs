@@ -1,14 +1,153 @@
+use std::collections::HashMap;
+
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
+use warp_core::SessionId;
 use warpui::elements::DraggableState;
-use warpui::{AppContext, SingletonEntity, ViewContext, ViewHandle};
+use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
-use super::tree::PaneData;
-use super::{Direction, Event, PaneGroup, PaneId, TerminalPane, get_minimum_pane_size};
+use super::docked_stacks::DockedStack;
+use super::tree::{PaneData, PaneLayout};
+use super::{
+    Direction, Event, PaneGroup, PaneId, TerminalPane, TerminalPaneId, get_minimum_pane_size,
+};
 use crate::pane_group::pane::{AnyPaneContent, DetachType};
 use crate::workspace::sync_inputs::SyncedInputState;
 
+type TerminalIdentity = (EntityId, Option<SessionId>);
+
+#[derive(Clone)]
+pub(crate) struct DockingLayoutSnapshot {
+    pub(crate) tree: PaneLayout,
+    stacks: Vec<DockedStack>,
+    panes: HashMap<PaneId, Option<TerminalIdentity>>,
+    focused: PaneId,
+    active_session: Option<TerminalPaneId>,
+}
+
+impl DockingLayoutSnapshot {
+    pub(crate) fn pane_ids(&self) -> impl Iterator<Item = PaneId> + '_ {
+        self.panes.keys().copied()
+    }
+
+    pub(crate) fn matches(&self, current: &Self) -> bool {
+        self.panes == current.panes
+            && self
+                .stacks
+                .iter()
+                .map(|stack| &stack.members)
+                .eq(current.stacks.iter().map(|stack| &stack.members))
+            && self.normalized_tree() == current.normalized_tree()
+    }
+
+    pub(crate) fn fits(&self, size: Vector2F, ctx: &AppContext) -> bool {
+        self.tree.clone().into_pane_data().docked_subtree_fits(
+            size,
+            get_minimum_pane_size(ctx),
+            None,
+        )
+    }
+
+    fn normalized_tree(&self) -> PaneLayout {
+        let mut tree = self.tree.clone();
+        for stack in &self.stacks {
+            tree.remap_leaf(stack.active, stack.members[0]);
+        }
+        tree
+    }
+}
+
 impl PaneGroup {
+    pub(crate) fn capture_docking_layout(
+        handle: &ViewHandle<Self>,
+        ctx: &AppContext,
+    ) -> Option<DockingLayoutSnapshot> {
+        let group = handle.as_ref(ctx);
+        if !group.supports_docking_context(handle, ctx) || group.pane_contents.is_empty() {
+            return None;
+        }
+
+        let panes = group
+            .pane_contents
+            .keys()
+            .map(|&pane| {
+                let terminal = group.terminal_view_from_pane_id(pane, ctx).map(|view| {
+                    let session = view
+                        .as_ref(ctx)
+                        .active_session()
+                        .as_ref(ctx)
+                        .session_id(ctx);
+                    (view.id(), session)
+                });
+                (pane, terminal)
+            })
+            .collect();
+        Some(DockingLayoutSnapshot {
+            tree: group.panes.layout_snapshot(),
+            stacks: group.docked_stacks.clone(),
+            panes,
+            focused: group.focused_pane_id(ctx),
+            active_session: group.active_session_id(ctx),
+        })
+    }
+
+    pub(crate) fn can_replay_docking_move(&self, pane: PaneId, ctx: &AppContext) -> bool {
+        self.terminal_session_by_id(pane)
+            .is_some_and(|terminal| terminal.supports_terminal_docking(ctx))
+    }
+
+    pub(crate) fn take_layout_history_panes(
+        &mut self,
+        ids: &[PaneId],
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<Box<dyn AnyPaneContent>> {
+        let panes = ids
+            .iter()
+            .map(|id| {
+                let pane = self
+                    .pane_contents
+                    .remove(id)
+                    .expect("Validated layout pane");
+                pane.as_pane().detach(self, DetachType::Moved, ctx);
+                ctx.unsubscribe_to_model(&pane.as_pane().pane_configuration());
+                pane
+            })
+            .collect();
+        if !ids.is_empty() {
+            self.restore_docking_group_subscriptions(ctx);
+        }
+        panes
+    }
+
+    pub(crate) fn replay_docking_layout(
+        &mut self,
+        snapshot: DockingLayoutSnapshot,
+        incoming: Vec<Box<dyn AnyPaneContent>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.panes = snapshot.tree.into_pane_data();
+        self.docked_stacks = snapshot.stacks;
+        for pane in incoming {
+            let id = pane.as_pane().id();
+            self.pane_contents.insert(id, pane);
+            self.attach_pane(self.pane_contents[&id].as_ref(), ctx);
+        }
+        self.pane_history
+            .retain(|pane| self.pane_contents.contains_key(pane));
+        self.handle_pane_count_change(ctx);
+        self.focus_pane(snapshot.focused, false, ctx);
+        self.update_pane_history(snapshot.focused);
+        self.focus_state.update(ctx, |state, ctx| {
+            state.set_active_session(snapshot.active_session, ctx);
+        });
+        for pane in self.panes.pane_ids() {
+            self.refresh_docked_stack_header(pane, ctx);
+        }
+        ctx.notify();
+        ctx.emit(Event::TerminalViewStateChanged);
+        ctx.emit(Event::AppStateChanged);
+    }
+
     pub(crate) fn take_terminal_pane_for_new_tab(
         &mut self,
         pane: PaneId,
@@ -55,7 +194,10 @@ impl PaneGroup {
         ctx: &mut ViewContext<Self>,
     ) {
         ctx.unsubscribe_to_model(&moved.as_pane().pane_configuration());
+        self.restore_docking_group_subscriptions(ctx);
+    }
 
+    fn restore_docking_group_subscriptions(&self, ctx: &mut ViewContext<Self>) {
         // Unsubscribing from a shared model removes all callbacks for this pane group.
         #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
         Self::subscribe_to_child_sharing_events(ctx);
@@ -125,7 +267,8 @@ impl PaneGroup {
         if self.is_focused_pane_maximized(ctx) || self.right_panel_open || self.left_panel_open {
             return Vec::new();
         }
-        self.panes.docking_preview_rects(bounds)
+        self.panes
+            .docking_preview_rects(bounds, get_minimum_pane_size(ctx))
     }
 
     pub(crate) fn docking_layout_fits(

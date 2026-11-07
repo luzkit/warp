@@ -9,7 +9,7 @@ use warpui::elements::{
     ChildAnchor, ConstrainedBox, Container, DispatchEventResult, Element, Empty, EventHandler,
     Flex, Hoverable, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
     ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Rect, SavePosition,
-    Shrinkable, Stack,
+    Shrinkable, Stack, flex_sizes_with_minimums,
 };
 use warpui::platform::Cursor;
 use warpui::{AppContext, EntityId, ViewContext};
@@ -36,6 +36,25 @@ pub fn get_divider_thickness() -> f32 {
 
 pub(crate) fn get_divider_layout_extent() -> f32 {
     get_divider_thickness() - 1.0
+}
+
+pub(crate) const RESIZE_PREVIEW_POSITION: &str = "pane_group:resize_preview";
+
+#[derive(Clone, Copy)]
+pub(super) struct ResizePreview {
+    pub(super) border_id: EntityId,
+    pub(super) offset: f32,
+}
+
+pub(super) enum DividerAdjustment {
+    Move(f32),
+    Reset,
+}
+
+#[derive(Clone, Copy)]
+struct SplitRendering {
+    minimum: Option<f32>,
+    preview: Option<ResizePreview>,
 }
 
 // Extra padding for the divider to make it easier to resize.
@@ -116,6 +135,56 @@ pub enum PaneNode {
     Branch(PaneBranch),
     /// A single pane
     Leaf(PaneId),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PaneLayout {
+    Leaf(PaneId),
+    Branch(SplitDirection, Vec<(f32, Self)>),
+}
+
+impl PaneLayout {
+    pub(crate) fn into_pane_data(self) -> PaneData {
+        let (root, len) = self.into_node();
+        PaneData {
+            root,
+            len,
+            hidden_panes: Vec::new(),
+        }
+    }
+
+    fn into_node(self) -> (PaneNode, usize) {
+        match self {
+            Self::Leaf(id) => (PaneNode::Leaf(id), 1),
+            Self::Branch(axis, children) => {
+                let mut len = 0;
+                let nodes: Vec<_> = children
+                    .into_iter()
+                    .map(|(flex, child)| {
+                        let (child, count) = child.into_node();
+                        len += count;
+                        (PaneFlex(flex), child)
+                    })
+                    .collect();
+                (PaneData::new_branch(axis, nodes, len).root, len)
+            }
+        }
+    }
+
+    pub(crate) fn remap_leaf(&mut self, old: PaneId, new: PaneId) {
+        match self {
+            Self::Leaf(pane) => {
+                if *pane == old {
+                    *pane = new;
+                }
+            }
+            Self::Branch(_, children) => {
+                for (_, child) in children {
+                    child.remap_leaf(old, new);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -207,6 +276,10 @@ impl Divider {
 }
 
 impl PaneData {
+    pub(crate) fn layout_snapshot(&self) -> PaneLayout {
+        self.root.layout_snapshot()
+    }
+
     /// Create a new `PaneData` with a Leaf as the root
     pub fn new(pane_id: PaneId) -> Self {
         Self {
@@ -532,18 +605,23 @@ impl PaneData {
             let count = self.len() as f32;
             across >= minimum && along >= count * minimum + (count - 1.) * divider
         } else {
-            self.root.fits_docking_size(size, minimum, divider)
+            let required = self.root.minimum_layout_size(minimum, divider);
+            size.x() >= required.x() && size.y() >= required.y()
         }
     }
 
     /// Computes visible leaf geometry without laying out the associated views.
-    pub(super) fn docking_preview_rects(&self, bounds: RectF) -> Vec<(PaneId, RectF)> {
+    pub(super) fn docking_preview_rects(
+        &self,
+        bounds: RectF,
+        minimum: f32,
+    ) -> Vec<(PaneId, RectF)> {
         if self.is_empty() || !self.hidden_panes.is_empty() {
             return Vec::new();
         }
         let mut panes = Vec::with_capacity(self.len());
         self.root
-            .collect_docking_rects(bounds, get_divider_layout_extent(), &mut panes);
+            .collect_docking_rects(bounds, minimum, get_divider_layout_extent(), &mut panes);
         panes
     }
 
@@ -637,11 +715,97 @@ impl PaneData {
         self.len == 0
     }
 
-    pub fn render(&self, theme: &WarpTheme, app: &AppContext) -> Box<dyn Element> {
+    pub(super) fn render(
+        &self,
+        theme: &WarpTheme,
+        preview: Option<ResizePreview>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         match &self.root {
             PaneNode::Leaf(pane) => pane.render(app),
-            PaneNode::Branch(node) => node.render(theme, &self.hidden_panes, app),
+            PaneNode::Branch(node) => {
+                let options = SplitRendering {
+                    minimum: self
+                        .supports_adaptive_resize()
+                        .then(|| get_minimum_pane_size(app)),
+                    preview,
+                };
+                node.render(theme, &self.hidden_panes, options, app)
+            }
         }
+    }
+
+    pub(super) fn supports_adaptive_resize(&self) -> bool {
+        FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && !self
+                .hidden_panes
+                .iter()
+                .any(|pane| self.root.contains_pane(pane.pane_id))
+    }
+
+    pub(super) fn divider_for_pane(&self, pane: PaneId, axis: SplitDirection) -> Option<EntityId> {
+        self.root.divider_for_pane(pane, axis)
+    }
+
+    pub(super) fn plan_divider_resize(
+        &self,
+        border_id: EntityId,
+        adjustment: DividerAdjustment,
+        ctx: &ViewContext<PaneGroup>,
+    ) -> Option<ResizePreview> {
+        let branch = self.root.branch_at_divider(border_id)?;
+        let index = branch.divider_index(border_id)?;
+        let minimum = get_minimum_pane_size(ctx);
+        let divider = get_divider_layout_extent();
+        let first = &branch.nodes[index].1;
+        let second = &branch.nodes[index + 1].1;
+        let before = branch.child_extent(first, ctx)?;
+        let pair = before + branch.child_extent(second, ctx)?;
+        let minimum_before = branch
+            .axis
+            .along(first.minimum_layout_size(minimum, divider));
+        let minimum_after = branch
+            .axis
+            .along(second.minimum_layout_size(minimum, divider));
+        let next_before =
+            adjusted_divider_size(before, pair, minimum_before, minimum_after, adjustment)?;
+        Some(ResizePreview {
+            border_id,
+            offset: next_before - before,
+        })
+    }
+
+    pub(super) fn apply_divider_resize(
+        &mut self,
+        resize: ResizePreview,
+        ctx: &ViewContext<PaneGroup>,
+    ) -> bool {
+        let Some(branch) = self.root.branch_at_divider_mut(resize.border_id) else {
+            return false;
+        };
+        let Some(index) = branch.divider_index(resize.border_id) else {
+            return false;
+        };
+        let Some(mut sizes) = branch
+            .nodes
+            .iter()
+            .map(|(_, child)| branch.child_extent(child, ctx))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        sizes[index] += resize.offset;
+        sizes[index + 1] -= resize.offset;
+        let total_flex: f32 = branch.nodes.iter().map(|(flex, _)| flex.0).sum();
+        let total_extent: f32 = sizes.iter().sum();
+        for ((flex, _), extent) in branch.nodes.iter_mut().zip(sizes) {
+            *flex = PaneFlex(extent / total_extent * total_flex);
+        }
+        true
+    }
+
+    pub(super) fn balance(&mut self) -> bool {
+        self.root.balance()
     }
 
     pub fn adjust_pane_size(
@@ -841,10 +1005,97 @@ impl PaneNode {
         }
     }
 
+    fn layout_snapshot(&self) -> PaneLayout {
+        match self {
+            Self::Leaf(pane) => PaneLayout::Leaf(*pane),
+            Self::Branch(branch) => PaneLayout::Branch(
+                branch.axis,
+                branch
+                    .nodes
+                    .iter()
+                    .map(|(flex, child)| (flex.0, child.layout_snapshot()))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn layout_position_id(&self) -> String {
+        match self {
+            Self::Leaf(pane) => pane.position_id(),
+            Self::Branch(branch) => branch.layout_position_id(),
+        }
+    }
+
+    fn divider_for_pane(&self, pane: PaneId, axis: SplitDirection) -> Option<EntityId> {
+        let Self::Branch(branch) = self else {
+            return None;
+        };
+        let index = branch
+            .nodes
+            .iter()
+            .position(|(_, child)| child.contains_pane(pane))?;
+        branch.nodes[index]
+            .1
+            .divider_for_pane(pane, axis)
+            .or_else(|| {
+                if axis != branch.axis {
+                    return None;
+                }
+                let index = index.min(branch.dividers.len().saturating_sub(1));
+                branch.dividers.get(index).map(|divider| divider.id)
+            })
+    }
+
+    fn branch_at_divider(&self, border_id: EntityId) -> Option<&PaneBranch> {
+        let Self::Branch(branch) = self else {
+            return None;
+        };
+        if branch.divider_index(border_id).is_some() {
+            Some(branch)
+        } else {
+            branch
+                .nodes
+                .iter()
+                .find_map(|(_, child)| child.branch_at_divider(border_id))
+        }
+    }
+
+    fn branch_at_divider_mut(&mut self, border_id: EntityId) -> Option<&mut PaneBranch> {
+        let Self::Branch(branch) = self else {
+            return None;
+        };
+        if branch.divider_index(border_id).is_some() {
+            Some(branch)
+        } else {
+            branch
+                .nodes
+                .iter_mut()
+                .find_map(|(_, child)| child.branch_at_divider_mut(border_id))
+        }
+    }
+
+    fn balance(&mut self) -> bool {
+        let Self::Branch(branch) = self else {
+            return false;
+        };
+        let mut changed = false;
+        let mean =
+            branch.nodes.iter().map(|(flex, _)| flex.0).sum::<f32>() / branch.nodes.len() as f32;
+        for (flex, child) in &mut branch.nodes {
+            if (flex.0 - mean).abs() > f32::EPSILON {
+                *flex = PaneFlex(mean);
+                changed = true;
+            }
+            changed |= child.balance();
+        }
+        changed
+    }
+
     fn render(
         &self,
         theme: &WarpTheme,
         hidden_panes: &Vec<HiddenPane>,
+        options: SplitRendering,
         app: &AppContext,
     ) -> Box<dyn Element> {
         match self {
@@ -860,7 +1111,7 @@ impl PaneNode {
                     })
                     .finish()
             }
-            PaneNode::Branch(branch) => branch.render(theme, hidden_panes, app),
+            PaneNode::Branch(branch) => branch.render(theme, hidden_panes, options, app),
         }
     }
 
@@ -988,33 +1239,40 @@ impl PaneNode {
         }
     }
 
-    fn fits_docking_size(&self, size: Vector2F, minimum: f32, divider: f32) -> bool {
+    fn minimum_layout_size(&self, minimum: f32, divider: f32) -> Vector2F {
         match self {
-            PaneNode::Leaf(_) => size.x() >= minimum && size.y() >= minimum,
+            PaneNode::Leaf(_) => Vector2F::new(minimum, minimum),
             PaneNode::Branch(branch) => {
-                branch
-                    .docking_child_sizes(size, divider)
-                    .is_some_and(|mut children| {
-                        children
-                            .all(|(child, size)| child.fits_docking_size(size, minimum, divider))
-                    })
+                let mut size = branch.axis.size(divider * branch.dividers.len() as f32, 0.);
+                for (_, child) in &branch.nodes {
+                    let child = child.minimum_layout_size(minimum, divider);
+                    size = branch.axis.size(
+                        branch.axis.along(size) + branch.axis.along(child),
+                        branch.axis.across(size).max(branch.axis.across(child)),
+                    );
+                }
+                size
             }
         }
     }
 
-    fn collect_docking_rects(&self, bounds: RectF, divider: f32, panes: &mut Vec<(PaneId, RectF)>) {
+    fn collect_docking_rects(
+        &self,
+        bounds: RectF,
+        minimum: f32,
+        divider: f32,
+        panes: &mut Vec<(PaneId, RectF)>,
+    ) {
         if !(bounds.width() > 0. && bounds.height() > 0.) {
             return;
         }
         match self {
             PaneNode::Leaf(id) => panes.push((*id, bounds)),
             PaneNode::Branch(branch) => {
-                let Some(children) = branch.docking_child_sizes(bounds.size(), divider) else {
-                    return;
-                };
+                let children = branch.docking_child_sizes(bounds.size(), minimum, divider);
                 let mut origin = bounds.origin();
                 for (child, size) in children {
-                    child.collect_docking_rects(RectF::new(origin, size), divider, panes);
+                    child.collect_docking_rects(RectF::new(origin, size), minimum, divider, panes);
                     origin += match branch.axis {
                         SplitDirection::Horizontal => Vector2F::new(size.x() + divider, 0.),
                         SplitDirection::Vertical => Vector2F::new(0., size.y() + divider),
@@ -1083,31 +1341,45 @@ impl FindPaneByDirection for PaneNode {
 }
 
 impl PaneBranch {
+    fn child_extent(&self, child: &PaneNode, ctx: &ViewContext<PaneGroup>) -> Option<f32> {
+        let bounds = ctx.element_position_by_id(child.layout_position_id())?;
+        let extent = self.axis.along(bounds.size());
+        (extent.is_finite() && extent > 0.).then_some(extent)
+    }
+
+    fn layout_position_id(&self) -> String {
+        format!("pane_group:split_layout:{}", self.dividers[0].id)
+    }
+
+    fn divider_index(&self, border_id: EntityId) -> Option<usize> {
+        self.dividers
+            .iter()
+            .position(|divider| divider.id == border_id)
+    }
+
     fn docking_child_sizes(
         &self,
         size: Vector2F,
+        minimum: f32,
         divider: f32,
-    ) -> Option<impl Iterator<Item = (&PaneNode, Vector2F)> + '_> {
-        let total_flex: f32 = self.nodes.iter().map(|(flex, _)| flex.0).sum();
-        if !total_flex.is_finite()
-            || total_flex <= 0.
-            || self.nodes.iter().any(|(flex, _)| flex.0 <= 0.)
-        {
-            return None;
-        }
+    ) -> impl Iterator<Item = (&PaneNode, Vector2F)> + '_ {
         let reserved = divider * self.dividers.len() as f32;
-        Some(self.nodes.iter().map(move |(flex, child)| {
-            let share = flex.0 / total_flex;
-            let size = match self.axis {
-                SplitDirection::Horizontal => {
-                    Vector2F::new((size.x() - reserved).max(0.) * share, size.y())
-                }
-                SplitDirection::Vertical => {
-                    Vector2F::new(size.x(), (size.y() - reserved).max(0.) * share)
-                }
-            };
-            (child, size)
-        }))
+        let children: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|(flex, child)| {
+                (
+                    flex.0,
+                    self.axis.along(child.minimum_layout_size(minimum, divider)),
+                )
+            })
+            .collect();
+        let available = (self.axis.along(size) - reserved).max(0.);
+        let sizes = flex_sizes_with_minimums(available, &children);
+        self.nodes
+            .iter()
+            .zip(sizes)
+            .map(move |((_, child), along)| (child, self.axis.size(along, self.axis.across(size))))
     }
 
     fn new(old_pane: PaneNode, new_pane: PaneNode, direction: Direction) -> Self {
@@ -1268,6 +1540,7 @@ impl PaneBranch {
         &self,
         theme: &WarpTheme,
         hidden_panes: &Vec<HiddenPane>,
+        options: SplitRendering,
         app: &AppContext,
     ) -> Box<dyn Element> {
         let mut parent = match self.axis {
@@ -1299,9 +1572,13 @@ impl PaneBranch {
                 }
             }
 
-            parent.add_child(
-                Shrinkable::new(flex_value, node.render(theme, hidden_panes, app)).finish(),
-            );
+            let mut child =
+                Shrinkable::new(flex_value, node.render(theme, hidden_panes, options, app));
+            if let Some(minimum) = options.minimum {
+                let minimum_size = node.minimum_layout_size(minimum, get_divider_layout_extent());
+                child = child.with_minimum_main_axis_size(self.axis.along(minimum_size));
+            }
+            parent.add_child(child.finish());
             if let Some(divider) = dividers.next() {
                 if matches!(node, PaneNode::Leaf(id) if pane_hidden_for_move(hidden_panes, id)) {
                     continue;
@@ -1335,15 +1612,36 @@ impl PaneBranch {
             stack.add_positioned_child(
                 divider_element,
                 OffsetPositioning::offset_from_save_position_element(
-                    position_id,
+                    &position_id,
                     Vector2F::new(0., 0.),
                     PositionedElementOffsetBounds::Unbounded,
                     PositionedElementAnchor::TopLeft,
                     ChildAnchor::TopLeft,
                 ),
             );
+            if let Some(preview) = options
+                .preview
+                .filter(|preview| preview.border_id == divider.id)
+            {
+                stack.add_positioned_overlay_child(
+                    create_resize_preview(self.axis, theme),
+                    OffsetPositioning::offset_from_save_position_element(
+                        &position_id,
+                        self.axis.size(preview.offset, 0.),
+                        PositionedElementOffsetBounds::Unbounded,
+                        PositionedElementAnchor::TopLeft,
+                        ChildAnchor::TopLeft,
+                    ),
+                );
+            }
         }
-        stack.finish()
+        if options.minimum.is_some() {
+            SavePosition::new(stack.finish(), &self.layout_position_id())
+                .for_single_frame()
+                .finish()
+        } else {
+            stack.finish()
+        }
     }
 
     pub fn adjust_pane_size(
@@ -1612,6 +1910,36 @@ fn create_divider_placeholder(direction: SplitDirection, position_id: &str) -> B
     SavePosition::new(placeholder, position_id).finish()
 }
 
+fn adjusted_divider_size(
+    before: f32,
+    pair: f32,
+    minimum_before: f32,
+    minimum_after: f32,
+    adjustment: DividerAdjustment,
+) -> Option<f32> {
+    let maximum_before = pair - minimum_after;
+    if maximum_before < minimum_before {
+        return None;
+    }
+    let requested = match adjustment {
+        DividerAdjustment::Move(delta) => before + delta,
+        DividerAdjustment::Reset => pair / 2.,
+    };
+    let next_before = requested.clamp(minimum_before, maximum_before);
+    ((next_before - before).abs() > f32::EPSILON).then_some(next_before)
+}
+
+fn create_resize_preview(direction: SplitDirection, theme: &WarpTheme) -> Box<dyn Element> {
+    let line = ConstrainedBox::new(Rect::new().with_background(theme.accent()).finish());
+    let line = match direction {
+        SplitDirection::Horizontal => line.with_width(2.),
+        SplitDirection::Vertical => line.with_height(2.),
+    };
+    SavePosition::new(line.finish(), RESIZE_PREVIEW_POSITION)
+        .for_single_frame()
+        .finish()
+}
+
 fn divider_mouse_down_action(
     mouse_state: &MouseStateHandle,
     border_id: EntityId,
@@ -1762,6 +2090,29 @@ impl fmt::Debug for PaneBranch {
 pub enum SplitDirection {
     Horizontal,
     Vertical,
+}
+
+impl SplitDirection {
+    pub(super) fn along(self, size: Vector2F) -> f32 {
+        match self {
+            Self::Horizontal => size.x(),
+            Self::Vertical => size.y(),
+        }
+    }
+
+    fn across(self, size: Vector2F) -> f32 {
+        match self {
+            Self::Horizontal => size.y(),
+            Self::Vertical => size.x(),
+        }
+    }
+
+    fn size(self, along: f32, across: f32) -> Vector2F {
+        match self {
+            Self::Horizontal => Vector2F::new(along, across),
+            Self::Vertical => Vector2F::new(across, along),
+        }
+    }
 }
 
 impl From<app_state::SplitDirection> for SplitDirection {

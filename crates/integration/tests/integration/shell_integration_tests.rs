@@ -25,6 +25,9 @@ integration_tests! {
     test_dock_pane_across_tabs,
     // Test both members keep running when stacked, selected, and extracted.
     test_stack_terminal_tabs_and_extract_member,
+    // Test layout undo, redo, and resize preserve running bash and zsh sessions.
+    test_pane_layout_undo_redo_preserves_processes,
+    test_pane_layout_resize_history_preserves_processes,
     // Test powerlevel10k detection (via bootstrap script logic).
     test_detect_powerlevel10k,
     // Test properties of bootstrap.

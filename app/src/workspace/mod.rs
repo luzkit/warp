@@ -79,11 +79,40 @@ use crate::workspace::view::{
 #[cfg(all(target_os = "macos", feature = "local_tty"))]
 pub(crate) const DETACH_SESSION_BINDING_NAME: &str = "workspace:detach_persistent_session";
 
+pub(crate) const MOVE_TO_OWN_TAB_LABEL: &str = "Move to own tab";
+
 pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
+
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "workspace:undo_pane_layout_change",
+            "Undo Pane Layout Change",
+            WorkspaceAction::UndoPaneLayoutChange,
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:redo_pane_layout_change",
+            "Redo Pane Layout Change",
+            WorkspaceAction::RedoPaneLayoutChange,
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:balance_panes",
+            "Balance Panes",
+            WorkspaceAction::BalancePanes,
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+    ]);
 
     #[cfg(all(target_os = "macos", feature = "local_tty"))]
     app.register_editable_bindings([

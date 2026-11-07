@@ -944,7 +944,7 @@ fn flattening_a_docked_subtree_uses_equal_flex_in_visual_order() {
 }
 
 #[test]
-fn docking_fit_uses_flex_and_reserves_divider_space() {
+fn docking_fit_reserves_space_for_dividers_and_minimums() {
     let _minimalist = FeatureFlag::MinimalistUI.override_enabled(false);
     let narrow = PaneId::dummy_pane_id();
     let wide = PaneId::dummy_pane_id();
@@ -957,8 +957,157 @@ fn docking_fit_uses_flex_and_reserves_divider_space() {
         2,
     );
 
-    assert!(!tree.docked_subtree_fits(Vector2F::new(200., 75.), 50., None));
-    assert!(tree.docked_subtree_fits(Vector2F::new(201., 75.), 50., None));
+    assert!(!tree.docked_subtree_fits(Vector2F::new(100., 75.), 50., None));
+    assert!(tree.docked_subtree_fits(Vector2F::new(101., 75.), 50., None));
+}
+
+#[test]
+fn adaptive_resize_retains_preferred_proportions_after_recovering_space() {
+    let _minimalist = FeatureFlag::MinimalistUI.override_enabled(false);
+    let narrow = PaneId::dummy_pane_id();
+    let wide = PaneId::dummy_pane_id();
+    let tree = PaneData::new_branch(
+        SplitDirection::Horizontal,
+        vec![
+            (PaneFlex(1.), PaneNode::Leaf(narrow)),
+            (PaneFlex(3.), PaneNode::Leaf(wide)),
+        ],
+        2,
+    );
+
+    let cramped =
+        tree.docking_preview_rects(RectF::new(Vector2F::zero(), Vector2F::new(161., 80.)), 50.);
+    let restored =
+        tree.docking_preview_rects(RectF::new(Vector2F::zero(), Vector2F::new(401., 80.)), 50.);
+
+    assert_eq!(cramped[0].1.width(), 50.);
+    assert_eq!(cramped[1].1.width(), 110.);
+    assert_eq!(restored[0].1.width(), 100.);
+    assert_eq!(restored[1].1.width(), 300.);
+}
+
+#[test]
+fn adaptive_resize_allocates_space_for_a_nested_split_along_the_same_axis() {
+    let _minimalist = FeatureFlag::MinimalistUI.override_enabled(false);
+    let left = PaneId::dummy_pane_id();
+    let middle = PaneId::dummy_pane_id();
+    let right = PaneId::dummy_pane_id();
+    let mut tree = PaneData::new(left);
+    let mut incoming = PaneData::new(middle);
+    assert!(incoming.split(middle, right, Direction::Right));
+    tree.insert_docked_subtree(left, incoming, Direction::Right, false)
+        .unwrap();
+    let PaneNode::Branch(branch) = &mut tree.root else {
+        panic!("Expected a horizontal branch");
+    };
+    branch.nodes[0].0 = PaneFlex(4.);
+
+    let panes =
+        tree.docking_preview_rects(RectF::new(Vector2F::zero(), Vector2F::new(202., 75.)), 50.);
+
+    assert_eq!(
+        panes,
+        [
+            (left, RectF::new(Vector2F::zero(), Vector2F::new(100., 75.))),
+            (
+                middle,
+                RectF::new(Vector2F::new(101., 0.), Vector2F::new(50., 75.))
+            ),
+            (
+                right,
+                RectF::new(Vector2F::new(152., 0.), Vector2F::new(50., 75.))
+            ),
+        ],
+    );
+}
+
+#[test]
+fn adaptive_resize_keeps_panes_visible_when_no_minimum_layout_fits() {
+    let _minimalist = FeatureFlag::MinimalistUI.override_enabled(false);
+    let left = PaneId::dummy_pane_id();
+    let right = PaneId::dummy_pane_id();
+    let tree = PaneData::new_branch(
+        SplitDirection::Horizontal,
+        vec![
+            (PaneFlex(1.), PaneNode::Leaf(left)),
+            (PaneFlex(3.), PaneNode::Leaf(right)),
+        ],
+        2,
+    );
+
+    let panes =
+        tree.docking_preview_rects(RectF::new(Vector2F::zero(), Vector2F::new(81., 75.)), 50.);
+
+    assert_eq!(panes[0].1.width(), 40.);
+    assert_eq!(panes[1].1.width(), 40.);
+    assert_eq!(panes[1].1.origin().x(), 41.);
+}
+
+#[test]
+fn divider_adjustment_clamps_to_the_adjacent_subtree_minimum() {
+    assert_eq!(
+        adjusted_divider_size(90., 300., 50., 101., DividerAdjustment::Move(200.)),
+        Some(199.),
+    );
+}
+
+#[test]
+fn divider_reset_equalizes_only_the_available_pair() {
+    assert_eq!(
+        adjusted_divider_size(200., 320., 50., 50., DividerAdjustment::Reset),
+        Some(160.),
+    );
+}
+
+#[test]
+fn divider_adjustment_rejects_a_pair_too_small_for_both_subtrees() {
+    assert_eq!(
+        adjusted_divider_size(40., 120., 50., 101., DividerAdjustment::Move(20.)),
+        None,
+    );
+}
+
+#[test]
+fn balancing_panes_preserves_nested_structure_and_ids() {
+    let left = PaneId::dummy_pane_id();
+    let top = PaneId::dummy_pane_id();
+    let bottom = PaneId::dummy_pane_id();
+    let mut tree = PaneLayout::Branch(
+        SplitDirection::Horizontal,
+        vec![
+            (3., PaneLayout::Leaf(left)),
+            (
+                1.,
+                PaneLayout::Branch(
+                    SplitDirection::Vertical,
+                    vec![
+                        (0.5, PaneLayout::Leaf(top)),
+                        (1.5, PaneLayout::Leaf(bottom)),
+                    ],
+                ),
+            ),
+        ],
+    )
+    .into_pane_data();
+
+    assert!(tree.balance());
+
+    assert_eq!(
+        tree.layout_snapshot(),
+        PaneLayout::Branch(
+            SplitDirection::Horizontal,
+            vec![
+                (2., PaneLayout::Leaf(left)),
+                (
+                    2.,
+                    PaneLayout::Branch(
+                        SplitDirection::Vertical,
+                        vec![(1., PaneLayout::Leaf(top)), (1., PaneLayout::Leaf(bottom))],
+                    ),
+                ),
+            ],
+        ),
+    );
 }
 
 #[test]
@@ -1030,6 +1179,7 @@ fn docking_preview_uses_nested_flex_and_window_coordinates() {
     let mut panes = Vec::new();
     tree.root.collect_docking_rects(
         RectF::new(Vector2F::new(10., 20.), Vector2F::new(301., 201.)),
+        50.,
         1.,
         &mut panes,
     );

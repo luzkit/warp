@@ -16,7 +16,7 @@ use crate::features::FeatureFlag;
 use crate::pane_group::tree::get_divider_layout_extent;
 use crate::pane_group::{Direction, PaneGroup, PaneId, get_minimum_pane_size};
 use crate::tab::uses_vertical_tabs;
-use crate::workspace::{PaneViewLocator, WorkspaceRegistry};
+use crate::workspace::{MOVE_TO_OWN_TAB_LABEL, PaneViewLocator, WorkspaceRegistry};
 
 pub(super) const DOCKING_SURFACE_POSITION: &str = "workspace_view:docking_surface";
 
@@ -183,6 +183,33 @@ pub(crate) fn handle_docking_input(
     let Some(workspace) = WorkspaceRegistry::as_ref(ctx).get(window_id, ctx) else {
         return false;
     };
+    let group = {
+        let workspace = workspace.as_ref(ctx);
+        workspace
+            .get_pane_group_view(workspace.active_tab_index)
+            .filter(|group| group.as_ref(ctx).is_previewing_resize())
+            .cloned()
+    };
+    if let Some(group) = group {
+        return group.update(ctx, |group, ctx| match event {
+            Event::LeftMouseDragged { position, .. } => {
+                group.preview_resize_at(position.scale_down(ctx.zoom_factor()), ctx);
+                true
+            }
+            Event::LeftMouseUp { position, .. } => {
+                group.commit_resize_at(position.scale_down(ctx.zoom_factor()), ctx);
+                true
+            }
+            Event::LeftMouseDown { .. } => {
+                group.cancel_resizing(ctx);
+                false
+            }
+            _ => {
+                group.cancel_resizing(ctx);
+                true
+            }
+        });
+    }
     if workspace.as_ref(ctx).docking_pane_drag.is_some() {
         return workspace.update(ctx, |workspace, ctx| {
             workspace.handle_pane_docking_input(event, cancel, ctx)
@@ -639,7 +666,7 @@ impl Workspace {
             {
                 stack.add_positioned_overlay_child(
                     Container::new(
-                        Text::new_inline("Move pane to new tab", appearance.ui_font_family(), 12.)
+                        Text::new_inline(MOVE_TO_OWN_TAB_LABEL, appearance.ui_font_family(), 12.)
                             .with_color(theme.main_text_color(theme.accent()).into())
                             .finish(),
                     )

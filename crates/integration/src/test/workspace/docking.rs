@@ -24,7 +24,12 @@ use warpui_core::{App, EntityId, TypedActionView, WindowId, async_assert, async_
 use super::{dispatch_mouse_event, tab_center};
 use crate::Builder;
 
+mod history;
 mod rearrangement;
+pub use history::{
+    test_pane_layout_resize_history_preserves_processes,
+    test_pane_layout_undo_redo_preserves_processes,
+};
 pub use rearrangement::{
     test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
     test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
@@ -33,7 +38,7 @@ pub use rearrangement::{
 const PROCESS_SNAPSHOT: &str = "processes before transfer";
 const DOCK_POINT: &str = "dock point";
 const PREVIEW_POSITION: &str = "workspace_view:docking_preview";
-const MOVE_PANE_TO_NEW_TAB: &str = "Move pane to new tab";
+const MOVE_TO_OWN_TAB: &str = "Move to own tab";
 const COMMAND: &str = r#"sh -c 'printf "dock-child=%s\n" "$$"; exec sleep 120'"#;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -426,10 +431,10 @@ pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
             TestStep::new("Open the inactive right pane's overflow menu")
                 .with_click_on_saved_position_fn(right_pane_overflow_button_id)
                 .add_named_assertion(
-                    "Move pane to new tab is below Maximize pane",
+                    "Move to own tab is below Maximize pane",
                     |app, window_id| {
                         let maximize = saved_bounds(app, window_id, "Maximize pane");
-                        let move_pane = saved_bounds(app, window_id, MOVE_PANE_TO_NEW_TAB);
+                        let move_pane = saved_bounds(app, window_id, MOVE_TO_OWN_TAB);
                         if let (Some(maximize), Some(move_pane)) = (maximize, move_pane) {
                             async_assert!(move_pane.center().y() > maximize.center().y())
                         } else {
@@ -440,7 +445,7 @@ pub fn test_move_split_pane_to_new_tab_from_overflow() -> Builder {
         )
         .with_step(
             TestStep::new("Move the right pane to a new tab")
-                .with_click_on_saved_position(MOVE_PANE_TO_NEW_TAB)
+                .with_click_on_saved_position(MOVE_TO_OWN_TAB)
                 .add_assertion(assert_tab_count(2))
                 .add_assertion(assert_focused_tab_index(1))
                 .add_assertion(assert_num_panes_in_tab(0, 1))

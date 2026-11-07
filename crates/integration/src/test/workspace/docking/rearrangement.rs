@@ -1,5 +1,6 @@
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use warp::cmd_or_ctrl_shift;
+use warp::integration_testing::command_palette::open_command_palette_and_run_action;
 use warp::integration_testing::pane_group::assert_num_panes_in_tab;
 use warp::integration_testing::terminal::{
     execute_long_running_command, wait_until_bootstrapped_single_pane_for_tab,
@@ -11,12 +12,12 @@ use warpui_core::event::{Event, ModifiersState};
 use warpui_core::integration::{AssertionOutcome, StepDataMap, TestStep};
 use warpui_core::{App, TypedActionView, WindowId, async_assert, async_assert_eq};
 
+use super::history::UNDO_LAYOUT;
 use super::{
-    COMMAND, DOCK_POINT, MOVE_PANE_TO_NEW_TAB, PREVIEW_POSITION, PROCESS_SNAPSHOT,
-    TerminalProcesses, assert_processes_preserved, dispatch_mouse_event, pane_bounds,
-    pane_overflow_button_id, pane_position_id, record_processes, release_tab, saved_bounds,
-    split_terminal_builder, tab_center, terminal_processes, terminal_tabs_with_running_commands,
-    with_split_commands,
+    COMMAND, DOCK_POINT, MOVE_TO_OWN_TAB, PREVIEW_POSITION, PROCESS_SNAPSHOT, TerminalProcesses,
+    assert_processes_preserved, dispatch_mouse_event, pane_bounds, pane_overflow_button_id,
+    pane_position_id, record_processes, release_tab, saved_bounds, split_terminal_builder,
+    tab_center, terminal_processes, terminal_tabs_with_running_commands, with_split_commands,
 };
 use crate::Builder;
 
@@ -347,11 +348,26 @@ pub fn test_stack_terminal_tabs_and_extract_member() -> Builder {
         .with_step(open_stack_menu())
         .with_step(check_moved_processes(
             TestStep::new("Move the active member to a new tab")
-                .with_click_on_saved_position(MOVE_PANE_TO_NEW_TAB)
+                .with_click_on_saved_position(MOVE_TO_OWN_TAB)
                 .add_assertion(assert_tab_count(2))
                 .add_assertion(assert_focused_tab_index(1))
                 .add_assertion(assert_num_panes_in_tab(0, 1))
                 .add_assertion(assert_num_panes_in_tab(1, 1)),
             &[(1, 0), (0, 0)],
+        ))
+        .with_steps(open_command_palette_and_run_action(UNDO_LAYOUT))
+        .with_step(check_visible_stack_member(
+            TestStep::new("Undo extraction restores the active member in its stack")
+                .add_assertion(assert_tab_count(1))
+                .add_assertion(assert_num_panes_in_tab(0, 1)),
+            0,
+        ))
+        .with_steps(open_command_palette_and_run_action(UNDO_LAYOUT))
+        .with_step(check_moved_processes(
+            TestStep::new("Undo stacking restores the original two tabs")
+                .add_assertion(assert_tab_count(2))
+                .add_assertion(assert_num_panes_in_tab(0, 1))
+                .add_assertion(assert_num_panes_in_tab(1, 1)),
+            &[(0, 0), (1, 0)],
         ))
 }

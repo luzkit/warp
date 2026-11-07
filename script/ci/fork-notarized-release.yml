@@ -11,6 +11,10 @@ on:
         description: Check the release source and Mac signing credentials without building
         default: false
         type: boolean
+      allow_mac_build:
+        description: Build, sign, and notarize the reviewed release on personal-mac
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -26,19 +30,35 @@ defaults:
 jobs:
   resolve:
     if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: [self-hosted, Linux]
+    container: ubuntu:24.04
+    timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       version: ${{ steps.source.outputs.version }}
     steps:
+      - name: Install isolated Linux verification tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git gh python3 shellcheck
+      - name: Require explicit approval for the personal Mac build
+        env:
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+          ALLOW_MAC_BUILD: ${{ inputs.allow_mac_build }}
+        run: |
+          if [[ "$PREFLIGHT_ONLY" != true && "$ALLOW_MAC_BUILD" != true ]]; then
+            echo '::error::A full release uses the personal Mac and submits to Apple. Use preflight_only to diagnose signing, or explicitly enable allow_mac_build after approving the full run.'
+            exit 1
+          fi
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: luzkit/warp
           ref: master
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-resolve
           persist-credentials: false
       - name: Freeze reviewed release source
         id: source
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-resolve
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
@@ -61,6 +81,19 @@ jobs:
               raise SystemExit("A release already exists for this tag; use a new version")
           PY
           printf 'source_sha=%s\nversion=%s\n' "$source_sha" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate reviewed packaging code
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-resolve
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 -B -m unittest discover -s script/macos -p 'test_*fork*.py'
+          bash -n script/macos/bundle-fork
+          shellcheck script/macos/bundle-fork
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE"
 
   preflight:
     needs: resolve
@@ -105,8 +138,8 @@ jobs:
 
   build:
     needs: [resolve, preflight]
-    if: ${{ !inputs.preflight_only }}
-    runs-on: macos-15
+    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && !inputs.preflight_only && inputs.allow_mac_build }}
+    runs-on: [self-hosted, macOS, ARM64, personal-mac]
     timeout-minutes: 180
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
@@ -116,42 +149,65 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CARGO_PROFILE_RELEASE_LTO: 'false'
       CARGO_INCREMENTAL: '0'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
+      CARGO_HOME: /Users/github-runner/.cargo
+      RUSTUP_HOME: /Users/github-runner/.rustup
+      DEVELOPER_DIR: /Applications/Xcode-26.3.0.app/Contents/Developer
+      TOOLCHAINS: com.apple.dt.toolchain.Metal.32023.864
     steps:
+      - name: Configure runner-local tool paths
+        id: configure
+        run: |
+          test "$(id -un)" = github-runner
+          test "$HOME" = /Users/github-runner
+          test -x "$HOME/.cargo/bin/rustup"
+          test -x /opt/homebrew/bin/git-lfs
+          printf '%s\n' /opt/homebrew/bin "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          printf 'CARGO_TARGET_DIR=%s/release-control-%s-%s-build/target\n' \
+            "$GITHUB_WORKSPACE" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: luzkit/warp
           ref: ${{ needs.resolve.outputs.source_sha }}
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-build
           persist-credentials: false
           lfs: true
-      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
-        with:
-          xcode-version: '26'
-      - name: Install build tools
+      - name: Verify preinstalled build tools
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-build
         run: |
+          trap 'echo "::error::Provision the pinned runner build tools before retrying; this job does not install them."' ERR
           test "$(uname -m)" = arm64
-          rustup show active-toolchain
-          brew install protobuf jq pkgconf
-          xcodebuild -downloadComponent MetalToolchain
+          test "$(command -v cargo)" = "$HOME/.cargo/bin/cargo"
+          toolchain="$(python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          print(tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])
+          PY
+          )"
+          rustup run "$toolchain" rustc --version
+          rustup run "$toolchain" cargo --version
+          test "$(cargo-binstall -V)" = 1.18.1
+          bundle_version="$(cargo-bundle --version)"
+          bundle_version="${bundle_version##* }"
+          test "${bundle_version#v}" = 0.11.0
+          test "$(cargo-about --version)" = 'cargo-about 0.8.4'
+          protoc --version
+          jq --version
+          pkg-config --version
+          git lfs version
+          xcodebuild -version
           xcrun -sdk macosx metal --version
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          key: fork-macos-arm64-release-v1
-          cache-all-crates: false
-          cache-on-failure: true
-      - name: Install packaging tools
-        run: |
-          ./script/install_cargo_bundle
-          ./script/install_cargo_release_deps --no-build-deps
       - name: Build unsigned installer
         id: bundle
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-build
         env:
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           WARP_FORK_SIGNING_MODE: ad-hoc
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          ./script/macos/bundle-fork "$RELEASE_VERSION" "$RUNNER_TEMP/fork-unsigned"
+          output_dir="$(mktemp -d "$RUNNER_TEMP/fork-unsigned-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")"
+          ./script/macos/bundle-fork "$RELEASE_VERSION" "$output_dir"
       - name: Record unsigned installer digest
         id: digest
         env:
@@ -169,6 +225,10 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+      - name: Remove isolated build workspace
+        if: ${{ always() && steps.configure.outcome == 'success' }}
+        run: |
+          rm -rf -- "$GITHUB_WORKSPACE/release-control-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-build"
 
   sign:
     needs: [resolve, preflight, build]
@@ -198,7 +258,7 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.artifact_id }}
           merge-multiple: true
           path: ${{ steps.paths.outputs.input }}
-      - name: Sign and notarize the verified hosted artifact
+      - name: Sign and notarize the verified build artifact
         working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-sign
         env:
           MAC_SIGNING_IDENTITY: ${{ needs.preflight.outputs.signing_identity }}
@@ -234,21 +294,28 @@ jobs:
 
   verify:
     needs: [resolve, preflight, build, sign]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux]
+    container: ubuntu:24.04
     timeout-minutes: 10
     steps:
+      - name: Install isolated Linux verification tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git gh python3
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: luzkit/warp
           ref: ${{ needs.resolve.outputs.source_sha }}
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.sign.outputs.artifact_id }}
           merge-multiple: true
-          path: installer
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify/installer
       - name: Verify signed provenance and final checksum
         id: verify
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
@@ -304,6 +371,7 @@ jobs:
           print("Signed release source, notarization receipts, and checksum verified")
           PY
       - name: Recheck tag and summarize verified release assets
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: luzkit/warp
@@ -334,3 +402,6 @@ jobs:
 
           No public release was created. Before publishing, verify this successful run and recheck the tag and any existing public or draft release with an account authorized for luzkit/warp.
           EOF
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE"

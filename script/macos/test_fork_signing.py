@@ -99,6 +99,27 @@ class ForkSigningTests(unittest.TestCase):
                 signing.preflight(self.config)
         self.assertFalse(any(call[0] == "codesign" for call in self.calls))
 
+    def test_locked_keychain_names_runner_account_without_unlocking_or_exposing_details(self):
+        original = self.fake_run
+
+        def locked_keychain(arguments):
+            if arguments[:3] == ["xcrun", "notarytool", "history"]:
+                raise subprocess.CalledProcessError(1, arguments, stderr="keychainLocked private diagnostic")
+            return original(arguments)
+
+        with patch.object(signing, "run", side_effect=locked_keychain), \
+             patch.object(signing.platform, "system", return_value="Darwin"), \
+             patch.object(signing.platform, "machine", return_value="arm64"), \
+             patch.object(signing.shutil, "which", return_value="/test/tool"), \
+             patch.object(signing.pwd, "getpwuid") as account:
+            account.return_value.pw_name = "github-runner"
+            with self.assertRaisesRegex(ValueError, "runner account 'github-runner'") as result:
+                signing.preflight(self.config)
+        self.assertIn("preflight_only=true", str(result.exception))
+        self.assertNotIn("private diagnostic", str(result.exception))
+        self.assertEqual([call[1] for call in self.calls if call[0] == "security"], ["find-identity"])
+        self.assertFalse(any(call[0] == "codesign" or "submit" in call for call in self.calls))
+
     def test_preflight_rejects_missing_identity_before_notary_authentication(self):
         original = self.fake_run
 

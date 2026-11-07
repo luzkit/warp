@@ -58,12 +58,16 @@ receive access to the signing runner.
    major at most 9999 and minor/patch at most 99 for Apple's bundle version format.
 2. In the private repository, run **Notarized fork macOS release** from `main` with
    `release_tag` set to that tag. `preflight_only` validates the source and signing
-   setup without starting a build.
-3. The workflow resolves the tag to the current fork `master` SHA, checks the
-   existing signing identity and notarization profile, compiles on hosted macOS,
-   and sends that run's exact artifact to the Mac for signing. The signing job
-   validates source metadata, checksum, bundle identity, version, and architecture
-   without executing the downloaded app or rebuilding Rust.
+   setup without starting a build. A full release also requires
+   `allow_mac_build=true`, explicitly approving compilation on the personal Mac,
+   Developer ID signing, and submission to Apple for notarization. Leaving it false
+   stops before a Mac build. There is no hosted macOS fallback.
+3. The workflow resolves the tag to the current fork `master` SHA and runs signing
+   regression tests and packaging shell checks on the homelab Linux pool. It checks
+   the existing Mac signing identity and notarization profile, compiles the reviewed
+   source on the personal Mac, and passes that run's exact unsigned artifact to the
+   signing job. It validates source metadata, checksum, bundle identity, version,
+   and architecture without executing the downloaded app or rebuilding Rust.
 4. After the final verification job succeeds, download its exact signed artifact.
    Verify the final checksum and metadata against the resolved source, tag, signing
    team, and run. Create the fork's draft release with the DMG, checksum, metadata,
@@ -71,7 +75,12 @@ receive access to the signing runner.
 
 The controller intentionally has no cross-repository write credential. Publishing
 uses the release operator's existing GitHub authorization for `luzkit/warp`. This
-keeps the existing runner groups, other Mac projects, and Linux runners unchanged.
+keeps the existing runner groups and other Mac projects unchanged. The Linux
+resolve/validation and final verification jobs use `[self-hosted, Linux]`, the
+labels of the existing `homelab-ci-01`, `homelab-ci-02`, and `homelab-ci-03` pool.
+Their tools are installed inside Ubuntu job containers, not on the persistent host.
+Only the private controller's manual `main` dispatch can schedule these jobs; public
+PR code never reaches the homelab or personal Mac.
 Do not overwrite a version tag or existing release assets; use a new version for
 changed source. The final publication must recheck the tag SHA and existing drafts,
 which the controller's read-only token cannot necessarily see.
@@ -84,15 +93,50 @@ the Keychain with a password. An unavailable identity/profile stops before the
 costly build. A failed or timed-out Apple submission retains its ID in a diagnostic
 artifact; inspect that submission before retrying, rather than blindly resubmitting.
 
-Builds use GitHub's `macos-15` Apple Silicon runner, two Cargo jobs, the repository's
-pinned Rust toolchain, an optimized release profile without LTO or debug symbols,
-and dependency caching. The workflow installs Protobuf, the Metal toolchain,
-`cargo-bundle`, and `cargo-about`. It generates license attribution and settings
-schema, verifies the app signature and architecture, and verifies the disk image.
-The private controller saves dependencies in its own `main` cache; public PR
-snapshots use the fork's separate cache. Workspace crates are rebuilt rather than
-stored in the dependency cache. The existing Linux homelab runners cannot build or
-sign this native macOS app, so they are not needed for this release.
+Builds use the existing `[self-hosted, macOS, ARM64, personal-mac]` runner, two Cargo
+jobs, the repository's pinned Rust toolchain, and an optimized release profile
+without LTO or debug symbols. Each run uses its own source checkout, Cargo target
+directory, and installer output. The target directory stays within that checkout
+for the DockTilePlugin build and is removed with the checkout after the job. The
+installer is under `RUNNER_TEMP`; Cargo registry downloads remain in the runner
+account's Cargo home.
+The workflow checks preinstalled tools and does not install packages or change the
+global Xcode selection. It scopes Cargo paths, `DEVELOPER_DIR`, and Metal
+`TOOLCHAINS` to the build job. It does not restore an Actions Rust cache onto the
+persistent Mac, preserving the installed Cargo tools. Public PR snapshots retain
+their separate hosted-runner cache.
+
+The build generates license attribution and settings schema, verifies the ad-hoc
+app signature and architecture, and verifies the disk image. Linux handles source
+and artifact verification but cannot replace the native macOS compiler or Apple's
+signing tools.
+
+### Mac runner readiness and Keychain recovery
+
+A signing-ready Mac is not necessarily a Warp build-ready Mac. Its `github-runner`
+account must have the repository's pinned Rust toolchain, Protobuf, jq, pkg-config,
+Git LFS, Python 3.11+, cargo-binstall 1.18.1, cargo-bundle 0.11.0, cargo-about 0.8.4, and Xcode's
+Metal Toolchain. The current build job selects Xcode 26.3 from
+`/Applications/Xcode-26.3.0.app` and Metal
+`com.apple.dt.toolchain.Metal.32023.864`; update these job-scoped selections when
+provisioning a different approved Xcode installation. Install approved system
+prerequisites from the administrator account and account-local Cargo tools as `github-runner`;
+do not change Homebrew ownership or grant the runner administrator access. Keep
+enough free disk space for the source, dependency cache, build output, and installer.
+
+The existing runner service uses `SessionCreate=false` in the runner account's GUI
+domain. Preserve that reviewed session configuration. `notarytool` targets the data
+protection Keychain unless given an explicit Keychain file, so an unlocked login
+Keychain file in another security session does not establish that the service can
+use its notarization profile. Test access with `preflight_only=true` from the actual
+runner. If it reports `keychainLocked`, stop and investigate the runner's login and
+service context before changing settings or credentials. Coordinate service
+maintenance with the operator; do not switch desktop users or restart a busy runner
+as an automated recovery step. Do not send passwords in chat or save them in
+repository variables, Actions secrets, or logs. No certificate export, new Apple
+credential, permission broadening, or full build is needed for this check. Apple's
+[notarization guidance](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool)
+describes the profile's default Keychain storage.
 
 ## Development snapshots
 

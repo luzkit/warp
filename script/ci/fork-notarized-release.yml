@@ -1,4 +1,4 @@
-name: Notarized fork macOS release
+name: Warp signed macOS release
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ defaults:
 
 jobs:
   resolve:
-    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    if: ${{ vars.WARP_RELEASE_ENABLED == 'true' && github.repository == 'luzkit/warp-release' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: [self-hosted, Linux]
     container: ubuntu:24.04
     timeout-minutes: 10
@@ -88,6 +88,8 @@ jobs:
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           python3 -B -m unittest discover -s script/macos -p 'test_*fork*.py'
+          # Reject a source tag that predates this controller before using the Mac.
+          PYTHONPATH=script/macos python3 -B -c 'import notarize_fork; notarize_fork.workflow_provenance()'
           bash -n script/macos/bundle-fork
           shellcheck script/macos/bundle-fork
       - name: Restore workspace ownership
@@ -96,7 +98,7 @@ jobs:
 
   preflight:
     needs: resolve
-    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.repository == 'luzkit/warp-release' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: [self-hosted, macOS, ARM64, personal-mac]
     timeout-minutes: 10
     outputs:
@@ -137,7 +139,7 @@ jobs:
 
   build:
     needs: [resolve, preflight]
-    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && !inputs.preflight_only && inputs.allow_mac_build }}
+    if: ${{ github.repository == 'luzkit/warp-release' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && !inputs.preflight_only && inputs.allow_mac_build }}
     runs-on: [self-hosted, macOS, ARM64, personal-mac]
     timeout-minutes: 180
     outputs:
@@ -231,7 +233,7 @@ jobs:
 
   sign:
     needs: [resolve, preflight, build]
-    if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && !inputs.preflight_only }}
+    if: ${{ github.repository == 'luzkit/warp-release' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && !inputs.preflight_only }}
     runs-on: [self-hosted, macOS, ARM64, personal-mac]
     timeout-minutes: 60
     outputs:
@@ -342,7 +344,7 @@ jobs:
               "profile": "release", "signing": "developer-id", "signing_team": os.environ["APPLE_TEAM_ID"],
               "unsigned_installer_sha256": os.environ["UNSIGNED_SHA256"],
               "signing_workflow": {
-                  "repository": "luzkit/nab-release-app", "run_id": os.environ["GITHUB_RUN_ID"],
+                  "repository": "luzkit/warp-release", "run_id": os.environ["GITHUB_RUN_ID"],
                   "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"], "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
                   "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
               },

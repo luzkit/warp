@@ -145,7 +145,7 @@ class NotarizeForkTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_sign_only_keeps_original_and_hashes_stapled_output(self):
-        env = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": "luzkit/nab-release-app", "GITHUB_RUN_ID": "123",
+        env = {"GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": installer.SIGNING_CONTROLLER, "GITHUB_RUN_ID": "123",
                "GITHUB_RUN_ATTEMPT": "2", "GITHUB_WORKFLOW_REF": installer.SIGNING_WORKFLOW_REF,
                "GITHUB_WORKFLOW_SHA": "b" * 40}
         with patch.dict(os.environ, env, clear=True):
@@ -162,7 +162,7 @@ class NotarizeForkTests(unittest.TestCase):
         self.assertIs(metadata["notarized"], True)
         self.assertEqual(metadata["signing_workflow"]["run_attempt"], "2")
         self.assertEqual(metadata["repository"], "luzkit/warp")
-        self.assertEqual(metadata["signing_workflow"]["repository"], "luzkit/nab-release-app")
+        self.assertEqual(metadata["signing_workflow"]["repository"], installer.SIGNING_CONTROLLER)
         detach = next(i for i, call in enumerate(self.calls) if call[:2] == ["hdiutil", "detach"])
         first_sign = next(i for i, call in enumerate(self.calls) if call[:2] == ["codesign", "--force"])
         self.assertLess(detach, first_sign)
@@ -170,9 +170,23 @@ class NotarizeForkTests(unittest.TestCase):
         self.assertFalse(any(call[0] in {"cargo", "rustc"} or call[0].endswith("warp-oss") for call in self.calls))
         self.assertEqual(len(list(self.output.iterdir())), 5)
 
+    def test_existing_controller_keeps_its_own_workflow_provenance(self):
+        repository = installer.LEGACY_SIGNING_CONTROLLER
+        ref = f"{repository}/.github/workflows/fork-notarized-release.yml@refs/heads/main"
+        with patch.dict(os.environ, {
+            "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": repository, "GITHUB_WORKFLOW_REF": ref,
+            "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_WORKFLOW_SHA": "b" * 40,
+        }, clear=True):
+            provenance = installer.workflow_provenance()
+        self.assertEqual(provenance["repository"], repository)
+        self.assertEqual(provenance["workflow_ref"], ref)
+
     def test_signing_workflow_must_be_approved_controller_on_main(self):
         for repository, ref in (("luzkit/warp", installer.SIGNING_WORKFLOW_REF),
-                                (installer.SIGNING_CONTROLLER, installer.SIGNING_WORKFLOW_REF.replace("main", "other"))):
+                                (installer.SIGNING_CONTROLLER, installer.SIGNING_WORKFLOW_REF.replace("main", "other")),
+                                (installer.LEGACY_SIGNING_CONTROLLER, installer.SIGNING_WORKFLOW_REF),
+                                ("someone/warp-release", installer.SIGNING_WORKFLOW_REF),
+                                (installer.SIGNING_CONTROLLER, installer.SIGNING_WORKFLOW_REF.replace("fork-notarized-release", "other"))):
             with self.subTest(repository=repository, ref=ref), patch.dict(os.environ, {
                 "GITHUB_ACTIONS": "true", "GITHUB_REPOSITORY": repository, "GITHUB_WORKFLOW_REF": ref,
                 "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",

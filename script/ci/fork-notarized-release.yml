@@ -11,6 +11,10 @@ on:
         description: Check the release source and Mac signing credentials without building
         default: false
         type: boolean
+      allow_hosted_build:
+        description: Allow the private repository's billable GitHub-hosted macOS build
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -26,19 +30,35 @@ defaults:
 jobs:
   resolve:
     if: ${{ github.repository == 'luzkit/nab-release-app' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    runs-on: [self-hosted, Linux]
+    container: ubuntu:24.04
+    timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.source_sha }}
       version: ${{ steps.source.outputs.version }}
     steps:
+      - name: Install isolated Linux verification tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git gh python3 shellcheck
+      - name: Require explicit approval for a hosted build
+        env:
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+          ALLOW_HOSTED_BUILD: ${{ inputs.allow_hosted_build }}
+        run: |
+          if [[ "$PREFLIGHT_ONLY" != true && "$ALLOW_HOSTED_BUILD" != true ]]; then
+            echo '::error::A full release currently uses billable macos-15 in this private repository. Use preflight_only to diagnose signing, or explicitly enable allow_hosted_build after approving that cost.'
+            exit 1
+          fi
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: luzkit/warp
           ref: master
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-resolve
           persist-credentials: false
       - name: Freeze reviewed release source
         id: source
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-resolve
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
@@ -61,6 +81,19 @@ jobs:
               raise SystemExit("A release already exists for this tag; use a new version")
           PY
           printf 'source_sha=%s\nversion=%s\n' "$source_sha" "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Validate reviewed packaging code
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-resolve
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 -B -m unittest discover -s script/macos -p 'test_*fork*.py'
+          bash -n script/macos/bundle-fork
+          shellcheck script/macos/bundle-fork
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE"
 
   preflight:
     needs: resolve
@@ -105,7 +138,7 @@ jobs:
 
   build:
     needs: [resolve, preflight]
-    if: ${{ !inputs.preflight_only }}
+    if: ${{ !inputs.preflight_only && inputs.allow_hosted_build }}
     runs-on: macos-15
     timeout-minutes: 180
     outputs:
@@ -234,21 +267,28 @@ jobs:
 
   verify:
     needs: [resolve, preflight, build, sign]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux]
+    container: ubuntu:24.04
     timeout-minutes: 10
     steps:
+      - name: Install isolated Linux verification tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git gh python3
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           repository: luzkit/warp
           ref: ${{ needs.resolve.outputs.source_sha }}
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ needs.sign.outputs.artifact_id }}
           merge-multiple: true
-          path: installer
+          path: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify/installer
       - name: Verify signed provenance and final checksum
         id: verify
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify
         env:
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
           RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
@@ -304,6 +344,7 @@ jobs:
           print("Signed release source, notarization receipts, and checksum verified")
           PY
       - name: Recheck tag and summarize verified release assets
+        working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-verify
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: luzkit/warp
@@ -334,3 +375,6 @@ jobs:
 
           No public release was created. Before publishing, verify this successful run and recheck the tag and any existing public or draft release with an account authorized for luzkit/warp.
           EOF
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE"

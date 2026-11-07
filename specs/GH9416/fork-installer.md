@@ -58,9 +58,13 @@ receive access to the signing runner.
    major at most 9999 and minor/patch at most 99 for Apple's bundle version format.
 2. In the private repository, run **Notarized fork macOS release** from `main` with
    `release_tag` set to that tag. `preflight_only` validates the source and signing
-   setup without starting a build.
-3. The workflow resolves the tag to the current fork `master` SHA, checks the
-   existing signing identity and notarization profile, compiles on hosted macOS,
+   setup without starting a build. A full release also requires
+   `allow_hosted_build=true`, explicitly opting into this private repository's
+   GitHub-hosted macOS compute. Leaving it false stops before a Mac build; it does
+   not silently fall back to paid compute.
+3. The workflow resolves the tag to the current fork `master` SHA and runs signing
+   regression tests and packaging shell checks on the homelab Linux pool. It checks
+   the existing Mac signing identity and notarization profile, compiles on hosted macOS,
    and sends that run's exact artifact to the Mac for signing. The signing job
    validates source metadata, checksum, bundle identity, version, and architecture
    without executing the downloaded app or rebuilding Rust.
@@ -71,7 +75,12 @@ receive access to the signing runner.
 
 The controller intentionally has no cross-repository write credential. Publishing
 uses the release operator's existing GitHub authorization for `luzkit/warp`. This
-keeps the existing runner groups, other Mac projects, and Linux runners unchanged.
+keeps the existing runner groups and other Mac projects unchanged. The Linux
+resolve/validation and final verification jobs use `[self-hosted, Linux]`, the
+labels of the existing `homelab-ci-01`, `homelab-ci-02`, and `homelab-ci-03` pool.
+Their tools are installed inside Ubuntu job containers, not on the persistent host.
+Only the private controller's manual `main` dispatch can schedule these jobs; public
+PR code never reaches the homelab or signing Mac.
 Do not overwrite a version tag or existing release assets; use a new version for
 changed source. The final publication must recheck the tag SHA and existing drafts,
 which the controller's read-only token cannot necessarily see.
@@ -91,8 +100,26 @@ and dependency caching. The workflow installs Protobuf, the Metal toolchain,
 schema, verifies the app signature and architecture, and verifies the disk image.
 The private controller saves dependencies in its own `main` cache; public PR
 snapshots use the fork's separate cache. Workspace crates are rebuilt rather than
-stored in the dependency cache. The existing Linux homelab runners cannot build or
-sign this native macOS app, so they are not needed for this release.
+stored in the dependency cache. Linux handles source and artifact verification but
+cannot replace the native macOS compiler or Apple's signing tools.
+
+### Mac runner readiness and Keychain recovery
+
+A signing-ready Mac is not necessarily a Warp build-ready Mac. Do not replace the
+hosted build with the personal Mac until its `github-runner` account can find the
+repository's pinned Rust toolchain, Protobuf, jq, pkg-config, cargo-bundle 0.11.0,
+cargo-about 0.8.4, and Xcode's Metal Toolchain. Install approved system prerequisites
+from the administrator account and account-local Cargo tools as `github-runner`;
+do not change Homebrew ownership or grant the runner administrator access. Keep
+enough free disk space for the source, dependency cache, build output, and installer.
+
+If `notarytool` reports `keychainLocked`, log into the **github-runner** macOS
+account and unlock its login/default Keychain in Keychain Access. Unlocking the
+developer account's Keychain does not unlock the runner's. Keep that account logged
+in; fast user switching back to the developer account is fine. Do not send the
+password in chat or save it in repository variables, Actions secrets, or logs.
+Retry only `preflight_only=true` after the local unlock. No certificate export,
+new Apple credential, permission broadening, or paid build is needed to test it.
 
 ## Development snapshots
 

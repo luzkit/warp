@@ -98,7 +98,7 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Implemented and verified with focused macOS tests. See the evidence log. |
 | 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Implemented and verified for two-window macOS workflows. Physical display and fullscreen checks are pending. |
 | 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Implemented and verified on Apple Silicon macOS. Physical display transitions and other platforms are pending. |
-| 6. Advanced interaction | Multi-selection and temporary groups, drag handles, explicit keyboard docking, searchable Pane and Workspace Navigator, focus options and accessibility. | Pending |
+| 6. Advanced interaction | Multi-selection and temporary groups, drag handles, explicit keyboard docking, searchable Pane and Workspace Navigator, focus options and accessibility. | Implemented and verified on Apple Silicon macOS. Linux, Windows, and native screen-reader checks are pending. |
 | 7. Specialized content | Capability-aware movement of agent and editor views, unsaved state and parent/child dependencies, fullscreen and maximized states, and optional persistent-session lifecycle integration. | Pending |
 | 8. Hardening and rollout | Bounded preview work, measured frame and resource budgets, diagnostics, stress and session integrity testing, accessibility and platform validation, staged rollout. | Pending |
 
@@ -180,6 +180,14 @@ Open **Manage Pane Layouts** from the Command Palette in a terminal-only window.
 The catalog is local to the Warp data profile. Applying a layout uses the current window and preserves its live terminal views and processes. Apply supports terminal-only windows with ungrouped, unpinned tabs and with panes restored from maximization. Close the tools and assistant panels and turn off synchronized input before applying a layout. If the window or its panes change while the preview is open, preview again.
 
 On macOS and non-tiling native X11, display recovery moves an unreachable normal window onto the primary display. The window returns to its original location when its display comes back if it remains at the recovery location. Windows uses reported geometry for profile matching. Physical display transitions still need native verification.
+
+### Pane Navigator and keyboard docking
+
+Open **Pane Navigator** from the Command Palette and search by pane title, tab name, or window. Use the arrow keys to browse and **Enter** to focus a result. Select panes with their checkboxes or **Shift+Enter**. The temporary selection can include terminal panes in different tabs and windows.
+
+Press **Alt+Enter** in the navigator or run **Keyboard Docking** from the Command Palette. With an empty selection, the command uses the focused terminal. Search for a pane or a new tab in an open window, choose a placement, and review the move. **Enter** commits the preview and **Escape** cancels it. A single terminal can also swap or stack within a window, or move to a new window. **Undo Pane Layout Change** reverses a group move within one window.
+
+Use **Settings → Appearance → Panes** to choose when the drag grip appears, whether focus follows moved panes, and whether the navigator announces moves and selection through assistive technology. The Command Palette also exposes these preferences.
 
 ## Build and validation
 
@@ -295,10 +303,32 @@ cargo test --locked -p warp --lib --features gui,enhanced_pane_management,drag_t
   workspace::pane_layouts workspace::display_layouts workspace::view::layout_history
 ```
 
+### Milestone 6 verification on SANDISK SSD
+
+```sh
+"/Volumes/SANDISK SSD/git/warp-pane-management-m6/target/start"
+```
+
+The development build uses the separate `docking-m6-ssd` profile. Open the Command Palette with **⌘⇧P** and choose **Pane Navigator**. Milestone 7 covers specialized panes and session lifecycle integration.
+
+Build the integration runner with `cargo build --locked -p integration --bin integration --features drag_tabs_to_windows`. Run it with `WARP_INTEGRATION=1` and `WARP_SHELL_PATH` set to `/bin/zsh` and then `/bin/bash` for these cases.
+
+- `test_keyboard_docking_groups_live_panes`
+- `test_keyboard_docking_groups_panes_across_windows`
+- `test_keyboard_docking_single_pane_actions`
+- `test_saved_pane_layout_preserves_processes`
+- `test_stack_terminal_tabs_and_extract_member`
+- `test_swap_panes_from_header_drag`
+- `test_pane_layout_resize_history_preserves_processes`
+- `test_tear_out_tab_layout_preserves_processes`
+
 ### Evidence log
 
 | Item | Result |
 | --- | --- |
+| Milestone 6 integration checks | Sixteen runs passed on Apple Silicon macOS across zsh and Bash. New coverage exercised mouse and keyboard selection, destination search, preview and cancellation, right-side splits, same-window group undo and redo, retained focus, groups spanning two windows, and the single-pane Swap, Stack, and New Window actions. The tests compared terminal view IDs, session IDs, shell and foreground process IDs, and process start times. Five existing docking and layout cases passed on both shells. |
+| Milestone 6 lint and SSD build | App and integration Clippy passed with warnings denied. The launcher accepted `--help` and the bundled settings schema includes the new controls. The signed `dev.warp.WarpOss` bundle passed strict signature verification with CDHash `126c45d26b82f57329c0c38e24195c1ff98e5a6f`. |
+| Milestone 6 platform coverage | Linux, Windows, and native screen-reader interaction are pending. |
 | Milestone 5 integration checks | Twelve runs passed across zsh and Bash on Apple Silicon macOS. The new test saved two tabs as a snapshot, docked the terminals into one tab, previewed the snapshot without moving anything, applied it, and undid the change. It compared terminal view IDs, session IDs, shell and foreground process IDs, and process start times. Five existing docking, stack, history, resize, and tear-out tests also passed on both shells. |
 | Milestone 5 focused unit checks | All 15 passed. Coverage included versioned import and portable export, catalog persistence, missing and extra sessions, nested balance and overflow alternatives, display geometry and recovery, and history. |
 | Milestone 5 lint and SSD build | App and integration Clippy passed with warnings denied. The launcher accepted `--help`. The signed `dev.warp.WarpOss` bundle passed strict signature verification with CDHash `4b4cc2059d4da9e3cc5180dcee82047ef6505541`. |
@@ -323,7 +353,7 @@ cargo test --locked -p warp --lib --features gui,enhanced_pane_management,drag_t
 | Other platforms | Linux, Windows and the remaining platform matrix are pending. |
 | Compatibility with the persistent-session backend and ordinary PTY | The native run used the disposable runtime `/tmp/wpdock.9YetIM`, which retained both owner sockets after the move. The integration runner verified ordinary local PTYs under its isolated Integration channel. |
 | Performance | No measurements yet. Before rollout, measure busy workspaces at 10, 50 and 100 panes, recording preview frame time, planner cost, allocation or memory data, CPU overhead and input/output latency. Derive budgets from a feature-off baseline on the same hardware. |
-| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. Milestone 5 implementation and regression coverage `9b8d8e1f`. |
+| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. Milestone 5 implementation and regression coverage `9b8d8e1f`. Milestone 6 implementation and regression coverage `dab1cc24`. |
 
 ## Contribution boundaries
 

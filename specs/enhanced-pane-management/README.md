@@ -96,7 +96,7 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | 1. Existing tab to split | Same-window single-terminal tab source, four directional targets, live split preview, cancel, live identity transfer, normal source-tab cleanup. | Implemented and verified in the isolated macOS development build. See the evidence log. |
 | 2. Rearrangement and docking | Intra-tab and inter-tab moves, swap, center Swap/Stack, pane-to-tab, atomic multi-pane layout moves, nested structure and optional flattening. | Implemented and verified with focused macOS integration and unit tests. See the evidence log. |
 | 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Implemented and verified with focused macOS tests. See the evidence log. |
-| 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Pending |
+| 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Implemented and verified for two-window macOS workflows. Physical display and fullscreen checks are pending. |
 | 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Pending |
 | 6. Advanced interaction | Multi-selection and temporary groups, drag handles, explicit keyboard docking, searchable Pane and Workspace Navigator, focus options and accessibility. | Pending |
 | 7. Specialized content | Capability-aware movement of agent and editor views, unsaved state and parent/child dependencies, fullscreen and maximized states, and optional persistent-session lifecycle integration. | Pending |
@@ -160,6 +160,14 @@ Cross-tab previews require an inactive destination whose pane area is clear of o
 - Each window keeps up to 32 recent layout edits until restart. History checks the tab order and the affected pane and session IDs before applying a change. A tab or session change can make an entry stale. If the layout needs a larger window, the entry remains available to try again.
 - History can replay docking, stacking, swapping, moving panes to tabs, and resizing. It moves or resizes existing panes and preserves their processes.
 
+### Moving panes between windows
+
+- Drag a pane header or a whole tab to a split edge or the tab strip of another Warp window. The destination previews the drop. Escape cancels it.
+- Drag a pane or tab outside Warp windows to open it in a new window on the display where you dropped it. An entire tab keeps its split tree when moved as a tab.
+- The pane overflow and tab context menus list eligible windows and offer a new-window action. The Command Palette offers **Move Pane to New Window** and **Move Tab Layout to New Window**. These actions provide a route when a window manager or fullscreen space limits pointer dragging.
+- The source window closes by default when its last tab leaves. To leave it open with a fresh tab, run **Keep Empty Windows After Moving Panes**. **Close Empty Windows After Moving Panes** restores the default.
+- **Swap** and **Stack** are available within a window. Window moves operate on live terminal views and preserve the shell and running jobs. Cross-window transfers are outside the per-window layout undo history.
+
 ## Build and validation
 
 Build from the isolated worktree with the pinned Rust toolchain, Protobuf, Xcode and Metal tools, and the repository's macOS bundling prerequisites. This invokes the macOS runner directly to select the OSS binary and keep the debug bundle in the worktree.
@@ -177,7 +185,16 @@ docking_app="$CARGO_TARGET_DIR/debug/bundle/osx/WarpOss.app"
 
 Verify the bundle identifies itself as `dev.warp.WarpOss` before launching it. Set `HOME` and `ZDOTDIR` to a disposable directory for the binary launch to separate its shell startup and preferences from the production profile. For the feature-off control, omit `enhanced_pane_management` from `FEATURES` and use a distinct target and debug profile. An OSS build uses a persistent runtime by default on eligible macOS paths. For the ordinary-PTY control, set `WARP_PERSISTENT_PTY_DIR` to an existing regular file in the disposable runtime directory before launch and verify that the app logs its direct local PTY fallback. Turning off auto-reattach alone leaves the default runtime behavior in place.
 
-Launch the signed Milestone 3 build with its isolated shell and data profile on this Mac.
+Launch the signed Milestone 4 development build from SANDISK SSD.
+
+```sh
+"/Volumes/SANDISK SSD/git/warp-pane-management-m4/target/start"
+```
+
+The M4 launcher uses its own SSD profile and private PTY runtime. The M3 SSD
+launcher is at `/Volumes/SANDISK SSD/git/warp-pane-management/target/start`.
+
+The following Milestone 3 temporary launcher is retained as historical evidence.
 
 ```sh
 /private/tmp/warp-docking-m3.GPjX9s/start
@@ -234,12 +251,30 @@ Milestone 3 adds the `test(test_pane_layout_)` filter to the integration run and
 the member extraction and the original stack. The resize test checks the actual
 divider gesture, terminal column count, and the three Command Palette actions.
 
+Milestone 4 adds two tests to the shell integration runner. The pointer test uses
+real AppKit windows so it can exercise native window ordering. The Command
+Palette tear-out test uses the standard offscreen integration mode.
+
+```sh
+WARP_INTEGRATION=1 WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS=1 WARP_SHELL_PATH=/bin/zsh \
+  cargo run --locked -p integration --bin integration --features drag_tabs_to_windows -- \
+  test_move_pane_between_windows_preserves_processes
+WARP_INTEGRATION=1 WARP_SHELL_PATH=/bin/zsh \
+  cargo run --locked -p integration --bin integration --features drag_tabs_to_windows -- \
+  test_tear_out_tab_layout_preserves_processes
+cargo test --locked -p warpui_core --lib transfer_
+```
+
 Run focused tests, then relevant lint checks, then format, in the order in [AGENTS.md](../../AGENTS.md). Keep one record per milestone with the exact commands, build and commit, platform, process-identity evidence, failures or unavailable tests, and the next milestone. Production installation and profiles stay separate from the development run.
 
 ### Evidence log
 
 | Item | Result |
 | --- | --- |
+| Milestone 4 integration checks | Eleven tests passed with zsh and Bash on Apple Silicon macOS. The native pointer case verified split preview, Escape and retry, moving a pane to a second window, and moving the active split layout back through the destination tab strip. The offscreen Command Palette case tore out an entire split twice and verified the close and keep source-window policies. The tests compared view IDs, session IDs, shell and foreground process IDs, start times, and focus. |
+| Milestone 4 WarpUI transfer tests | All 16 focused tests passed, including reparenting a view before transferring its former and current parents. |
+| Milestone 4 app checks and SSD build | All 18 focused app unit tests passed, the registered tear-out test passed through the normal test harness, and Clippy passed for the app, WarpUI core, and integration runner with warnings denied. The signed `dev.warp.WarpOss` bundle on SSD passed strict signature verification with CDHash `71d6e3a67427866598d06f9d6741cf1bff1b736e`. |
+| Milestone 4 platform coverage | Real AppKit windows were exercised. A physical second-display run, fullscreen transitions, Linux, and Windows are pending. |
 | Milestone 3 integration checks | All 10 focused tests passed on Apple Silicon macOS with zsh and Bash. They verified the **Move to own tab** menu item, docking and stack undo, redo, stale history after shell exit, divider preview and Escape, committed terminal dimensions, divider reset, Balance Panes, and feature-off tab reordering. Process checks compared terminal view and session IDs and shell and foreground process IDs and start times. |
 | Milestone 3 app unit checks | All 44 focused tests passed. Coverage included nested pane minimums, maintaining preferred proportions as space returns, clamped divider movement, layout history limits, redo invalidation, and persistent stack routing. The app fixtures ran with native macOS system access. |
 | Milestone 3 WarpUI checks | All 25 focused Flex and wrap tests passed with `cargo nextest run --locked -p warpui_core --lib -E 'test(elements::gui::flex)'`. |
@@ -254,7 +289,7 @@ Run focused tests, then relevant lint checks, then format, in the order in [AGEN
 | Other platforms | Linux, Windows and the remaining platform matrix are pending. |
 | Compatibility with the persistent-session backend and ordinary PTY | The native run used the disposable runtime `/tmp/wpdock.9YetIM`, which retained both owner sockets after the move. The integration runner verified ordinary local PTYs under its isolated Integration channel. |
 | Performance | No measurements yet. Before rollout, measure busy workspaces at 10, 50 and 100 panes, recording preview frame time, planner cost, allocation or memory data, CPU overhead and input/output latency. Derive budgets from a feature-off baseline on the same hardware. |
-| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. |
+| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. |
 
 ## Contribution boundaries
 

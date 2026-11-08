@@ -97,7 +97,7 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | 2. Rearrangement and docking | Intra-tab and inter-tab moves, swap, center Swap/Stack, pane-to-tab, atomic multi-pane layout moves, nested structure and optional flattening. | Implemented and verified with focused macOS integration and unit tests. See the evidence log. |
 | 3. Resizing and undo/redo | Adaptive proportions, minimum sizes, manual rebalance and divider reset, normal PTY resize, bounded layout undo and redo with explicit layout commands. | Implemented and verified with focused macOS tests. See the evidence log. |
 | 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Implemented and verified for two-window macOS workflows. Physical display and fullscreen checks are pending. |
-| 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Pending |
+| 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Implemented and verified on Apple Silicon macOS. Physical display transitions and other platforms are pending. |
 | 6. Advanced interaction | Multi-selection and temporary groups, drag handles, explicit keyboard docking, searchable Pane and Workspace Navigator, focus options and accessibility. | Pending |
 | 7. Specialized content | Capability-aware movement of agent and editor views, unsaved state and parent/child dependencies, fullscreen and maximized states, and optional persistent-session lifecycle integration. | Pending |
 | 8. Hardening and rollout | Bounded preview work, measured frame and resource budgets, diagnostics, stress and session integrity testing, accessibility and platform validation, staged rollout. | Pending |
@@ -136,7 +136,7 @@ Directional docking replaces the target leaf with a nested branch and preserves 
 
 Transfers rebind focus observers to the new pane group. After detaching from a tab that still has other terminals, the transaction restores their shared-session and AI history subscriptions. Cross-tab hover computes geometry from pane-tree flex and divider widths, then paints an outline over the mounted source. Only the commit attaches a terminal to its new group and activates the destination.
 
-Stack members retain their original `PaneId`, `TerminalPane`, metadata, and lifecycle subscriptions. One member occupies the visible slot. Workspace snapshots save all members as ordinary splits, so a restored stack uses split layout. Persistent members use the existing persistent owner restore behavior. An attached hidden member can be found and revealed by its owner UUID.
+Stack members retain their original `PaneId`, `TerminalPane`, metadata, and lifecycle subscriptions. One member occupies the visible slot. Warp’s automatic workspace restore saves stack members as ordinary splits. A named pane layout can retain the stack structure. Persistent members use the existing persistent owner restore behavior. An attached hidden member can be found and revealed by its owner UUID.
 
 ### Moving a split pane back to a tab
 
@@ -167,6 +167,19 @@ Cross-tab previews require an inactive destination whose pane area is clear of o
 - The pane overflow and tab context menus list eligible windows and offer a new-window action. The Command Palette offers **Move Pane to New Window** and **Move Tab Layout to New Window**. These actions provide a route when a window manager or fullscreen space limits pointer dragging.
 - The source window closes by default when its last tab leaves. To leave it open with a fresh tab, run **Keep Empty Windows After Moving Panes**. **Close Empty Windows After Moving Panes** restores the default.
 - **Swap** and **Stack** are available within a window. Window moves operate on live terminal views and preserve the shell and running jobs. Cross-window transfers are outside the per-window layout undo history.
+
+### Saved pane layouts
+
+Open **Manage Pane Layouts** from the Command Palette in a terminal-only window.
+
+- Enter a name and choose **Save Template** to record the tab, split, and stack structure, or **Save Snapshot** to also record which live terminal belongs in each slot.
+- Choose **Preview** to see how the layout fits the current window. If its proportions make panes too small, Warp offers the arrangements that fit from **Rebalance**, **Stack overflow**, and **Use more tabs**. Extra live terminals keep their own tabs. Unavailable snapshot terminals leave unfilled slots. **Apply Layout** moves the current terminals, and **Undo Pane Layout Change** reverses the edit.
+- **Copy Template JSON** puts a portable layout on the clipboard. It omits session IDs. Copy a layout document to the clipboard and choose **Import from Clipboard** to add it to the catalog under its saved name.
+- From a preview, choose **Save Display Profile** to associate the layout with the current arrangement of displays. **Preview Display Profile** recalls the matching layout for explicit review and application.
+
+The catalog is local to the Warp data profile. Applying a layout uses the current window and preserves its live terminal views and processes. Apply supports terminal-only windows with ungrouped, unpinned tabs and with panes restored from maximization. Close the tools and assistant panels and turn off synchronized input before applying a layout. If the window or its panes change while the preview is open, preview again.
+
+On macOS and non-tiling native X11, display recovery moves an unreachable normal window onto the primary display. The window returns to its original location when its display comes back if it remains at the recovery location. Windows uses reported geometry for profile matching. Physical display transitions still need native verification.
 
 ## Build and validation
 
@@ -267,10 +280,29 @@ cargo test --locked -p warpui_core --lib transfer_
 
 Run focused tests, then relevant lint checks, then format, in the order in [AGENTS.md](../../AGENTS.md). Keep one record per milestone with the exact commands, build and commit, platform, process-identity evidence, failures or unavailable tests, and the next milestone. Production installation and profiles stay separate from the development run.
 
+### Milestone 5 verification on SANDISK SSD
+
+```sh
+"/Volumes/SANDISK SSD/git/warp-pane-management-m5/target/start"
+```
+
+The signed development build uses the separate `docking-m5-ssd` data profile. Open the Command Palette with **⌘⇧P** and choose **Manage Pane Layouts**. Milestone 6 covers advanced pane interaction, including multi-pane selection and keyboard docking.
+
+Build the integration runner with `cargo build --locked -p integration --bin integration --features drag_tabs_to_windows`. Run `integration test_saved_pane_layout_preserves_processes` with `WARP_INTEGRATION=1` and `WARP_SHELL_PATH` set to `/bin/zsh` and then `/bin/bash`. Run the same runner for `test_dock_tab_preserves_running_processes`, `test_stack_terminal_tabs_and_extract_member`, `test_pane_layout_undo_redo_preserves_processes`, `test_pane_layout_resize_history_preserves_processes`, and `test_tear_out_tab_layout_preserves_processes`.
+
+```sh
+cargo test --locked -p warp --lib --features gui,enhanced_pane_management,drag_tabs_to_windows -- \
+  workspace::pane_layouts workspace::display_layouts workspace::view::layout_history
+```
+
 ### Evidence log
 
 | Item | Result |
 | --- | --- |
+| Milestone 5 integration checks | Twelve runs passed across zsh and Bash on Apple Silicon macOS. The new test saved two tabs as a snapshot, docked the terminals into one tab, previewed the snapshot without moving anything, applied it, and undid the change. It compared terminal view IDs, session IDs, shell and foreground process IDs, and process start times. Five existing docking, stack, history, resize, and tear-out tests also passed on both shells. |
+| Milestone 5 focused unit checks | All 15 passed. Coverage included versioned import and portable export, catalog persistence, missing and extra sessions, nested balance and overflow alternatives, display geometry and recovery, and history. |
+| Milestone 5 lint and SSD build | App and integration Clippy passed with warnings denied. The launcher accepted `--help`. The signed `dev.warp.WarpOss` bundle passed strict signature verification with CDHash `4b4cc2059d4da9e3cc5180dcee82047ef6505541`. |
+| Milestone 5 platform coverage | Physical disconnect and reconnect, Linux, and Windows are pending. Monitor geometry transitions were simulated in the unit tests. |
 | Milestone 4 integration checks | Eleven tests passed with zsh and Bash on Apple Silicon macOS. The native pointer case verified split preview, Escape and retry, moving a pane to a second window, and moving the active split layout back through the destination tab strip. The offscreen Command Palette case tore out an entire split twice and verified the close and keep source-window policies. The tests compared view IDs, session IDs, shell and foreground process IDs, start times, and focus. |
 | Milestone 4 WarpUI transfer tests | All 16 focused tests passed, including reparenting a view before transferring its former and current parents. |
 | Milestone 4 app checks and SSD build | All 18 focused app unit tests passed, the registered tear-out test passed through the normal test harness, and Clippy passed for the app, WarpUI core, and integration runner with warnings denied. The signed `dev.warp.WarpOss` bundle on SSD passed strict signature verification with CDHash `71d6e3a67427866598d06f9d6741cf1bff1b736e`. |
@@ -289,7 +321,7 @@ Run focused tests, then relevant lint checks, then format, in the order in [AGEN
 | Other platforms | Linux, Windows and the remaining platform matrix are pending. |
 | Compatibility with the persistent-session backend and ordinary PTY | The native run used the disposable runtime `/tmp/wpdock.9YetIM`, which retained both owner sockets after the move. The integration runner verified ordinary local PTYs under its isolated Integration channel. |
 | Performance | No measurements yet. Before rollout, measure busy workspaces at 10, 50 and 100 panes, recording preview frame time, planner cost, allocation or memory data, CPU overhead and input/output latency. Derive budgets from a feature-off baseline on the same hardware. |
-| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. |
+| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. Milestone 5 implementation and regression coverage `9b8d8e1f`. |
 
 ## Contribution boundaries
 

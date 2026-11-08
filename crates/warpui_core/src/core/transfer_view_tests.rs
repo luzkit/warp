@@ -902,6 +902,44 @@ fn test_transfer_structural_children_does_not_move_unrelated_views() {
 }
 
 #[test]
+fn test_transfer_tree_uses_current_structural_parent_after_reattachment() {
+    struct TestView;
+
+    impl Entity for TestView {
+        type Event = ();
+    }
+
+    impl View for TestView {
+        fn render(&self, _: &AppContext) -> Box<dyn Element> {
+            Empty::new().finish()
+        }
+
+        fn ui_name() -> &'static str {
+            "TestView"
+        }
+    }
+
+    impl TypedActionView for TestView {
+        type Action = ();
+    }
+
+    App::test((), |mut app| async move {
+        let (source, root) = app.add_window(WindowStyle::NotStealFocus, |_| TestView);
+        let (destination, _) = app.add_window(WindowStyle::NotStealFocus, |_| TestView);
+        let old_parent = root.update(&mut app, |_, ctx| ctx.add_typed_action_view(|_| TestView));
+        let new_parent = root.update(&mut app, |_, ctx| ctx.add_typed_action_view(|_| TestView));
+        let child = old_parent.update(&mut app, |_, ctx| ctx.add_typed_action_view(|_| TestView));
+
+        app.update(|ctx| ctx.record_structural_view_parent(source, child.id(), new_parent.id()));
+        app.update(|ctx| ctx.transfer_view_tree_to_window(old_parent.id(), source, destination));
+        app.read(|ctx| assert_eq!(child.window_id(ctx), source));
+
+        app.update(|ctx| ctx.transfer_view_tree_to_window(new_parent.id(), source, destination));
+        app.read(|ctx| assert_eq!(child.window_id(ctx), destination));
+    });
+}
+
+#[test]
 fn test_transfer_view_tree_moves_child_view_ids_owned_views() {
     // A view can own child views that are never rendered (e.g. held through a
     // model, like a pane's navigation stack) and are not registered as

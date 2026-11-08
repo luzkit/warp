@@ -8358,6 +8358,11 @@ impl PaneGroup {
     pub fn attach_pane(&self, pane: &dyn AnyPaneContent, ctx: &mut ViewContext<Self>) {
         // Attach the pane.
         let pane = pane.as_pane();
+        if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            let window = ctx.window_id();
+            let group = ctx.view_id();
+            ctx.record_structural_view_parent(window, pane.id().creation_order_id(), group);
+        }
         let focus_handle = focus_state::PaneFocusHandle::new(pane.id(), self.focus_state.clone());
         pane.attach(self, focus_handle, ctx);
 

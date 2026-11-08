@@ -114,6 +114,59 @@ pub fn init(app: &mut AppContext) {
         .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
     ]);
 
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "workspace:move_pane_to_new_window",
+            "Move Pane to New Window",
+            WorkspaceAction::MovePaneToWindow {
+                pane: None,
+                destination: None,
+            },
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| {
+            cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled()
+        }),
+        EditableBinding::new(
+            "workspace:move_tab_layout_to_new_window",
+            "Move Tab Layout to New Window",
+            WorkspaceAction::MoveTabToWindow {
+                tab: None,
+                destination: None,
+            },
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| {
+            cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled()
+        }),
+        EditableBinding::new(
+            "workspace:close_empty_windows_after_pane_transfer",
+            "Close Empty Windows After Moving Panes",
+            WorkspaceAction::SetCloseEmptyWindowsAfterPaneTransfer(true),
+        )
+        .with_context_predicate(
+            id!("Workspace") & !id!("Workspace_CloseEmptyWindowsAfterPaneTransfer"),
+        )
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| {
+            cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled()
+        }),
+        EditableBinding::new(
+            "workspace:keep_empty_windows_after_pane_transfer",
+            "Keep Empty Windows After Moving Panes",
+            WorkspaceAction::SetCloseEmptyWindowsAfterPaneTransfer(false),
+        )
+        .with_context_predicate(
+            id!("Workspace") & id!("Workspace_CloseEmptyWindowsAfterPaneTransfer"),
+        )
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| {
+            cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled()
+        }),
+    ]);
+
     #[cfg(all(target_os = "macos", feature = "local_tty"))]
     app.register_editable_bindings([
         EditableBinding::new(

@@ -27872,6 +27872,7 @@ impl TypedActionView for TerminalView {
             | AltMouseAction(_)
             | ToggleMaximizePane
             | MovePaneToNewTab
+            | MovePaneToWindow { .. }
             | ShowStackedPane(_)
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
@@ -28192,6 +28193,15 @@ impl TypedActionView for TerminalView {
                         focus_handle.pane_id(),
                     ));
                 }
+            }
+            MovePaneToWindow {
+                source,
+                destination,
+            } => {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::MovePaneToWindow {
+                    pane: Some(*source),
+                    destination: *destination,
+                });
             }
             ShowStackedPane(locator) => {
                 ctx.dispatch_typed_action_deferred(WorkspaceAction::FocusPane(*locator));
@@ -29141,6 +29151,17 @@ impl TypedActionView for TerminalView {
 impl View for TerminalView {
     fn ui_name() -> &'static str {
         "Terminal"
+    }
+
+    fn on_window_transferred(
+        &mut self,
+        _: WindowId,
+        new_window_id: WindowId,
+        _: &mut ViewContext<Self>,
+    ) {
+        if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            self.window_id = new_window_id;
+        }
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {

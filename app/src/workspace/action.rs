@@ -148,6 +148,15 @@ pub enum WorkspaceAction {
     MoveTabLeft(usize),
     MoveTabRight(usize),
     MovePaneToNewTab(PaneId),
+    MovePaneToWindow {
+        pane: Option<PaneViewLocator>,
+        destination: Option<WindowId>,
+    },
+    MoveTabToWindow {
+        tab: Option<EntityId>,
+        destination: Option<WindowId>,
+    },
+    SetCloseEmptyWindowsAfterPaneTransfer(bool),
     UndoPaneLayoutChange,
     RedoPaneLayoutChange,
     BalancePanes,
@@ -963,6 +972,9 @@ impl WorkspaceAction {
             | MoveTabLeft(_)
             | MoveTabRight(_)
             | MovePaneToNewTab(_)
+            | MovePaneToWindow { .. }
+            | MoveTabToWindow { .. }
+            | SetCloseEmptyWindowsAfterPaneTransfer(_)
             | UndoPaneLayoutChange
             | RedoPaneLayoutChange
             | BalancePanes

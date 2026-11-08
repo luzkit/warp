@@ -221,12 +221,22 @@ impl PaneGroup {
         pane: PaneId,
         ctx: &AppContext,
     ) -> bool {
+        Self::has_window_docking_pane(handle, pane, ctx)
+            && handle
+                .as_ref(ctx)
+                .terminal_session_by_id(pane)
+                .is_some_and(|terminal| terminal.supports_terminal_docking(ctx))
+    }
+
+    pub(crate) fn has_window_docking_pane(
+        handle: &ViewHandle<Self>,
+        pane: PaneId,
+        ctx: &AppContext,
+    ) -> bool {
         let group = handle.as_ref(ctx);
         group.supports_docking_context(handle, ctx)
             && group.panes.is_pane_in_tree(pane)
-            && group
-                .terminal_session_by_id(pane)
-                .is_some_and(|terminal| terminal.supports_terminal_docking(ctx))
+            && group.pane_contents.contains_key(&pane)
     }
 
     pub(crate) fn can_dock_terminal_pane(
@@ -247,16 +257,35 @@ impl PaneGroup {
         Some(self.terminal_session_by_id(pane)?.header_drag_state(ctx))
     }
 
-    pub(crate) fn can_dock_terminal_layout(handle: &ViewHandle<Self>, ctx: &AppContext) -> bool {
+    pub(crate) fn refresh_terminal_pane_header_drag(
+        &self,
+        pane: PaneId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(terminal) = self.terminal_session_by_id(pane) {
+            let header = terminal.pane_view().as_ref(ctx).header().clone();
+            header.update(ctx, |header, ctx| header.refresh_docking_drag(ctx));
+        }
+    }
+
+    pub(crate) fn can_move_terminal_layout_to_window(
+        handle: &ViewHandle<Self>,
+        ctx: &AppContext,
+    ) -> bool {
         let group = handle.as_ref(ctx);
         group.supports_docking_context(handle, ctx)
-            && group.pane_count() == group.pane_contents.len()
             && !group.pane_contents.is_empty()
             && group.pane_contents.values().all(|pane| {
                 pane.as_any()
                     .downcast_ref::<TerminalPane>()
                     .is_some_and(|terminal| terminal.supports_terminal_docking(ctx))
             })
+    }
+
+    pub(crate) fn can_dock_terminal_layout(handle: &ViewHandle<Self>, ctx: &AppContext) -> bool {
+        let group = handle.as_ref(ctx);
+        group.pane_count() == group.pane_contents.len()
+            && Self::can_move_terminal_layout_to_window(handle, ctx)
     }
 
     pub(crate) fn docking_preview_rects(
@@ -310,6 +339,21 @@ impl PaneGroup {
         ctx.emit(Event::AppStateChanged);
     }
 
+    fn transfer_docking_pane_views(
+        source: &ViewHandle<Self>,
+        destination: &ViewHandle<Self>,
+        panes: impl IntoIterator<Item = PaneId>,
+        ctx: &mut AppContext,
+    ) {
+        let from = source.window_id(ctx);
+        let to = destination.window_id(ctx);
+        if from != to {
+            for pane in panes {
+                ctx.transfer_view_tree_to_window(pane.creation_order_id(), from, to);
+            }
+        }
+    }
+
     /// The enclosing workspace update owns source-tab cleanup if the transfer empties it.
     pub(crate) fn dock_terminal_layout_between_tabs(
         source: &ViewHandle<Self>,
@@ -339,6 +383,7 @@ impl PaneGroup {
             }
             panes
         });
+        Self::transfer_docking_pane_views(source, destination, panes.keys().copied(), ctx);
         destination.update(ctx, |group, ctx| {
             for (id, pane) in panes {
                 group.pane_contents.insert(id, pane);
@@ -384,6 +429,7 @@ impl PaneGroup {
             destination.update(ctx, |group, _| group.panes.remove(pane));
             return false;
         };
+        Self::transfer_docking_pane_views(source, destination, [pane], ctx);
         destination.update(ctx, |group, ctx| {
             group.pane_contents.insert(pane, content);
             group.attach_pane(group.pane_contents[&pane].as_ref(), ctx);

@@ -682,13 +682,39 @@ pub fn create_transferred_window(
     is_tab_drag_preview: bool,
     ctx: &mut AppContext,
 ) -> WindowId {
+    create_window_for_tab_transfer(
+        transferred_tab,
+        source_window_id,
+        RectF::new(window_position, window_size),
+        is_tab_drag_preview,
+        false,
+        ctx,
+    )
+}
+
+pub(crate) fn create_docked_window(
+    transferred_tab: crate::workspace::view::TransferredTab,
+    source_window_id: WindowId,
+    bounds: RectF,
+    ctx: &mut AppContext,
+) -> WindowId {
+    create_window_for_tab_transfer(transferred_tab, source_window_id, bounds, false, true, ctx)
+}
+
+fn create_window_for_tab_transfer(
+    transferred_tab: crate::workspace::view::TransferredTab,
+    source_window_id: WindowId,
+    bounds: RectF,
+    is_tab_drag_preview: bool,
+    transfer_on_init: bool,
+    ctx: &mut AppContext,
+) -> WindowId {
     let global_resource_handles = GlobalResourceHandlesProvider::handle(ctx)
         .as_ref(ctx)
         .get()
         .clone();
     let window_settings = WindowSettings::handle(ctx).as_ref(ctx);
-
-    let window_bounds = WindowBounds::ExactPosition(RectF::new(window_position, window_size));
+    let window_bounds = WindowBounds::ExactPosition(bounds);
 
     let window_style = if is_tab_drag_preview {
         WindowStyle::PositionedNoFocus
@@ -707,9 +733,19 @@ pub fn create_transferred_window(
             ..Default::default()
         },
         |ctx| {
+            let tab_to_adopt = transfer_on_init.then(|| {
+                let window_id = ctx.window_id();
+                ctx.transfer_view_tree_to_window(
+                    transferred_tab.pane_group.id(),
+                    source_window_id,
+                    window_id,
+                );
+                transferred_tab.clone()
+            });
             let mut view = RootView::new(
                 global_resource_handles.clone(),
                 NewWorkspaceSource::TransferredTab {
+                    tab_to_adopt,
                     source_window_id,
                     tab_color: transferred_tab.color,
                     custom_title: transferred_tab.custom_title.clone(),
@@ -727,6 +763,10 @@ pub fn create_transferred_window(
             view
         },
     );
+
+    if transfer_on_init {
+        return new_window_id;
+    }
 
     let pane_group_id = transferred_tab.pane_group.id();
     ctx.transfer_view_tree_to_window(pane_group_id, source_window_id, new_window_id);
@@ -1637,6 +1677,8 @@ pub enum NewWorkspaceSource {
     /// The workspace will create a placeholder tab, which will be replaced by the transferred
     /// PaneGroup after window creation.
     TransferredTab {
+        /// Attach an existing group during construction when the view tree has already moved.
+        tab_to_adopt: Option<crate::workspace::view::TransferredTab>,
         source_window_id: WindowId,
         /// Tab color from the source tab
         tab_color: Option<AnsiColorIdentifier>,

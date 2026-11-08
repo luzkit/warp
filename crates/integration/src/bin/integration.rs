@@ -393,6 +393,8 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_stack_terminal_tabs_and_extract_member);
     register_test!(test_pane_layout_undo_redo_preserves_processes);
     register_test!(test_pane_layout_resize_history_preserves_processes);
+    register_test!(test_move_pane_between_windows_preserves_processes);
+    register_test!(test_tear_out_tab_layout_preserves_processes);
     register_test!(test_reorder_tabs_with_drag);
     register_test!(test_detach_tab_to_new_window_with_drag);
     register_test!(test_attach_tab_to_other_window_and_continue_drag);

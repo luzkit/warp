@@ -1486,6 +1486,31 @@ impl AppContext {
             .insert(view_id, parent_view_id);
     }
 
+    /// Records ownership when a view is attached to a different structural parent.
+    pub fn record_structural_view_parent(
+        &mut self,
+        window_id: WindowId,
+        view_id: EntityId,
+        parent_view_id: EntityId,
+    ) {
+        self.record_view_parent(window_id, view_id, parent_view_id);
+        if let Some(previous_parent) = self
+            .structural_child_to_parent
+            .insert(view_id, parent_view_id)
+            && previous_parent != parent_view_id
+            && let Some(children) = self.structural_parent_to_children.get_mut(&previous_parent)
+        {
+            children.remove(&view_id);
+            if children.is_empty() {
+                self.structural_parent_to_children.remove(&previous_parent);
+            }
+        }
+        self.structural_parent_to_children
+            .entry(parent_view_id)
+            .or_default()
+            .insert(view_id);
+    }
+
     /// Render-time hook: merges the child-view → parent-view embeddings the
     /// active backend discovered while laying out a frame into the window's
     /// neutral view hierarchy.
@@ -3126,13 +3151,7 @@ impl AppContext {
 
         // If a parent view ID was provided, add the view as a child of the parent
         if let Some(parent_view_id) = parent_view_id {
-            self.record_view_parent(window_id, view_id, parent_view_id);
-            self.structural_child_to_parent
-                .insert(view_id, parent_view_id);
-            self.structural_parent_to_children
-                .entry(parent_view_id)
-                .or_default()
-                .insert(view_id);
+            self.record_structural_view_parent(window_id, view_id, parent_view_id);
         }
 
         // Register the action handler for this view type (if it hasn't already been added)

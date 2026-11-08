@@ -276,6 +276,19 @@ impl<P: BackingView> PaneHeader<P> {
         &self.mouse_state_handles.draggable_state
     }
 
+    pub(crate) fn refresh_docking_drag(&self, ctx: &mut ViewContext<Self>) {
+        for handle in [
+            &self.mouse_state_handles.header_click_handle,
+            &self.mouse_state_handles.close_button_handle,
+            &self.mouse_state_handles.overflow_button_handle,
+        ] {
+            if let Ok(mut state) = handle.lock() {
+                state.reset_interaction_state();
+            }
+        }
+        ctx.notify();
+    }
+
     pub fn set_overflow_menu_items(
         &mut self,
         items: impl IntoIterator<Item = MenuItem<P::PaneHeaderOverflowMenuAction>>,

@@ -29,6 +29,7 @@ pub(crate) mod tests;
 mod vertical_tabs;
 #[cfg(target_family = "wasm")]
 mod wasm_view;
+mod window_docking;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -127,6 +128,7 @@ use warpui::{
 
 use self::docking_overlay::{DockingPaneDrag, DockingTabDrag};
 pub(crate) use self::docking_overlay::{handle_docking_input, pane_drag_owns_pointer};
+use self::enhanced_docking::DockingSource;
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     SummaryPaneKind, SummaryPaneKindIcons, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID,
@@ -1017,6 +1019,7 @@ fn query_for_rewind_prefill(inputs: &[AIAgentInput]) -> Option<String> {
 /// `insert_transferred_tab_at_index`. Captures the pane group handle, visual
 /// metadata, panel-open state, and `DraggableState` so an in-progress drag
 /// animation continues seamlessly after a handoff.
+#[derive(Clone)]
 pub struct TransferredTab {
     pub pane_group: ViewHandle<PaneGroup>,
     pub color: Option<AnsiColorIdentifier>,
@@ -4296,6 +4299,7 @@ impl Workspace {
             }
             #[cfg(feature = "local_fs")]
             NewWorkspaceSource::TransferredTab {
+                tab_to_adopt,
                 tab_color,
                 custom_title,
                 left_panel_open,
@@ -4305,15 +4309,7 @@ impl Workspace {
                 ..
             } => {
                 self.set_is_tab_drag_preview(is_tab_drag_preview);
-                self.add_tab_with_pane_layout(
-                    Default::default(),
-                    Arc::new(HashMap::new()),
-                    custom_title,
-                    ctx,
-                );
-                if let (Some(color), Some(tab)) = (tab_color, self.tabs.last_mut()) {
-                    tab.selected_color = SelectedTabColor::Color(color);
-                }
+                self.initialize_transferred_tab(tab_to_adopt, tab_color, custom_title, ctx);
                 if self.left_panel_visibility_across_tabs_enabled(ctx) {
                     self.left_panel_open = left_panel_open;
                 }
@@ -4323,10 +4319,10 @@ impl Workspace {
                     });
                     self.setup_code_review_panel(None, ctx);
                 }
-                self.pending_pane_group_transfer = true;
             }
             #[cfg(not(feature = "local_fs"))]
             NewWorkspaceSource::TransferredTab {
+                tab_to_adopt,
                 tab_color,
                 custom_title,
                 left_panel_open,
@@ -4334,19 +4330,10 @@ impl Workspace {
                 ..
             } => {
                 self.set_is_tab_drag_preview(is_tab_drag_preview);
-                self.add_tab_with_pane_layout(
-                    Default::default(),
-                    Arc::new(HashMap::new()),
-                    custom_title,
-                    ctx,
-                );
-                if let (Some(color), Some(tab)) = (tab_color, self.tabs.last_mut()) {
-                    tab.selected_color = SelectedTabColor::Color(color);
-                }
+                self.initialize_transferred_tab(tab_to_adopt, tab_color, custom_title, ctx);
                 if self.left_panel_visibility_across_tabs_enabled(ctx) {
                     self.left_panel_open = left_panel_open;
                 }
-                self.pending_pane_group_transfer = true;
             }
         };
 
@@ -8170,6 +8157,128 @@ impl Workspace {
             == 1
     }
 
+    pub(crate) fn pane_window_move_options(
+        window: WindowId,
+        pane: PaneViewLocator,
+        ctx: &AppContext,
+    ) -> (bool, Vec<(WindowId, String)>) {
+        if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            return Default::default();
+        }
+        let Some(workspace) = WorkspaceRegistry::as_ref(ctx).get(window, ctx) else {
+            return Default::default();
+        };
+        let workspace = workspace.as_ref(ctx);
+        if !workspace.can_offer_window_move_for_pane(pane, ctx) {
+            return Default::default();
+        }
+        let windows = Self::window_move_labels(
+            |window| workspace.window_docking_destination(window, ctx).is_some(),
+            ctx,
+        );
+        (ctx.window_bounds(&window).is_some(), windows)
+    }
+
+    fn window_move_options(
+        &self,
+        source: DockingSource,
+        ctx: &AppContext,
+    ) -> (bool, Vec<(WindowId, String)>) {
+        if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            return Default::default();
+        }
+        let can_tear_out = self.can_tear_out_docking_source(source, ctx);
+        let windows = Self::window_move_labels(
+            |window| self.can_move_docking_source_to_window(source, window, ctx),
+            ctx,
+        );
+        (can_tear_out, windows)
+    }
+
+    fn window_move_labels(
+        can_move: impl Fn(WindowId) -> bool,
+        ctx: &AppContext,
+    ) -> Vec<(WindowId, String)> {
+        let mut workspaces = WorkspaceRegistry::as_ref(ctx).all_workspaces(ctx);
+        workspaces.sort_unstable_by_key(|(window, _)| *window);
+        workspaces
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (window, _))| can_move(*window))
+            .map(|(index, (window, workspace))| {
+                let workspace = workspace.as_ref(ctx);
+                let number = index + 1;
+                let title = workspace
+                    .get_pane_group_view(workspace.active_tab_index)
+                    .map(|group| group.as_ref(ctx).display_title(ctx))
+                    .filter(|title| !title.is_empty());
+                let label = match title {
+                    Some(title) => format!(
+                        "window {number} ({})",
+                        truncate_from_end(&title, MAX_WINDOW_TITLE_LENGTH)
+                    ),
+                    None => format!("window {number}"),
+                };
+                (window, label)
+            })
+            .collect()
+    }
+
+    fn append_tab_window_move_items(
+        &self,
+        group: EntityId,
+        items: &mut Vec<MenuItem<WorkspaceAction>>,
+        ctx: &AppContext,
+    ) {
+        let (can_tear_out, windows) = self.window_move_options(DockingSource::Tab(group), ctx);
+        if !can_tear_out && windows.is_empty() {
+            return;
+        }
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        if can_tear_out {
+            items.push(
+                MenuItemFields::new("Move tab to new window")
+                    .with_on_select_action(WorkspaceAction::MoveTabToWindow {
+                        tab: Some(group),
+                        destination: None,
+                    })
+                    .into_item(),
+            );
+        }
+        items.extend(windows.into_iter().map(|(window, title)| {
+            MenuItemFields::new(format!("Move tab to {title}"))
+                .with_on_select_action(WorkspaceAction::MoveTabToWindow {
+                    tab: Some(group),
+                    destination: Some(window),
+                })
+                .into_item()
+        }));
+    }
+
+    fn move_source_from_window_menu(
+        &mut self,
+        source: DockingSource,
+        destination: Option<WindowId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let moved = match destination {
+            Some(window) => self.move_docking_source_to_window(source, window, None, ctx),
+            None => self.tear_out_docking_source(source, None, ctx),
+        };
+        if !moved {
+            self.toast_stack.update(ctx, |stack, ctx| {
+                stack.add_ephemeral_toast(
+                    DismissibleToast::default(
+                        "This layout cannot be moved to that window.".to_owned(),
+                    ),
+                    ctx,
+                );
+            });
+        }
+    }
+
     pub fn toggle_tab_right_click_menu(
         &mut self,
         tab_index: usize,
@@ -8186,7 +8295,7 @@ impl Workspace {
         let can_move_left = self.can_move_tab(tab_index, TabMovement::Left);
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
-        let menu_items = {
+        let mut menu_items = {
             let tab = &self.tabs[tab_index];
             tab.menu_items(
                 tab_index,
@@ -8198,6 +8307,11 @@ impl Workspace {
                 ctx,
             )
         };
+        self.append_tab_window_move_items(
+            self.tabs[tab_index].pane_group.id(),
+            &mut menu_items,
+            ctx,
+        );
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
         });
@@ -8274,7 +8388,7 @@ impl Workspace {
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
         let tab = &self.tabs[tab_index];
-        let menu_items = tab.menu_items_with_pane_name_target(
+        let mut menu_items = tab.menu_items_with_pane_name_target(
             tab_index,
             self.tabs.len(),
             &self.tab_groups,
@@ -8284,6 +8398,7 @@ impl Workspace {
             Some(pane_name_target),
             ctx,
         );
+        self.append_tab_window_move_items(tab.pane_group.id(), &mut menu_items, ctx);
 
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
@@ -12420,6 +12535,7 @@ impl Workspace {
         {
             tab_data.draggable_state.cancel_drag();
             tab_data.draggable_state.set_suppress_overlay_paint(false);
+            self.notify_window_docking_preview(ctx);
             self.docking_tab_drag = None;
             self.current_workspace_state.is_tab_being_dragged = false;
         }
@@ -24298,6 +24414,36 @@ impl TypedActionView for Workspace {
             MoveTabLeft(index) => self.move_tab(*index, TabMovement::Left, ctx),
             MoveTabRight(index) => self.move_tab(*index, TabMovement::Right, ctx),
             MovePaneToNewTab(pane) => self.move_pane_to_new_tab(*pane, ctx),
+            MovePaneToWindow { pane, destination } => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    let pane = pane.unwrap_or_else(|| {
+                        let group = self.active_tab_pane_group();
+                        PaneViewLocator {
+                            pane_group_id: group.id(),
+                            pane_id: group.as_ref(ctx).focused_pane_id(ctx),
+                        }
+                    });
+                    self.move_source_from_window_menu(DockingSource::Pane(pane), *destination, ctx);
+                }
+            }
+            MoveTabToWindow { tab, destination } => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    let group = tab.unwrap_or_else(|| self.active_tab_pane_group().id());
+                    self.move_source_from_window_menu(DockingSource::Tab(group), *destination, ctx);
+                }
+            }
+            SetCloseEmptyWindowsAfterPaneTransfer(close) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    WindowSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(
+                            settings
+                                .close_empty_windows_after_pane_transfer
+                                .set_value(*close, ctx)
+                        );
+                    });
+                    ctx.notify();
+                }
+            }
             UndoPaneLayoutChange => self.undo_layout_change(ctx),
             RedoPaneLayoutChange => self.redo_layout_change(ctx),
             BalancePanes => {
@@ -26833,6 +26979,14 @@ impl View for Workspace {
     fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {
         let mut context = Self::default_keymap_context();
 
+        if FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && *WindowSettings::as_ref(app).close_empty_windows_after_pane_transfer
+        {
+            context
+                .set
+                .insert("Workspace_CloseEmptyWindowsAfterPaneTransfer");
+        }
+
         #[cfg(all(target_os = "macos", feature = "local_tty"))]
         if self.focused_persistent_terminal(app).is_some() {
             context.set.insert("Workspace_PersistentTerminal");
@@ -28389,6 +28543,7 @@ impl View for Workspace {
 
     /// Update this workspace when it has been closed, but may still be restored.
     fn on_window_closed(&mut self, ctx: &mut ViewContext<Self>) {
+        self.notify_window_docking_preview(ctx);
         if !self.suppress_detach_panes_on_window_close {
             for pane_group in self.tab_views() {
                 pane_group.update(ctx, |pane_group, ctx| {

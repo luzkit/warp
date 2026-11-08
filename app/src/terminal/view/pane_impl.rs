@@ -57,7 +57,7 @@ use crate::util::bindings::keybinding_name_to_display_string;
 #[cfg(target_arch = "wasm32")]
 use crate::workspace::WorkspaceAction;
 use crate::workspace::tab_settings::TabSettings;
-use crate::workspace::{MOVE_TO_OWN_TAB_LABEL, PaneViewLocator, WorkspaceRegistry};
+use crate::workspace::{MOVE_TO_OWN_TAB_LABEL, PaneViewLocator, Workspace, WorkspaceRegistry};
 
 /// Total size of the agent icon-with-status component rendered in the pane header.
 /// Sub-components (circle, badge, cloud) are derived inside `render_icon_with_status`.
@@ -692,14 +692,27 @@ impl BackingView for TerminalView {
         ctx: &AppContext,
     ) -> Vec<MenuItem<Self::PaneHeaderOverflowMenuAction>> {
         let pane_state = self.split_pane_state(ctx);
-        let can_move_to_new_tab = FeatureFlag::EnhancedPaneManagement.is_enabled()
-            && (pane_state.is_in_split_pane() || self.is_docked_stack_member(ctx))
+        let can_move_pane = FeatureFlag::EnhancedPaneManagement.is_enabled()
             && self
                 .pane_stack
                 .as_ref()
                 .and_then(|stack| stack.upgrade(ctx))
                 .is_some_and(|stack| stack.as_ref(ctx).depth() == 1)
             && self.supports_terminal_docking(ctx);
+        let can_move_to_new_tab =
+            can_move_pane && (pane_state.is_in_split_pane() || self.is_docked_stack_member(ctx));
+        let window_move = if can_move_pane {
+            self.focus_handle().and_then(|focus| {
+                let pane = PaneViewLocator {
+                    pane_group_id: self.agent_view_controller.as_ref(ctx).pane_group_id()?,
+                    pane_id: focus.pane_id(),
+                };
+                let options = Workspace::pane_window_move_options(self.window_id, pane, ctx);
+                Some((pane, options))
+            })
+        } else {
+            None
+        };
         let model = self.model.lock();
         let mut items = vec![];
         let source = SharedSessionActionSource::PaneHeader;
@@ -778,6 +791,32 @@ impl BackingView for TerminalView {
                     .with_on_select_action(TerminalAction::MovePaneToNewTab)
                     .into_item(),
             );
+        }
+
+        if let Some((source, (can_tear_out, windows))) = window_move
+            && (can_tear_out || !windows.is_empty())
+        {
+            if !items.is_empty() && !pane_state.is_in_split_pane() && !can_move_to_new_tab {
+                items.push(MenuItem::Separator);
+            }
+            if can_tear_out {
+                items.push(
+                    MenuItemFields::new("Move to new window")
+                        .with_on_select_action(TerminalAction::MovePaneToWindow {
+                            source,
+                            destination: None,
+                        })
+                        .into_item(),
+                );
+            }
+            items.extend(windows.into_iter().map(|(window, title)| {
+                MenuItemFields::new(format!("Move to {title}"))
+                    .with_on_select_action(TerminalAction::MovePaneToWindow {
+                        source,
+                        destination: Some(window),
+                    })
+                    .into_item()
+            }));
         }
 
         if let Some(focus_handle) = self.focus_handle()

@@ -9,10 +9,10 @@ use pathfinder_geometry::vector::Vector2F;
 use session_sharing_protocol::common::Role;
 use session_sharing_protocol::sharer::RoleUpdateReason;
 use warp_util::user_input::UserInput;
-use warpui::EntityId;
 use warpui::elements::HyperlinkUrl;
 use warpui::event::ModifiersState;
 use warpui::units::Lines;
+use warpui::{EntityId, WindowId};
 
 use super::inline_banner::{
     AwsBedrockLoginBannerAction, AwsCliNotInstalledBannerAction, OpenInWarpBannerAction,
@@ -204,6 +204,10 @@ pub enum TerminalAction {
     Close,
     ToggleMaximizePane,
     MovePaneToNewTab,
+    MovePaneToWindow {
+        source: PaneViewLocator,
+        destination: Option<WindowId>,
+    },
     ShowStackedPane(PaneViewLocator),
     SplitRight(Option<AvailableShell>),
     SplitLeft(Option<AvailableShell>),
@@ -570,6 +574,7 @@ impl fmt::Debug for TerminalAction {
             SplitUp(_) => f.write_str("SplitUp"),
             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
             MovePaneToNewTab => f.write_str("MovePaneToNewTab"),
+            MovePaneToWindow { .. } => f.write_str("MovePaneToWindow"),
             ShowStackedPane(_) => f.write_str("ShowStackedPane"),
             PromptContextMenu {
                 position_offset_from_prompt,

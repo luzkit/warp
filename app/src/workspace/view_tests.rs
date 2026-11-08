@@ -520,6 +520,7 @@ fn transferred_tab_workspace(
             global_resource_handles,
             None,
             NewWorkspaceSource::TransferredTab {
+                tab_to_adopt: None,
                 source_window_id: ctx.window_id(),
                 tab_color: None,
                 custom_title: None,

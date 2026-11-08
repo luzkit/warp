@@ -89,7 +89,7 @@ pub fn test_dock_entire_tab_layout() -> Builder {
         ))
 }
 
-fn drag_to(app: &mut App, window_id: WindowId, point: Vector2F) {
+pub(super) fn drag_to(app: &mut App, window_id: WindowId, point: Vector2F) {
     dispatch_mouse_event(
         app,
         window_id,
@@ -100,7 +100,7 @@ fn drag_to(app: &mut App, window_id: WindowId, point: Vector2F) {
     );
 }
 
-fn start_drag(app: &mut App, window_id: WindowId, point: Vector2F) {
+pub(super) fn start_drag(app: &mut App, window_id: WindowId, point: Vector2F) {
     dispatch_mouse_event(
         app,
         window_id,
@@ -114,7 +114,7 @@ fn start_drag(app: &mut App, window_id: WindowId, point: Vector2F) {
     drag_to(app, window_id, point + vec2f(12., 0.));
 }
 
-fn start_pane_header_drag(app: &mut App, window_id: WindowId, pane: usize) {
+pub(super) fn start_pane_header_drag(app: &mut App, window_id: WindowId, pane: usize) {
     let bounds = pane_bounds(app, window_id, 0, pane);
     start_drag(
         app,

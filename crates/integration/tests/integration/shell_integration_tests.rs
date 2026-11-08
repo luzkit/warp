@@ -28,6 +28,9 @@ integration_tests! {
     // Test layout undo, redo, and resize preserve running bash and zsh sessions.
     test_pane_layout_undo_redo_preserves_processes,
     test_pane_layout_resize_history_preserves_processes,
+    // Test bash and zsh process identity through cross-window moves and tear-out.
+    test_move_pane_between_windows_preserves_processes,
+    test_tear_out_tab_layout_preserves_processes,
     // Test powerlevel10k detection (via bootstrap script logic).
     test_detect_powerlevel10k,
     // Test properties of bootstrap.

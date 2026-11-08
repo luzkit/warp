@@ -26,6 +26,7 @@ use crate::Builder;
 
 mod history;
 mod rearrangement;
+mod windows;
 pub use history::{
     test_pane_layout_resize_history_preserves_processes,
     test_pane_layout_undo_redo_preserves_processes,
@@ -33,6 +34,10 @@ pub use history::{
 pub use rearrangement::{
     test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
     test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
+};
+pub use windows::{
+    test_move_pane_between_windows_preserves_processes,
+    test_tear_out_tab_layout_preserves_processes,
 };
 
 const PROCESS_SNAPSHOT: &str = "processes before transfer";

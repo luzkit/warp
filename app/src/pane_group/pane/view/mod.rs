@@ -286,7 +286,15 @@ impl<P: BackingView> PaneView<P> {
         match event {
             header::Event::PaneHeaderClicked => ctx.emit(PaneViewEvent::PaneHeaderClicked),
             header::Event::PaneHeaderOverflowMenuToggled(is_open) => {
-                self.child(ctx).update(ctx, |child, ctx| {
+                let child = self.child(ctx);
+                if *is_open && FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    let items =
+                        child.read(ctx, |view, ctx| view.pane_header_overflow_menu_items(ctx));
+                    self.header.update(ctx, |header, ctx| {
+                        header.set_overflow_menu_items(items, ctx);
+                    });
+                }
+                child.update(ctx, |child, ctx| {
                     child.on_pane_header_overflow_menu_toggled(*is_open, ctx);
                 });
             }

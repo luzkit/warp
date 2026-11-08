@@ -16,7 +16,9 @@ import fork_signing as signing
 
 
 REPOSITORY = "luzkit/warp"
-SIGNING_CONTROLLER = "luzkit/nab-release-app"
+SIGNING_CONTROLLER = "luzkit/warp-release"
+# Keep the existing controller available until the dedicated pipeline is verified.
+LEGACY_SIGNING_CONTROLLER = "luzkit/nab-release-app"
 SIGNING_WORKFLOW_REF = f"{SIGNING_CONTROLLER}/.github/workflows/fork-notarized-release.yml@refs/heads/main"
 
 
@@ -97,7 +99,9 @@ def workflow_provenance():
         "workflow_sha": "GITHUB_WORKFLOW_SHA",
     }.items()}
     if os.environ.get("GITHUB_ACTIONS") == "true":
-        if result["repository"] != SIGNING_CONTROLLER or result["workflow_ref"] != SIGNING_WORKFLOW_REF or not all(
+        controller = result["repository"]
+        expected_ref = f"{controller}/.github/workflows/fork-notarized-release.yml@refs/heads/main"
+        if controller not in (SIGNING_CONTROLLER, LEGACY_SIGNING_CONTROLLER) or result["workflow_ref"] != expected_ref or not all(
             result[key] and result[key].isdigit() for key in ("run_id", "run_attempt")
         ):
             raise ValueError("Missing or unexpected signing workflow provenance")

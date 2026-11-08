@@ -46,53 +46,118 @@ are not erased during installation.
 
 ## Build and publish
 
-The private `luzkit/nab-release-app` repository coordinates notarized builds using
-its existing Mac runner and Keychain. The reviewed workflow template is
-[`script/ci/fork-notarized-release.yml`](../../script/ci/fork-notarized-release.yml);
-deploy it there as `.github/workflows/fork-notarized-release.yml`. It runs only by
-manual dispatch from that repository's `main` branch. The public fork's PRs never
-receive access to the signing runner.
+The dedicated private [`luzkit/warp-release`](https://github.com/luzkit/warp-release)
+repository is the new home for notarized builds using the existing Mac runner and
+Keychain. The reviewed workflow template is
+[`script/ci/fork-notarized-release.yml`](../../script/ci/fork-notarized-release.yml),
+deployed there as `.github/workflows/fork-notarized-release.yml`. It runs only by
+manual dispatch from that repository's `main` branch, and remains disabled until
+`WARP_RELEASE_ENABLED` is explicitly set to `true` after the migration checklist in
+that repository is complete. The public fork's PRs never receive access to the
+signing runner.
+
+During migration, the existing `luzkit/nab-release-app` controller remains available
+with its original workflow. The signing script accepts only the exact reviewed
+workflow on `main` in these two private controllers and records the actual controller
+in the artifact provenance. Do not remove the old controller until the dedicated
+pipeline has completed a verified release; never change the Release Manager app's
+own release workflows. Existing published installers and their provenance remain
+unchanged.
 
 1. Merge the release changes into `luzkit/warp:master`, then create an immutable tag
    such as `fork-v0.1.0` at that exact commit. Tags use `fork-vMAJOR.MINOR.PATCH`, with
    major at most 9999 and minor/patch at most 99 for Apple's bundle version format.
-2. In the private repository, run **Notarized fork macOS release** from `main` with
+2. In the private repository, run **Warp signed macOS release** from `main` with
    `release_tag` set to that tag. `preflight_only` validates the source and signing
-   setup without starting a build.
-3. The workflow resolves the tag to the current fork `master` SHA, checks the
-   existing signing identity and notarization profile, compiles on hosted macOS,
-   and sends that run's exact artifact to the Mac for signing. The signing job
-   validates source metadata, checksum, bundle identity, version, and architecture
-   without executing the downloaded app or rebuilding Rust.
+   setup without starting a build. A full release also requires
+   `allow_mac_build=true`, explicitly approving compilation on the personal Mac,
+   Developer ID signing, and submission to Apple for notarization. Leaving it false
+   stops before a Mac build. There is no hosted macOS fallback.
+3. The workflow resolves the tag to the current fork `master` SHA and runs signing
+   regression tests and packaging shell checks on the homelab Linux pool. It checks
+   the existing Mac signing identity and notarization profile, compiles the reviewed
+   source on the personal Mac, and passes that run's exact unsigned artifact to the
+   signing job. It validates source metadata, checksum, bundle identity, version,
+   and architecture without executing the downloaded app or rebuilding Rust.
 4. After the final verification job succeeds, download its exact signed artifact.
    Verify the final checksum and metadata against the resolved source, tag, signing
    team, and run. Create the fork's draft release with the DMG, checksum, metadata,
    and both accepted notarization receipts; publish only after verification.
 
 The controller intentionally has no cross-repository write credential. Publishing
-uses the release operator's existing GitHub authorization for `luzkit/warp`. This
-keeps the existing runner groups, other Mac projects, and Linux runners unchanged.
+uses the release operator's existing GitHub authorization for `luzkit/warp`. Do not
+create new credentials for this migration. Authorizing the dedicated private
+repository in the existing runner groups requires separate approval; preserve all
+existing selected repositories and leave public-repository access disabled. The Linux
+resolve/validation and final verification jobs use `[self-hosted, Linux]`, the
+labels of the existing `homelab-ci-01`, `homelab-ci-02`, and `homelab-ci-03` pool.
+Their tools are installed inside Ubuntu job containers, not on the persistent host.
+Only the private controller's manual `main` dispatch can schedule these jobs; public
+PR code never reaches the homelab or personal Mac.
 Do not overwrite a version tag or existing release assets; use a new version for
 changed source. The final publication must recheck the tag SHA and existing drafts,
 which the controller's read-only token cannot necessarily see.
 
-The existing private repository variables are `MAC_SIGNING_IDENTITY` and
-`APPLE_KEYCHAIN_PROFILE`. The workflow derives the team and full Developer ID
-selector from that identity; certificates and notarization credentials stay in the
+The private controller needs `MAC_SIGNING_IDENTITY` and
+`APPLE_KEYCHAIN_PROFILE`, copied from the existing controller as ordinary repository
+variables, plus the explicit `WARP_RELEASE_ENABLED` activation gate. The workflow
+derives the team and full Developer ID selector from that identity; certificates and notarization credentials stay in the
 runner account's Keychain. It never exports keys, imports certificates, or unlocks
 the Keychain with a password. An unavailable identity/profile stops before the
 costly build. A failed or timed-out Apple submission retains its ID in a diagnostic
 artifact; inspect that submission before retrying, rather than blindly resubmitting.
 
-Builds use GitHub's `macos-15` Apple Silicon runner, two Cargo jobs, the repository's
-pinned Rust toolchain, an optimized release profile without LTO or debug symbols,
-and dependency caching. The workflow installs Protobuf, the Metal toolchain,
-`cargo-bundle`, and `cargo-about`. It generates license attribution and settings
-schema, verifies the app signature and architecture, and verifies the disk image.
-The private controller saves dependencies in its own `main` cache; public PR
-snapshots use the fork's separate cache. Workspace crates are rebuilt rather than
-stored in the dependency cache. The existing Linux homelab runners cannot build or
-sign this native macOS app, so they are not needed for this release.
+Builds use the existing `[self-hosted, macOS, ARM64, personal-mac]` runner, two Cargo
+jobs, the repository's pinned Rust toolchain, and an optimized release profile
+without LTO or debug symbols. Each run uses its own source checkout, Cargo target
+directory, and installer output. The target directory stays within that checkout
+for the DockTilePlugin build and is removed with the checkout after the job. The
+installer is under `RUNNER_TEMP`; Cargo registry downloads remain in the runner
+account's Cargo home.
+The workflow checks preinstalled tools and does not install packages or change the
+global Xcode selection. It scopes Cargo paths, `DEVELOPER_DIR`, and Metal
+`TOOLCHAINS` to the build job. It does not restore an Actions Rust cache onto the
+persistent Mac, preserving the installed Cargo tools. Public PR snapshots retain
+their separate hosted-runner cache.
+
+The build generates license attribution and settings schema, verifies the ad-hoc
+app signature and architecture, and verifies the disk image. Linux handles source
+and artifact verification but cannot replace the native macOS compiler or Apple's
+signing tools.
+
+### Mac runner readiness and Keychain recovery
+
+A signing-ready Mac is not necessarily a Warp build-ready Mac. Its `github-runner`
+account must have the repository's pinned Rust toolchain, Protobuf, jq, pkg-config,
+Git LFS, Python 3.11+, cargo-binstall 1.18.1, cargo-bundle 0.11.0, cargo-about 0.8.4, and Xcode's
+Metal Toolchain. The current build job selects Xcode 27.2 (27B52) from
+`/Applications/Xcode-27.2.app` and Metal
+`com.apple.dt.toolchain.Metal.32023.922.4`. It checks both exact versions before
+compilation. Run **Verify Warp runner access** in `luzkit/warp-release` after merging
+the matching controller change to verify those job-scoped selections as
+`github-runner`, without a source checkout, build, signing, or Keychain access.
+Keep `/Applications/Xcode-26.3.0.app` and its Metal toolchain installed as a temporary
+rollback option until the new toolchain has completed an approved release. Do not
+silently fall back if a pinned version is unavailable; restore the prior reviewed
+workflow and its source template together if rollback is needed.
+
+Install approved system prerequisites from the administrator account and account-local Cargo tools as `github-runner`;
+do not change Homebrew ownership or grant the runner administrator access. Keep
+enough free disk space for the source, dependency cache, build output, and installer.
+
+The existing runner service uses `SessionCreate=false` in the runner account's GUI
+domain. Preserve that reviewed session configuration. `notarytool` targets the data
+protection Keychain unless given an explicit Keychain file, so an unlocked login
+Keychain file in another security session does not establish that the service can
+use its notarization profile. Test access with `preflight_only=true` from the actual
+runner. If it reports `keychainLocked`, stop and investigate the runner's login and
+service context before changing settings or credentials. Coordinate service
+maintenance with the operator; do not switch desktop users or restart a busy runner
+as an automated recovery step. Do not send passwords in chat or save them in
+repository variables, Actions secrets, or logs. No certificate export, new Apple
+credential, permission broadening, or full build is needed for this check. Apple's
+[notarization guidance](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool)
+describes the profile's default Keychain storage.
 
 ## Development snapshots
 

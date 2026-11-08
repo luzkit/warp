@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import platform
 import plistlib
+import pwd
 import re
 import shutil
 import subprocess
@@ -59,7 +60,19 @@ def preflight(signing):
     if not any(f'"{signing.identity}"' in line for line in identities.splitlines()):
         raise ValueError("The configured Developer ID identity/private key is not available in this account's Keychain")
     # Authentication must succeed before a costly build; submission history stays private.
-    run(["xcrun", "notarytool", "history", "--keychain-profile", signing.profile, "--output-format", "json"])
+    try:
+        run(["xcrun", "notarytool", "history", "--keychain-profile", signing.profile, "--output-format", "json"])
+    except subprocess.CalledProcessError as error:
+        if "keychainLocked" not in (error.stderr or "") + (error.stdout or ""):
+            raise
+        account = pwd.getpwuid(os.geteuid()).pw_name
+        raise ValueError(
+            f"The default Keychain for the macOS runner account '{account}' is locked. "
+            "Log into that account, unlock its login/default Keychain in Keychain Access, "
+            "and keep the account logged in. Unlocking another account's Keychain does not help. "
+            "Do not put the password in chat, repository variables, or workflow logs. "
+            "After unlocking, retry with preflight_only=true; no build is needed."
+        ) from error
     print("Developer ID identity and notarization profile preflight passed")
 
 

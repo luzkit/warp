@@ -41,7 +41,7 @@ GitHub state checked November 6, 2026. Open proposals and closed prototypes are 
 | Existing pane drag and transfer | Within a tab the drag uses the tree's hidden pane preview. To move a split pane to another tab, `SwitchTabFocusAndMovePane` calls `remove_pane_for_move`, switches to the target tab and calls `add_pane_as_hidden` for continued placement. A tab-bar tear-out can pass the existing pane to `add_tab_from_existing_pane`. Both rely on normal detach/attach registrations. [Pane group](../../app/src/pane_group/mod.rs) · [Workspace events](../../app/src/workspace/view.rs) |
 | Existing tab drag | Horizontal and vertical tab rows share drag state and workspace actions for tab reordering. `CrossWindowTabDrag` handles floating windows and whole-tab handoff, including platform-specific behavior. Same-window directional docking uses the normal tab row as a drag source and keeps its preview local to the existing window. [Vertical tabs](../../app/src/workspace/view/vertical_tabs.rs) · [Cross-window drag](../../app/src/workspace/cross_window_tab_drag.rs) |
 | Focus and resize | The workspace's active tab and the group's focus state coordinate pane selection and terminal focus. Terminal view layout calculates the grid size and emits a resize through the existing PTY controller. The group already defines minimum pane size, including the larger requirement when Universal Developer Input is enabled. [Group focus](../../app/src/pane_group/focus_state.rs) · [Terminal view](../../app/src/terminal/view.rs) · [PTY controller](../../app/src/terminal/writeable_pty/pty_controller.rs) |
-| Dependent views | Pane content implements attach/detach hooks. Terminal hooks update the workspace subscriptions and active-agent registrations. A group also owns hidden child-agent panes and editor-specific state. A future capability check must account for these relationships and preserve ownership through a move. [Pane interfaces](../../app/src/pane_group/pane/mod.rs) · [Pane group](../../app/src/pane_group/mod.rs) |
+| Dependent views | Pane content implements attach/detach hooks. Terminal hooks update the workspace subscriptions and active-agent registrations. A group also owns hidden child-agent panes and editor-specific state. Docking capability checks keep linked and unsupported views with their owners. Eligible moves retain the existing view and update its workspace registration. [Pane interfaces](../../app/src/pane_group/pane/mod.rs) · [Pane group](../../app/src/pane_group/mod.rs) |
 | Restoration and display topology | Workspace snapshots feed SQLite restoration. Platform windows expose fullscreen state, and the application receives screen-change notifications. Pane maximization, app fullscreen and monitor topology are separate inputs to future planning. [Persistence](../../app/src/persistence/README.md) · [App callbacks](../../app/src/lib.rs) · [macOS window](../../crates/warpui/src/platform/mac/window.rs) |
 | Keyboard and commands | Workspace and pane actions already dispatch through WarpUI. Future keyboard docking enters an explicit mode through a configurable binding and Command Palette action. [Workspace actions](../../app/src/workspace/action.rs) · [Pane actions](../../app/src/pane_group/mod.rs) |
 
@@ -99,8 +99,8 @@ The persistent-session code in the fork base changes `TerminalManager`, `Termina
 | 4. Windows and monitors | Cross-window pane and tab-layout moves, preview and tear-out, configurable empty-window cleanup, focus restoration and fullscreen-compatible alternatives. | Implemented and verified for two-window macOS workflows. Physical display and fullscreen checks are pending. |
 | 5. Intelligent layouts | Named templates, workspace snapshots, import/export, session reassignment, overflow alternatives, display profiles and recovery on display changes. | Implemented and verified on Apple Silicon macOS. Physical display transitions and other platforms are pending. |
 | 6. Advanced interaction | Multi-selection and temporary groups, drag handles, explicit keyboard docking, searchable Pane and Workspace Navigator, focus options and accessibility. | Implemented and verified on Apple Silicon macOS. Linux, Windows, and native screen-reader checks are pending. |
-| 7. Specialized content | Capability-aware movement of agent and editor views, unsaved state and parent/child dependencies, fullscreen and maximized states, and optional persistent-session lifecycle integration. | Pending |
-| 8. Hardening and rollout | Bounded preview work, measured frame and resource budgets, diagnostics, stress and session integrity testing, accessibility and platform validation, staged rollout. | Pending |
+| 7. Specialized content | Capability-aware movement of agent and editor views, unsaved state and parent/child dependencies, fullscreen and maximized states, and optional persistent-session lifecycle integration. | Implemented. Local editor movement and undo passed macOS GUI checks. Agent ownership and lifecycle restrictions passed focused unit checks. |
+| 8. Hardening and rollout | Bounded preview work, measured frame and resource budgets, diagnostics, stress and session integrity testing, accessibility and platform validation, staged rollout. | Implemented for the opt-in development build. See the performance results and remaining rollout gates below. |
 
 | ID | Approved product decision | Milestones |
 | --- | --- | --- |
@@ -185,7 +185,7 @@ On macOS and non-tiling native X11, display recovery moves an unreachable normal
 
 Open **Pane Navigator** from the Command Palette and search by pane title, tab name, or window. Use the arrow keys to browse and **Enter** to focus a result. Select panes with their checkboxes or **Shift+Enter**. The temporary selection can include terminal panes in different tabs and windows.
 
-Press **Alt+Enter** in the navigator or run **Keyboard Docking** from the Command Palette. With an empty selection, the command uses the focused terminal. Search for a pane or a new tab in an open window, choose a placement, and review the move. **Enter** commits the preview and **Escape** cancels it. A single terminal can also swap or stack within a window, or move to a new window. **Undo Pane Layout Change** reverses a group move within one window.
+Press **Alt+Enter** in the navigator or run **Keyboard Docking** from the Command Palette. With an empty selection, the command uses the focused eligible pane. Search for a pane or a new tab in an open window, choose a placement, and review the move. **Enter** commits the preview and **Escape** cancels it. A single terminal can also swap or stack within a window, or move to a new window. **Undo Pane Layout Change** reverses a group move within one window.
 
 Use **Settings → Appearance → Panes** to choose when the drag grip appears, whether focus follows moved panes, and whether the navigator announces moves and selection through assistive technology. The Command Palette also exposes these preferences.
 
@@ -195,7 +195,7 @@ Use **Settings → Appearance → Panes** to choose when the drag grip appears, 
 
 An independent live local agent can move with its terminal, including between windows. The move keeps the active conversation controller and stream attached. Linked parent and child agents, shared sessions, and cloud agent panes stay with their owners. The navigator explains the restriction when it encounters an unsupported pane.
 
-Restore a maximized pane before using group docking. In a fullscreen window, use **Keyboard Docking** or the explicit window actions for placement. For a detached persistent session, attach it through Warp’s existing session controls before moving it. A disconnected or ended terminal remains in place until the existing terminal lifecycle makes it writable again. Pane docking uses the persistent owner identity through the terminal manager.
+Restore a maximized pane before using group docking. In a fullscreen window, use **Keyboard Docking** or the explicit window actions for placement. For a detached persistent session, attach it through Warp’s existing session controls before moving it. Disconnected or ended terminals remain in place. Reconnect a disconnected terminal through its existing session controls. Pane docking uses the persistent owner identity through the terminal manager.
 
 ## Build and validation
 
@@ -330,10 +330,64 @@ Build the integration runner with `cargo build --locked -p integration --bin int
 - `test_pane_layout_resize_history_preserves_processes`
 - `test_tear_out_tab_layout_preserves_processes`
 
+### Milestones 7 and 8 verification on SANDISK SSD
+
+```sh
+"/Volumes/SANDISK SSD/git/warp-pane-management-m8/target/start"
+```
+
+The combined development build uses the separate `docking-m8-ssd` profile. To try moving an editor, open a disposable local file, type an unsaved edit, then open **Keyboard Docking** from the Command Palette with **⌘⇧P**. Search for a terminal, choose a split direction, and press Return to preview and again to commit. **Undo Pane Layout Change** should return the same editor and unsaved buffer to its previous position.
+
+Open **Pane Navigator** to see which panes can move. Linked agent panes stay with their owner, and a disconnected persistent session must first be attached through its session controls. Restore a maximized pane before docking it. Local editors can move within their current window. Keyboard docking can operate inside a fullscreen window, while pointer transfers between windows use windowed mode.
+
+Build the runner with `cargo build --locked -p integration --bin integration --features drag_tabs_to_windows`. Use `WARP_INTEGRATION=1` and `WARP_SHELL_PATH=/bin/zsh` or `/bin/bash`. Run `test_dock_editor_preserves_unsaved_buffer` for the editor workflow and `test_keyboard_docking_single_pane_actions` for stale preview rejection after a resize. Add `WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS=1` for the native fullscreen and pointer transfer cases.
+
+#### Performance method
+
+The integration runner starts 10, 50, or 100 real local PTYs in separate tabs, with a foreground job writing a tick per second in each. Each feature-off control and active preview run makes 72 pointer samples with a 40 ms pause between samples. It measures CPU scene construction and dispatch time, application CPU and resident memory, and five keyboard-to-terminal output round trips after the pointer samples. The preview run also verifies continuous output in every pane and compares terminal view and session IDs, shell and foreground process IDs, and process start times after cancel and commit. CPU scene time excludes display presentation. The pure tree benchmark separately compares the previous two projections with the one-pass partition on nested layouts. Pointer previews reuse pane rectangles within a frame and summarize labels when a preview contains more than 24 panes.
+
+```sh
+for panes in 10 50 100; do
+  for mode in baseline preview; do
+    WARP_INTEGRATION=1 WARP_SHELL_PATH=/bin/zsh \
+      WARP_DOCKING_BENCH_PANES="$panes" WARP_DOCKING_BENCH_MODE="$mode" \
+      cargo run --locked -p integration --bin integration \
+        --features drag_tabs_to_windows -- benchmark_enhanced_pane_management
+  done
+done
+cargo test --locked -p warp --lib --features gui,enhanced_pane_management,drag_tabs_to_windows \
+  benchmark_pane_layout_partition -- --ignored --nocapture
+```
+
+#### Apple Silicon macOS measurements
+
+The table shows feature-off control / active preview for the isolated debug build. CPU is normalized to one logical core. The PTY values come from five probes in each run.
+
+| Busy terminals | Pointer p95 (ms) | CPU scene p95 (ms) | Observed PTY p95 (ms) | App CPU (%) | Peak RSS (MiB) | Output ticks |
+| --- | --- | --- | --- | --- | --- | --- |
+| 10 | 1.0 / 1.8 | 9.2 / 10.6 | 33.3 / 28.6 | 21.7 / 21.4 | 400.9 / 401.0 | 34 / 32 |
+| 50 | 7.2 / 3.5 | 33.2 / 25.5 | 648.4 / 518.7 | 78.2 / 62.8 | 659.7 / 657.5 | 701 / 401 |
+
+Both measured preview sizes preserved every terminal session, shell, and foreground process through cancel and commit. The 100-terminal control produced no valid timing samples. With the Linux VM idle, the final run bootstrapped all 100 shells and received 100 foreground command start hooks, then hit the 600-second test limit in workload startup before recording live identities or sampling. The live 100-terminal preview and budget remain unverified.
+
+Use the feature-off run at the same pane count as the provisional development budget. Allow up to 2 ms or 15% more CPU scene p95, whichever gives more headroom. Allow up to 10 ms or 25% more PTY p95, 20% more normalized CPU, and 10% more peak RSS. Require output from every PTY and exact live process identity. The 10- and 50-terminal samples meet those relative budgets. The 50-terminal control had 648.4 ms observed PTY p95, so it still needs release-build profiling. The test measures CPU work and sampled terminal output. Native presentation timing is a separate rollout check.
+
+The isolated tree partition averaged 3.3, 17.0, and 38.4 µs per operation at 10, 50, and 100 panes, versus 15.5, 101.9, and 227.6 µs for the previous projection method. Each size ran 500 operations in the debug build.
+
+#### Rollout gates
+
+1. Keep `EnhancedPaneManagement` opt-in in the isolated development build and use the feature-off control for regressions.
+2. Start an internal pilot after the targeted keyboard, pointer, lifecycle, and process identity checks pass on its supported platform. Capture debug rejection reasons and repeat the benchmark on the pilot build. The diagnostics contain selected pane counts and fixed reasons.
+3. Expand to preview after verifying platform-specific window behavior, native screen readers, display changes, and the performance budgets. The release flag stays off until those checks and the preview are complete.
+
 ### Evidence log
 
 | Item | Result |
 | --- | --- |
+| Milestones 7 and 8 macOS integration checks | Twenty offscreen and two native cross-window runs passed across zsh and Bash. Tests covered unsaved editor content and undo, multi-pane keyboard docking, stale preview rejection after resize, split and nested transfers, window tear-out, layout apply and history, and flag-off tab reorder. The isolated fullscreen test timed out during the AppKit transition before reaching docking. The Mac was locked during the follow-up bundled-app check. |
+| Milestones 7 and 8 focused unit checks | All 24 passed. Coverage included live local agent movement, linked agent rejection, disconnected persistent and terminated session placeholders, maximization, editor file-tab registration, display recovery, layout history, and partition parity for nested layouts. |
+| Milestones 7 and 8 lint and SSD build | App and integration Clippy passed with warnings denied. The isolated launcher accepted `--help`. The signed `dev.warp.WarpOss` bundle passed strict verification with CDHash `98a9fdf6d6b5bafee95d35aa250b34ee56521476`. |
+| Milestones 7 and 8 platform coverage | The Linux ARM64 build reached Warp app type checking and was killed when the Docker guest ran out of memory. The temporary container was removed. Windows, physical monitor disconnect and reconnect, native screen-reader delivery, and native presentation timing remain rollout gates. |
 | Milestone 6 integration checks | Sixteen runs passed on Apple Silicon macOS across zsh and Bash. New coverage exercised mouse and keyboard selection, destination search, preview and cancellation, right-side splits, same-window group undo and redo, retained focus, groups spanning two windows, and the single-pane Swap, Stack, and New Window actions. The tests compared terminal view IDs, session IDs, shell and foreground process IDs, and process start times. Five existing docking and layout cases passed on both shells. |
 | Milestone 6 lint and SSD build | App and integration Clippy passed with warnings denied. The launcher accepted `--help` and the bundled settings schema includes the new controls. The signed `dev.warp.WarpOss` bundle passed strict signature verification with CDHash `126c45d26b82f57329c0c38e24195c1ff98e5a6f`. |
 | Milestone 6 platform coverage | Linux, Windows, and native screen-reader interaction are pending. |
@@ -360,8 +414,8 @@ Build the integration runner with `cargo build --locked -p integration --bin int
 | Targeted lint and formatting | App and integration Clippy passed with warnings denied. Repository Rust formatting and the whitespace diff check passed. |
 | Other platforms | Linux, Windows and the remaining platform matrix are pending. |
 | Compatibility with the persistent-session backend and ordinary PTY | The native run used the disposable runtime `/tmp/wpdock.9YetIM`, which retained both owner sockets after the move. The integration runner verified ordinary local PTYs under its isolated Integration channel. |
-| Performance | No measurements yet. Before rollout, measure busy workspaces at 10, 50 and 100 panes, recording preview frame time, planner cost, allocation or memory data, CPU overhead and input/output latency. Derive budgets from a feature-off baseline on the same hardware. |
-| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. Milestone 5 implementation and regression coverage `9b8d8e1f`. Milestone 6 implementation and regression coverage `dab1cc24`. |
+| Performance | See the Apple Silicon control and active-preview measurements above. |
+| Implementation and validation commit references | Design checkpoint `93aa258f`. Milestone 1 implementation and regression coverage `2823392e`. Pane menu `eb2a02d3`. Milestone 2 implementation and regression coverage `4d2f3fb0`. Milestone 3 implementation and regression coverage `8bf2a058`. Milestone 4 implementation and regression coverage `4599287a`. Milestone 5 implementation and regression coverage `9b8d8e1f`. Milestone 6 implementation and regression coverage `dab1cc24`. Milestone 7 source checkpoint `d0932f5e`. Milestone 8 preview and benchmark checkpoint `378bd144`. Combined implementation `0002c294`. |
 
 ## Contribution boundaries
 

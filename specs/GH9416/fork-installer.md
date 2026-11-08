@@ -130,11 +130,18 @@ signing tools.
 A signing-ready Mac is not necessarily a Warp build-ready Mac. Its `github-runner`
 account must have the repository's pinned Rust toolchain, Protobuf, jq, pkg-config,
 Git LFS, Python 3.11+, cargo-binstall 1.18.1, cargo-bundle 0.11.0, cargo-about 0.8.4, and Xcode's
-Metal Toolchain. The current build job selects Xcode 26.3 from
-`/Applications/Xcode-26.3.0.app` and Metal
-`com.apple.dt.toolchain.Metal.32023.864`; update these job-scoped selections when
-provisioning a different approved Xcode installation. Install approved system
-prerequisites from the administrator account and account-local Cargo tools as `github-runner`;
+Metal Toolchain. The current build job selects Xcode 27.2 (27B52) from
+`/Applications/Xcode-27.2.app` and Metal
+`com.apple.dt.toolchain.Metal.32023.922.4`. It checks both exact versions before
+compilation. Run **Verify Warp runner access** in `luzkit/warp-release` after merging
+the matching controller change to verify those job-scoped selections as
+`github-runner`, without a source checkout, build, signing, or Keychain access.
+Keep `/Applications/Xcode-26.3.0.app` and its Metal toolchain installed as a temporary
+rollback option until the new toolchain has completed an approved release. Do not
+silently fall back if a pinned version is unavailable; restore the prior reviewed
+workflow and its source template together if rollback is needed.
+
+Install approved system prerequisites from the administrator account and account-local Cargo tools as `github-runner`;
 do not change Homebrew ownership or grant the runner administrator access. Keep
 enough free disk space for the source, dependency cache, build output, and installer.
 

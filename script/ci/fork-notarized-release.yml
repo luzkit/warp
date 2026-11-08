@@ -152,8 +152,8 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_HOME: /Users/github-runner/.cargo
       RUSTUP_HOME: /Users/github-runner/.rustup
-      DEVELOPER_DIR: /Applications/Xcode-26.3.0.app/Contents/Developer
-      TOOLCHAINS: com.apple.dt.toolchain.Metal.32023.864
+      DEVELOPER_DIR: /Applications/Xcode-27.2.app/Contents/Developer
+      TOOLCHAINS: com.apple.dt.toolchain.Metal.32023.922.4
     steps:
       - name: Configure runner-local tool paths
         id: configure
@@ -196,8 +196,12 @@ jobs:
           jq --version
           pkg-config --version
           git lfs version
-          xcodebuild -version
-          xcrun -sdk macosx metal --version
+          xcode_version="$(xcodebuild -version)"
+          printf '%s\n' "$xcode_version"
+          test "$xcode_version" = $'Xcode 27.2\nBuild version 27B52'
+          metal_version="$(xcrun -sdk macosx metal --version)"
+          printf '%s\n' "$metal_version"
+          test "${metal_version%%$'\n'*}" = 'Apple metal version 32023.922 (metalfe-32023.922.4)'
       - name: Build unsigned installer
         id: bundle
         working-directory: release-control-${{ github.run_id }}-${{ github.run_attempt }}-build

@@ -4,6 +4,8 @@ mod docking;
 use std::fs;
 use std::time::Duration;
 
+#[cfg(unix)]
+pub use docking::benchmark_enhanced_pane_management;
 pub use docking::{
     test_dock_editor_preserves_unsaved_buffer,
     test_keyboard_docking_in_native_fullscreen_preserves_processes,

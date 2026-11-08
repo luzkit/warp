@@ -1202,3 +1202,122 @@ fn docking_preview_uses_nested_flex_and_window_coordinates() {
         ],
     );
 }
+
+#[cfg(not(target_family = "wasm"))]
+mod pane_layout_partition {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use super::*;
+
+    fn nested_layout(panes: &[PaneId], axis: SplitDirection) -> PaneLayout {
+        if let [pane] = panes {
+            return PaneLayout::Leaf(*pane);
+        }
+        let (first, second) = panes.split_at(panes.len() / 2);
+        let child_axis = match axis {
+            SplitDirection::Horizontal => SplitDirection::Vertical,
+            SplitDirection::Vertical => SplitDirection::Horizontal,
+        };
+        PaneLayout::Branch(
+            axis,
+            vec![
+                (3., nested_layout(first, child_axis)),
+                (2., nested_layout(second, child_axis)),
+            ],
+        )
+    }
+
+    fn fixture(count: usize) -> (PaneLayout, Vec<PaneId>, HashSet<PaneId>) {
+        let panes: Vec<_> = (0..count).map(|_| PaneId::dummy_pane_id()).collect();
+        let layout = nested_layout(&panes, SplitDirection::Horizontal);
+        let moving: Vec<_> = panes
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, pane)| (index % 3 != 1).then_some(pane))
+            .collect();
+        let selected = moving.iter().copied().collect();
+        (layout, moving, selected)
+    }
+
+    fn legacy_partition(
+        layout: &PaneLayout,
+        moving: &[PaneId],
+        selected: &HashSet<PaneId>,
+    ) -> (Option<PaneLayout>, Option<PaneLayout>) {
+        let mut selected_tree = layout.clone().into_pane_data();
+        let mut has_selection = true;
+        for pane in selected_tree.pane_ids() {
+            if !selected.contains(&pane) && !selected_tree.remove(pane) {
+                has_selection = false;
+            }
+        }
+
+        let mut remaining_tree = layout.clone().into_pane_data();
+        let mut has_remainder = true;
+        for &pane in moving {
+            has_remainder &= remaining_tree.remove(pane);
+        }
+
+        // PaneData cannot remove its last root leaf.
+        (
+            has_selection.then(|| selected_tree.layout_snapshot()),
+            has_remainder.then(|| remaining_tree.layout_snapshot()),
+        )
+    }
+
+    #[test]
+    fn partition_matches_legacy_nested_projections() {
+        for count in [10, 50, 100] {
+            let (layout, moving, selected) = fixture(count);
+            assert_eq!(
+                layout.partition_by_selection(&selected),
+                legacy_partition(&layout, &moving, &selected),
+                "{count} panes"
+            );
+        }
+    }
+
+    #[test]
+    fn partition_keeps_the_entire_tree_when_every_pane_is_selected() {
+        let panes = [
+            PaneId::dummy_pane_id(),
+            PaneId::dummy_pane_id(),
+            PaneId::dummy_pane_id(),
+        ];
+        let layout = nested_layout(&panes, SplitDirection::Horizontal);
+        let selected = panes.into_iter().collect();
+        let partition = layout.partition_by_selection(&selected);
+
+        assert_eq!(partition, legacy_partition(&layout, &panes, &selected));
+        assert_eq!(partition, (Some(layout), None));
+        assert_eq!(partition.0.unwrap().first_pane_id(), panes[0]);
+    }
+
+    #[test]
+    #[ignore = "run explicitly to measure pane layout partitioning"]
+    fn benchmark_pane_layout_partition() {
+        const ITERATIONS: u32 = 500;
+        for count in [10, 50, 100] {
+            let (layout, moving, selected) = fixture(count);
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(legacy_partition(
+                    black_box(&layout),
+                    black_box(&moving),
+                    black_box(&selected),
+                ));
+            }
+            let legacy_ns = start.elapsed().as_nanos() / u128::from(ITERATIONS);
+
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                black_box(black_box(&layout).partition_by_selection(black_box(&selected)));
+            }
+            let partition_ns = start.elapsed().as_nanos() / u128::from(ITERATIONS);
+            println!(
+                "panes={count} legacy_ns_per_op={legacy_ns} partition_ns_per_op={partition_ns} iterations={ITERATIONS}"
+            );
+        }
+    }
+}

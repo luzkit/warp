@@ -153,6 +153,46 @@ impl PaneLayout {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn partition_by_selection(
+        &self,
+        selected: &HashSet<PaneId>,
+    ) -> (Option<Self>, Option<Self>) {
+        match self {
+            Self::Leaf(pane) if selected.contains(pane) => (Some(Self::Leaf(*pane)), None),
+            Self::Leaf(pane) => (None, Some(Self::Leaf(*pane))),
+            Self::Branch(axis, children) => {
+                let mut selected_children = Vec::new();
+                let mut remaining_children = Vec::new();
+                for (weight, child) in children {
+                    let (selected_child, remaining_child) = child.partition_by_selection(selected);
+                    if let Some(child) = selected_child {
+                        selected_children.push((*weight, child));
+                    }
+                    if let Some(child) = remaining_child {
+                        remaining_children.push((*weight, child));
+                    }
+                }
+
+                let collapse = |mut children: Vec<(f32, Self)>| match children.len() {
+                    0 => None,
+                    1 => children.pop().map(|(_, child)| child),
+                    _ => Some(Self::Branch(*axis, children)),
+                };
+                (collapse(selected_children), collapse(remaining_children))
+            }
+        }
+    }
+
+    /// Returns the first pane of a nonempty layout in visual order.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn first_pane_id(&self) -> PaneId {
+        match self {
+            Self::Leaf(pane) => *pane,
+            Self::Branch(_, children) => children[0].1.first_pane_id(),
+        }
+    }
+
     fn into_node(self) -> (PaneNode, usize) {
         match self {
             Self::Leaf(id) => (PaneNode::Leaf(id), 1),

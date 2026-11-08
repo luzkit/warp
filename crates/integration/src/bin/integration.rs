@@ -385,6 +385,8 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
 
     register_test!(test_close_tab_with_long_running_process);
     register_test!(test_dock_tab_preserves_running_processes);
+    #[cfg(unix)]
+    register_test!(benchmark_enhanced_pane_management);
     register_test!(test_move_split_pane_to_new_tab_from_overflow);
     register_test!(test_dock_tab_into_nested_split);
     register_test!(test_dock_entire_tab_layout);

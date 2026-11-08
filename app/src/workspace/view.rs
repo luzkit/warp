@@ -134,7 +134,8 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
-use self::docking_overlay::{DockingPaneDrag, DockingTabDrag};
+use self::docking_overlay::{DockingDestinationPreview, DockingPaneDrag, DockingTabDrag};
+pub(super) use self::docking_overlay::init_window_docking_preview;
 pub(crate) use self::docking_overlay::{handle_docking_input, pane_drag_owns_pointer};
 use self::enhanced_docking::DockingSource;
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
@@ -12545,13 +12546,14 @@ impl Workspace {
         let tab_data = self.tabs.remove(index);
 
         let removed_pane_group_id = tab_data.pane_group.id();
+        self.cancel_docking_from_removed_group(removed_pane_group_id, ctx);
         if self
             .docking_tab_drag
             .is_some_and(|drag| drag.source == removed_pane_group_id)
         {
             tab_data.draggable_state.cancel_drag();
             tab_data.draggable_state.set_suppress_overlay_paint(false);
-            self.notify_window_docking_preview(ctx);
+            self.clear_outgoing_docking_preview(ctx);
             self.docking_tab_drag = None;
             self.current_workspace_state.is_tab_being_dragged = false;
         }
@@ -22542,8 +22544,9 @@ impl Workspace {
 
     fn render_banner_and_active_tab(
         &self,
-        app: &AppContext,
+        docking_preview: Option<&DockingDestinationPreview>,
         appearance: &Appearance,
+        app: &AppContext,
     ) -> Box<dyn Element> {
         let active_content = if FeatureFlag::AgentManagementView.is_enabled()
             && self.current_workspace_state.is_agent_management_view_open
@@ -22558,7 +22561,9 @@ impl Workspace {
                         !docking_overlay::tab_drag_owns_pointer(event, window_id, app)
                     })
                     .finish();
-                if let Some(preview) = self.render_docking_destination_preview(appearance, app) {
+                if let Some(preview) = docking_preview.and_then(|preview| {
+                    Self::render_docking_destination_preview(preview, appearance, app)
+                }) {
                     Stack::new().with_child(source).with_child(preview).finish()
                 } else {
                     source
@@ -27306,6 +27311,7 @@ impl View for Workspace {
             }
         }
 
+        let docking_preview = self.docking_destination_preview(app);
         let panels = if use_simplified_wasm_tab_bar {
             // For the simplified WASM tab bar, we want to render the tab bar on top of all other content
             // so that content being added/moved around in the workspace (for example the details panel being toggled)
@@ -27314,7 +27320,7 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(app, appearance);
+            let content = self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
@@ -27326,7 +27332,7 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(app, appearance);
+            let content = self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
             Container::new(outer_column.finish())
@@ -27386,7 +27392,7 @@ impl View for Workspace {
                 .with_uniform_padding(WORKSPACE_PADDING)
                 .finish(),
         );
-        self.render_docking_overlay(&mut stack, appearance, app);
+        self.render_docking_overlay(&mut stack, docking_preview.as_ref(), appearance, app);
 
         if !use_simplified_wasm_tab_bar
             && FeatureFlag::VerticalTabs.is_enabled()
@@ -28630,7 +28636,6 @@ impl View for Workspace {
 
     /// Update this workspace when it has been closed, but may still be restored.
     fn on_window_closed(&mut self, ctx: &mut ViewContext<Self>) {
-        self.notify_window_docking_preview(ctx);
         if !self.suppress_detach_panes_on_window_close {
             for pane_group in self.tab_views() {
                 pane_group.update(ctx, |pane_group, ctx| {
@@ -28644,6 +28649,7 @@ impl View for Workspace {
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
             registry.unregister(window_id);
         });
+        self.clear_closed_window_docking_preview(ctx);
 
         // If this workspace's close was registered as part of a tab-drag
         // handoff, clear the entry now that the workspace is gone from the

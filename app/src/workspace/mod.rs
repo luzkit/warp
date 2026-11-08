@@ -90,6 +90,7 @@ pub(crate) const MOVE_TO_OWN_TAB_LABEL: &str = "Move to own tab";
 pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
+    view::init_window_docking_preview(app);
     #[cfg(not(target_family = "wasm"))]
     app.add_singleton_model(|_| display_layouts::DisplayLayoutState::default());
     #[cfg(not(target_family = "wasm"))]

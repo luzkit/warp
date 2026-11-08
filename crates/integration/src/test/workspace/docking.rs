@@ -25,6 +25,8 @@ use super::{dispatch_mouse_event, tab_center};
 use crate::Builder;
 
 mod editor;
+#[cfg(unix)]
+mod benchmark;
 mod history;
 mod keyboard;
 mod keyboard_single;
@@ -32,6 +34,8 @@ mod rearrangement;
 mod saved_layouts;
 mod windows;
 pub use editor::test_dock_editor_preserves_unsaved_buffer;
+#[cfg(unix)]
+pub use benchmark::benchmark_enhanced_pane_management;
 pub use history::{
     test_pane_layout_resize_history_preserves_processes,
     test_pane_layout_undo_redo_preserves_processes,

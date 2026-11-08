@@ -18,9 +18,13 @@ pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+#[cfg(not(target_family = "wasm"))]
+mod pane_layouts_modal;
 #[cfg(all(target_os = "macos", feature = "local_tty"))]
 mod persistent_terminals;
 pub(crate) mod right_panel;
+#[cfg(not(target_family = "wasm"))]
+mod saved_pane_layouts;
 mod startup_directory;
 mod tab_grouping;
 #[cfg(test)]
@@ -1119,6 +1123,8 @@ pub struct Workspace {
     welcome_tips_view: ViewHandle<TipsView>,
     model_event_sender: Option<mpsc::SyncSender<ModelEvent>>,
     launch_config_save_modal: ModalViewState<LaunchConfigSaveModal>,
+    #[cfg(not(target_family = "wasm"))]
+    pane_layouts_modal: Option<ModalViewState<Modal<pane_layouts_modal::PaneLayoutsView>>>,
     tab_config_params_modal: ModalViewState<Modal<TabConfigParamsModal>>,
     session_config_modal: ModalViewState<Modal<SessionConfigModal>>,
     pending_session_config_replacement: Option<PendingSessionConfigReplacement>,
@@ -3541,6 +3547,8 @@ impl Workspace {
             previous_workspace_state: None,
             model_event_sender,
             launch_config_save_modal,
+            #[cfg(not(target_family = "wasm"))]
+            pane_layouts_modal: None,
             tab_config_params_modal,
             session_config_modal,
             pending_session_config_replacement: None,
@@ -24444,6 +24452,10 @@ impl TypedActionView for Workspace {
                     ctx.notify();
                 }
             }
+            OpenPaneLayouts => {
+                #[cfg(not(target_family = "wasm"))]
+                self.open_pane_layouts(ctx);
+            }
             UndoPaneLayoutChange => self.undo_layout_change(ctx),
             RedoPaneLayoutChange => self.redo_layout_change(ctx),
             BalancePanes => {
@@ -27896,6 +27908,14 @@ impl View for Workspace {
 
         if self.launch_config_save_modal.is_open() {
             stack.add_child(self.launch_config_save_modal.render());
+        }
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(modal) = self
+            .pane_layouts_modal
+            .as_ref()
+            .filter(|modal| modal.is_open())
+        {
+            stack.add_child(modal.render());
         }
 
         if self.tab_config_params_modal.is_open() {

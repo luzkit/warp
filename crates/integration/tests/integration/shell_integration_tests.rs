@@ -28,6 +28,8 @@ integration_tests! {
     // Test layout undo, redo, and resize preserve running bash and zsh sessions.
     test_pane_layout_undo_redo_preserves_processes,
     test_pane_layout_resize_history_preserves_processes,
+    // Test the same bash and zsh processes survive saved layout preview and apply.
+    test_saved_pane_layout_preserves_processes,
     // Test bash and zsh process identity through cross-window moves and tear-out.
     test_move_pane_between_windows_preserves_processes,
     test_tear_out_tab_layout_preserves_processes,

@@ -7,6 +7,8 @@ pub(crate) mod cli_install;
 mod close_session_confirmation_dialog;
 pub(crate) mod cross_window_tab_drag;
 pub mod delete_conversation_confirmation_dialog;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod display_layouts;
 mod global_actions;
 pub mod header_toolbar_editor;
 pub mod header_toolbar_item;
@@ -15,6 +17,8 @@ mod home;
 mod lightbox_view;
 mod native_modal;
 mod one_time_modal_model;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod pane_layouts;
 mod registry;
 pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;
@@ -84,6 +88,8 @@ pub(crate) const MOVE_TO_OWN_TAB_LABEL: &str = "Move to own tab";
 pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
+    #[cfg(not(target_family = "wasm"))]
+    app.add_singleton_model(|_| display_layouts::DisplayLayoutState::default());
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
 
@@ -112,6 +118,16 @@ pub fn init(app: &mut AppContext) {
         .with_context_predicate(id!("Workspace"))
         .with_group(bindings::BindingGroup::Terminal.as_str())
         .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:manage_pane_layouts",
+            "Manage Pane Layouts",
+            WorkspaceAction::OpenPaneLayouts,
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| {
+            cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled()
+        }),
     ]);
 
     app.register_editable_bindings([

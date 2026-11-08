@@ -28,11 +28,13 @@ pub(super) struct LayoutState {
     tabs: Vec<TabPosition>,
     layouts: HashMap<EntityId, DockingLayoutSnapshot>,
     active_tab: EntityId,
+    tab_titles: HashMap<EntityId, Option<String>>,
 }
 
 impl LayoutState {
-    fn matches(&self, current: &Self) -> bool {
+    pub(super) fn matches(&self, current: &Self) -> bool {
         self.tabs == current.tabs
+            && (self.tab_titles.is_empty() || self.tab_titles == current.tab_titles)
             && self.layouts.len() == current.layouts.len()
             && self.layouts.iter().all(|(id, expected)| {
                 current
@@ -40,6 +42,18 @@ impl LayoutState {
                     .get(id)
                     .is_some_and(|live| expected.matches(live))
             })
+    }
+
+    fn capture_tab_titles(&mut self, tabs: &[TabData], ctx: &AppContext) {
+        self.tab_titles = tabs
+            .iter()
+            .map(|tab| {
+                (
+                    tab.pane_group.id(),
+                    tab.pane_group.as_ref(ctx).custom_title(ctx),
+                )
+            })
+            .collect();
     }
 
     fn pane_owners(&self) -> HashMap<PaneId, EntityId> {
@@ -69,13 +83,17 @@ pub(super) struct LayoutHistory {
 }
 
 impl LayoutHistory {
-    fn record(&mut self, change: LayoutChange, retired: Option<RetiredLayoutTab>) {
+    fn record(
+        &mut self,
+        change: LayoutChange,
+        retired: impl IntoIterator<Item = RetiredLayoutTab>,
+    ) {
         self.redo.clear();
         if self.undo.len() == MAX_LAYOUT_CHANGES {
             self.undo.pop_front();
         }
         self.undo.push_back(change);
-        if let Some(retired) = retired {
+        for retired in retired {
             self.retired_tabs
                 .insert(retired.tab.pane_group.id(), retired);
         }
@@ -135,6 +153,7 @@ impl Workspace {
                 .collect(),
             layouts,
             active_tab: self.active_tab_pane_group().id(),
+            tab_titles: HashMap::new(),
         })
     }
 
@@ -166,6 +185,27 @@ impl Workspace {
             .chain(created)
             .filter(|id| self.get_pane_group_view_with_id(*id).is_some());
         if let Some(after) = self.capture_layout_state(present, ctx)
+            && !before.matches(&after)
+        {
+            self.layout_history
+                .record(LayoutChange { before, after }, retired);
+        }
+    }
+
+    pub(super) fn capture_saved_layout_state(&self, ctx: &AppContext) -> Option<LayoutState> {
+        let mut state =
+            self.capture_layout_state(self.tabs.iter().map(|tab| tab.pane_group.id()), ctx)?;
+        state.capture_tab_titles(&self.tabs, ctx);
+        Some(state)
+    }
+
+    pub(super) fn record_saved_layout_change(
+        &mut self,
+        before: LayoutState,
+        retired: Vec<RetiredLayoutTab>,
+        ctx: &AppContext,
+    ) {
+        if let Some(after) = self.capture_saved_layout_state(ctx)
             && !before.matches(&after)
         {
             self.layout_history
@@ -274,7 +314,12 @@ impl Workspace {
     ) -> ReplayResult {
         if !self
             .capture_layout_state(from.layouts.keys().copied(), ctx)
-            .is_some_and(|current| from.matches(&current))
+            .is_some_and(|mut current| {
+                if !from.tab_titles.is_empty() {
+                    current.capture_tab_titles(&self.tabs, ctx);
+                }
+                from.matches(&current)
+            })
         {
             return ReplayResult::Stale;
         }
@@ -352,6 +397,9 @@ impl Workspace {
                     incoming.remove(&id).unwrap_or_default(),
                     ctx,
                 );
+                if let Some(title) = to.tab_titles.get(&id) {
+                    group.set_saved_layout_tab_title(title.clone(), ctx);
+                }
             });
         }
 

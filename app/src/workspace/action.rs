@@ -160,6 +160,7 @@ pub enum WorkspaceAction {
     UndoPaneLayoutChange,
     RedoPaneLayoutChange,
     BalancePanes,
+    OpenPaneLayouts,
     RenameTab(usize),
     ResetTabName(usize),
     RenamePane(PaneViewLocator),
@@ -978,6 +979,7 @@ impl WorkspaceAction {
             | UndoPaneLayoutChange
             | RedoPaneLayoutChange
             | BalancePanes
+            | OpenPaneLayouts
             | DropTab { .. }
             | DropGroup
             | RenameTab(_)

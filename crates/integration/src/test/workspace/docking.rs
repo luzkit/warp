@@ -26,6 +26,7 @@ use crate::Builder;
 
 mod history;
 mod rearrangement;
+mod saved_layouts;
 mod windows;
 pub use history::{
     test_pane_layout_resize_history_preserves_processes,
@@ -35,6 +36,7 @@ pub use rearrangement::{
     test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
     test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
 };
+pub use saved_layouts::test_saved_pane_layout_preserves_processes;
 pub use windows::{
     test_move_pane_between_windows_preserves_processes,
     test_tear_out_tab_layout_preserves_processes,

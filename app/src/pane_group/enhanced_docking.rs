@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use warp_core::SessionId;
 use warpui::elements::DraggableState;
 use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
@@ -125,8 +127,97 @@ impl PaneGroup {
         incoming: Vec<Box<dyn AnyPaneContent>>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.panes = snapshot.tree.into_pane_data();
-        self.docked_stacks = snapshot.stacks;
+        self.replace_docking_layout(
+            snapshot.tree,
+            snapshot.stacks,
+            snapshot.focused,
+            snapshot.active_session,
+            incoming,
+            ctx,
+        );
+    }
+
+    pub(crate) fn apply_saved_layout_tree(
+        &mut self,
+        tree: PaneLayout,
+        stacks: Vec<Vec<PaneId>>,
+        focused: PaneId,
+        incoming: Vec<Box<dyn AnyPaneContent>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let stacks = stacks
+            .into_iter()
+            .map(|members| DockedStack {
+                active: members[0],
+                members,
+            })
+            .collect();
+        self.replace_docking_layout(
+            tree,
+            stacks,
+            focused,
+            focused.as_terminal_pane_id(),
+            incoming,
+            ctx,
+        );
+    }
+
+    pub(crate) fn set_saved_layout_tab_title(
+        &mut self,
+        title: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if self.custom_title != title {
+            self.custom_title = title;
+            ctx.emit(Event::PaneTitleUpdated);
+            ctx.notify();
+        }
+    }
+
+    pub(crate) fn saved_layout_session_id(&self, pane: PaneId, ctx: &AppContext) -> Option<Uuid> {
+        let terminal = self.terminal_session_by_id(pane)?;
+        #[cfg(target_os = "macos")]
+        {
+            let manager = terminal.terminal_manager(ctx);
+            let manager = manager.as_ref(ctx);
+            if manager.persistent_session_is_attached() {
+                return manager.persistent_session_id();
+            }
+        }
+
+        let view = terminal.terminal_view(ctx);
+        let session = view
+            .as_ref(ctx)
+            .active_session()
+            .as_ref(ctx)
+            .session_id(ctx)?;
+        // The session ID doubles as a shell hook authentication token. Store an opaque
+        // identifier that also distinguishes new shells restored into the same pane.
+        let mut hash = Sha256::new();
+        hash.update(b"Warp pane layout session v1");
+        hash.update(terminal.session_uuid());
+        hash.update(session.as_u64().to_le_bytes());
+        let digest = hash.finalize();
+        let mut id = [0; 16];
+        id.copy_from_slice(&digest[..16]);
+        Some(Uuid::from_bytes(id))
+    }
+
+    pub(crate) fn has_saved_layout_side_panel(&self) -> bool {
+        self.left_panel_open || self.right_panel_open
+    }
+
+    fn replace_docking_layout(
+        &mut self,
+        tree: PaneLayout,
+        stacks: Vec<DockedStack>,
+        focused: PaneId,
+        active_session: Option<TerminalPaneId>,
+        incoming: Vec<Box<dyn AnyPaneContent>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.panes = tree.into_pane_data();
+        self.docked_stacks = stacks;
         for pane in incoming {
             let id = pane.as_pane().id();
             self.pane_contents.insert(id, pane);
@@ -135,10 +226,10 @@ impl PaneGroup {
         self.pane_history
             .retain(|pane| self.pane_contents.contains_key(pane));
         self.handle_pane_count_change(ctx);
-        self.focus_pane(snapshot.focused, false, ctx);
-        self.update_pane_history(snapshot.focused);
+        self.focus_pane(focused, false, ctx);
+        self.update_pane_history(focused);
         self.focus_state.update(ctx, |state, ctx| {
-            state.set_active_session(snapshot.active_session, ctx);
+            state.set_active_session(active_session, ctx);
         });
         for pane in self.panes.pane_ids() {
             self.refresh_docked_stack_header(pane, ctx);

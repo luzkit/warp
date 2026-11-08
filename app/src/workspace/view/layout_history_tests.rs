@@ -7,11 +7,13 @@ fn change() -> LayoutChange {
         before: LayoutState {
             tabs: Vec::new(),
             layouts: Default::default(),
+            tab_titles: Default::default(),
             active_tab: EntityId::new(),
         },
         after: LayoutState {
             tabs: Vec::new(),
             layouts: Default::default(),
+            tab_titles: Default::default(),
             active_tab: EntityId::new(),
         },
     }

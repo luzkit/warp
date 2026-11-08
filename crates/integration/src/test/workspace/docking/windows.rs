@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Result, ensure};
 use pathfinder_geometry::vector::vec2f;
 use warp::integration_testing::command_palette::{
@@ -573,6 +575,14 @@ pub fn test_keyboard_docking_in_native_fullscreen_preserves_processes() -> Build
                 .add_assertion(save_active_window_id(SOURCE_WINDOW_KEY)),
         )
         .with_step(record_processes(SEPARATE_TABS))
+        .with_step(
+            TestStep::new("Activate the native window before entering fullscreen")
+                .with_action(|app, _, data| {
+                    let window = saved_window(data, SOURCE_WINDOW_KEY);
+                    app.update(|ctx| ctx.windows().show_window_and_focus_app(window));
+                })
+                .set_post_step_pause(Duration::from_millis(500)),
+        )
         .with_step(toggle_saved_window_fullscreen(
             "Enter native fullscreen",
             FullscreenState::Fullscreen,
@@ -589,7 +599,9 @@ pub fn test_keyboard_docking_in_native_fullscreen_preserves_processes() -> Build
             TestStep::new("Find the second tab as a destination").with_typed_characters(&["Tab 2"]),
         )
         .with_step(TestStep::new("Choose the destination pane").with_keystrokes(&["enter"]))
-        .with_step(TestStep::new("Find the right split placement").with_typed_characters(&["Right"]))
+        .with_step(
+            TestStep::new("Find the right split placement").with_typed_characters(&["Right"]),
+        )
         .with_step(
             TestStep::new("Preview the right split in fullscreen")
                 .with_keystrokes(&["enter"])
@@ -642,7 +654,6 @@ fn toggle_saved_window_fullscreen(name: &str, expected: FullscreenState) -> Test
     TestStep::new(name)
         .with_action(|app, _, data| {
             let window = saved_window(data, SOURCE_WINDOW_KEY);
-            app.update(|ctx| ctx.windows().show_window_and_focus_app(window));
             workspace_view(app, window).update(app, |_, ctx| ctx.toggle_fullscreen());
         })
         .add_named_assertion_with_data_from_prior_step(
@@ -663,7 +674,9 @@ fn assert_window_fullscreen(
         let windows = ctx.windows();
         (
             windows.active_window(),
-            windows.platform_window(window).map(|window| window.fullscreen_state()),
+            windows
+                .platform_window(window)
+                .map(|window| window.fullscreen_state()),
         )
     });
     async_assert!(

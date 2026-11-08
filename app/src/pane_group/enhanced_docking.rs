@@ -108,9 +108,16 @@ impl PaneGroup {
     fn docking_pane_identity(&self, pane: PaneId, ctx: &AppContext) -> Option<DockingPaneIdentity> {
         if let Some(terminal) = self.terminal_session_by_id(pane) {
             let view = terminal.terminal_view(ctx);
-            let session = view.as_ref(ctx).active_session().as_ref(ctx).session_id(ctx);
+            let session = view
+                .as_ref(ctx)
+                .active_session()
+                .as_ref(ctx)
+                .session_id(ctx);
             #[cfg(target_os = "macos")]
-            let persistent_owner = terminal.terminal_manager(ctx).as_ref(ctx).persistent_session_id();
+            let persistent_owner = terminal
+                .terminal_manager(ctx)
+                .as_ref(ctx)
+                .persistent_session_id();
             #[cfg(not(target_os = "macos"))]
             let persistent_owner = None;
             return Some(DockingPaneIdentity::Terminal {
@@ -151,7 +158,9 @@ impl PaneGroup {
         ctx: &AppContext,
     ) -> Option<&'static str> {
         let group = handle.as_ref(ctx);
-        if group.is_focused_pane_maximized(ctx) || (group.right_panel_open && group.is_right_panel_maximized) {
+        if group.is_focused_pane_maximized(ctx)
+            || (group.right_panel_open && group.is_right_panel_maximized)
+        {
             return Some("Restore the maximized pane before docking.");
         }
         if group.child_agent_origin.is_some() || !group.child_agent_panes.is_empty() {
@@ -165,7 +174,10 @@ impl PaneGroup {
         {
             return Some("Turn off synchronized input before docking.");
         }
-        group.panes.pane_ids().into_iter()
+        group
+            .panes
+            .pane_ids()
+            .into_iter()
             .find_map(|pane| group.docking_content_restriction(pane, ctx))
     }
 
@@ -223,7 +235,9 @@ impl PaneGroup {
                 members,
             })
             .collect();
-        let active_session = focused.as_terminal_pane_id().or_else(|| self.active_session_id(ctx));
+        let active_session = focused
+            .as_terminal_pane_id()
+            .or_else(|| self.active_session_id(ctx));
         self.replace_docking_layout(tree, stacks, focused, active_session, incoming, ctx);
     }
 
@@ -293,9 +307,14 @@ impl PaneGroup {
         self.handle_pane_count_change(ctx);
         self.focus_pane(focused, false, ctx);
         self.update_pane_history(focused);
-        let active_session = active_session.filter(|session| {
-            self.pane_contents.contains_key(&PaneId::from(*session))
-        }).or_else(|| self.panes.pane_ids().into_iter().find_map(|pane| pane.as_terminal_pane_id()));
+        let active_session = active_session
+            .filter(|session| self.pane_contents.contains_key(&PaneId::from(*session)))
+            .or_else(|| {
+                self.panes
+                    .pane_ids()
+                    .into_iter()
+                    .find_map(|pane| pane.as_terminal_pane_id())
+            });
         self.focus_state.update(ctx, |state, ctx| {
             state.set_active_session(active_session, ctx);
         });

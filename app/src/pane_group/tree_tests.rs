@@ -1206,7 +1206,8 @@ fn docking_preview_uses_nested_flex_and_window_coordinates() {
 #[cfg(not(target_family = "wasm"))]
 mod pane_layout_partition {
     use std::hint::black_box;
-    use std::time::Instant;
+
+    use instant::Instant;
 
     use super::*;
 

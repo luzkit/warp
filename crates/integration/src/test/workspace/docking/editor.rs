@@ -23,15 +23,23 @@ const UNSAVED: &str = "edited in memory before docking";
 
 fn editor_id(app: &App, window: WindowId, tab: usize) -> Option<EntityId> {
     let group = pane_group_view(app, window, tab);
-    group.read(app, |group, ctx| group.code_views(ctx).first().map(|view| view.id()))
+    group.read(app, |group, ctx| {
+        group.code_views(ctx).first().map(|view| view.id())
+    })
 }
 
 fn test_path() -> PathBuf {
-    std::env::var_os(EDITOR_PATH).expect("Test file path is set").into()
+    std::env::var_os(EDITOR_PATH)
+        .expect("Test file path is set")
+        .into()
 }
 
 fn assert_dirty_editor(tab: usize) -> TestStep {
-    let select_all = if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" };
+    let select_all = if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    };
     TestStep::new("Read the live editor and its on-disk file")
         .with_keystrokes(&[select_all])
         .add_named_assertion_with_data_from_prior_step(
@@ -63,7 +71,11 @@ fn assert_dirty_editor(tab: usize) -> TestStep {
 
 pub fn test_dock_editor_preserves_unsaved_buffer() -> Builder {
     FeatureFlag::EnhancedPaneManagement.set_enabled(true);
-    let select_all = if cfg!(target_os = "macos") { "cmd-a" } else { "ctrl-a" };
+    let select_all = if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    };
     Builder::new()
         .with_setup(|utils| {
             let path = utils.test_dir().join("docking-editor.txt");
@@ -75,10 +87,13 @@ pub fn test_dock_editor_preserves_unsaved_buffer() -> Builder {
             TestStep::new("Open a local file in a new editor tab")
                 .with_action(|app, window, _| {
                     workspace_view(app, window).update(app, |workspace, ctx| {
-                        workspace.handle_action(&WorkspaceAction::OpenFileInNewTab {
-                            full_path: test_path(),
-                            line_and_column: None,
-                        }, ctx);
+                        workspace.handle_action(
+                            &WorkspaceAction::OpenFileInNewTab {
+                                full_path: test_path(),
+                                line_and_column: None,
+                            },
+                            ctx,
+                        );
                     });
                 })
                 .add_assertion(assert_tab_count(2))
@@ -102,11 +117,16 @@ pub fn test_dock_editor_preserves_unsaved_buffer() -> Builder {
         .with_steps(
             open_command_palette_and_run_action("Keyboard Docking").add_named_assertion(
                 "The docking destination search is visible",
-                |app, window| async_assert!(saved_bounds(app, window, "pane_navigator:search").is_some()),
+                |app, window| {
+                    async_assert!(saved_bounds(app, window, "pane_navigator:search").is_some())
+                },
             ),
         )
         .with_step(TestStep::new("Find the terminal tab").with_typed_characters(&["Tab 1"]))
-        .with_step(TestStep::new("Choose the terminal as the split destination").with_keystrokes(&["enter"]))
+        .with_step(
+            TestStep::new("Choose the terminal as the split destination")
+                .with_keystrokes(&["enter"]),
+        )
         .with_step(TestStep::new("Search for the right split").with_typed_characters(&["Right"]))
         .with_step(
             TestStep::new("Preview a split with the live editor")
@@ -124,9 +144,6 @@ pub fn test_dock_editor_preserves_unsaved_buffer() -> Builder {
         )
         .with_step(assert_dirty_editor(0))
         .with_steps(open_command_palette_and_run_action(UNDO_LAYOUT))
-        .with_step(
-            TestStep::new("Undo restores the editor tab")
-                .add_assertion(assert_tab_count(2)),
-        )
+        .with_step(TestStep::new("Undo restores the editor tab").add_assertion(assert_tab_count(2)))
         .with_step(assert_dirty_editor(1))
 }

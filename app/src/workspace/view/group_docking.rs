@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use pathfinder_geometry::rect::RectF;
@@ -151,7 +152,8 @@ fn docking_group(
     if workspace.has_docking_child_tab(group, ctx) {
         return Err("Keep linked agent panes in their original tab.");
     }
-    let index = workspace.window_docking_tab_index(group, ctx)
+    let index = workspace
+        .window_docking_tab_index(group, ctx)
         .ok_or("This tab is unavailable for docking.");
     let handle = &workspace.tabs[index?].pane_group;
     let group = handle.as_ref(ctx);
@@ -222,18 +224,34 @@ pub(super) fn plan_group_dock(
     let mut seen = HashSet::new();
     let mut editor_files = HashSet::new();
     let mut groups = Vec::<SourceGroup>::new();
+    let mut source_groups = HashMap::new();
     for &source in sources {
         if !seen.insert(source.pane_id) {
             return Err("A pane appears more than once in the selection.".to_owned());
         }
-        let source_workspace = docking_workspace(source.window_id, ctx)
-            .ok_or_else(|| "A selected pane’s window is unavailable.".to_owned())?;
-        let source_workspace = source_workspace.as_ref(ctx);
-        if source_workspace.team_uid(ctx) != team {
-            return Err("Move panes between windows in the same team.".to_owned());
-        }
-        let group = docking_group(source_workspace, source.pane_group_id, ctx)
-            .map_err(str::to_owned)?;
+        let (index, group) = match source_groups.entry(source.key()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let source_workspace = docking_workspace(source.window_id, ctx)
+                    .ok_or_else(|| "A selected pane’s window is unavailable.".to_owned())?;
+                let source_workspace = source_workspace.as_ref(ctx);
+                if source_workspace.team_uid(ctx) != team {
+                    return Err("Move panes between windows in the same team.".to_owned());
+                }
+                let group = docking_group(source_workspace, source.pane_group_id, ctx)
+                    .map_err(str::to_owned)?;
+                let snapshot = PaneGroup::capture_docking_layout(&group, ctx)
+                    .ok_or_else(|| "A selected tab is unavailable for docking.".to_owned())?;
+                let index = groups.len();
+                groups.push(SourceGroup {
+                    key: source.key(),
+                    snapshot,
+                    moving: Vec::new(),
+                    remaining: None,
+                });
+                entry.insert((index, group))
+            }
+        };
         let group_ref = group.as_ref(ctx);
         if !group_ref.has_pane_id(source.pane_id) {
             return Err("A selected pane is no longer available for docking.".to_owned());
@@ -248,50 +266,26 @@ pub(super) fn plan_group_dock(
                 }
             }
         }
-        if let Some(source_group) = groups.iter_mut().find(|group| group.key == source.key()) {
-            source_group.moving.push(source.pane_id);
-        } else {
-            let snapshot = PaneGroup::capture_docking_layout(&group, ctx)
-                .ok_or_else(|| "A selected tab is unavailable for docking.".to_owned())?;
-            groups.push(SourceGroup {
-                key: source.key(),
-                snapshot,
-                moving: vec![source.pane_id],
-                remaining: None,
-            });
-        }
+        groups[*index].moving.push(source.pane_id);
     }
 
     let mut subtrees = Vec::with_capacity(groups.len());
     for group in &mut groups {
         let moving: HashSet<_> = group.moving.iter().copied().collect();
-        let snapshot = &group.snapshot.tree;
-        let mut selected = snapshot.clone().into_pane_data();
-        for pane in selected.pane_ids() {
-            if !moving.contains(&pane) {
-                selected.remove(pane);
-            }
-        }
-        subtrees.push(selected.layout_snapshot());
-
-        let mut remaining = snapshot.clone().into_pane_data();
-        if group.moving.len() != remaining.len() {
-            for &pane in &group.moving {
-                remaining.remove(pane);
-            }
-            let workspace = docking_workspace(group.key.0, ctx).expect("Validated source window");
-            let original_focus = workspace
-                .as_ref(ctx)
-                .get_pane_group_view_with_id(group.key.1)
-                .expect("Validated source tab")
-                .as_ref(ctx)
-                .focused_pane_id(ctx);
-            let focused = if remaining.is_pane_in_tree(original_focus) {
+        let (selected, remaining) = group.snapshot.tree.partition_by_selection(&moving);
+        subtrees.push(
+            selected.ok_or_else(|| "The selected panes are unavailable for docking.".to_owned())?,
+        );
+        if let Some(remaining) = remaining {
+            let source = source_groups[&group.key].1.as_ref(ctx);
+            let original_focus = source.focused_pane_id(ctx);
+            let focused = if !moving.contains(&original_focus) && source.has_pane_id(original_focus)
+            {
                 original_focus
             } else {
-                remaining.pane_ids()[0]
+                remaining.first_pane_id()
             };
-            group.remaining = Some((remaining.layout_snapshot(), focused));
+            group.remaining = Some((remaining, focused));
         }
     }
 
@@ -300,25 +294,36 @@ pub(super) fn plan_group_dock(
             if seen.contains(&target.pane_id) {
                 return Err("Choose a destination outside the selection.".to_owned());
             }
-            let target_group = docking_group(workspace, target.pane_group_id, ctx)
-                .map_err(str::to_owned)?;
+            let source_group = source_groups.get(&target.key());
+            let target_group = match source_group {
+                Some((_, group)) => group.clone(),
+                None => {
+                    docking_group(workspace, target.pane_group_id, ctx).map_err(str::to_owned)?
+                }
+            };
             let target_ref = target_group.as_ref(ctx);
             if !target_ref.has_pane_id(target.pane_id) {
                 return Err("The destination pane is unavailable for docking.".to_owned());
             }
-            if !editor_files.is_empty() && target_ref.pane_ids()
-                .filter(|pane| !seen.contains(pane))
-                .filter_map(|pane| target_ref.code_pane_by_id(pane))
-                .flat_map(|editor| editor.docking_locations(ctx))
-                .any(|file| editor_files.contains(&file))
+            if !editor_files.is_empty()
+                && target_ref
+                    .pane_ids()
+                    .filter(|pane| !seen.contains(pane))
+                    .filter_map(|pane| target_ref.code_pane_by_id(pane))
+                    .flat_map(|editor| editor.docking_locations(ctx))
+                    .any(|file| editor_files.contains(&file))
             {
-                return Err("The destination already has one of the selected files open.".to_owned());
+                return Err(
+                    "The destination already has one of the selected files open.".to_owned(),
+                );
             }
-            let snapshot = PaneGroup::capture_docking_layout(&target_group, ctx)
-                .ok_or_else(|| "The destination tab is unavailable for docking.".to_owned())?;
-            let destination_tree = groups
-                .iter()
-                .find(|group| group.key == target.key())
+            let snapshot = match source_group {
+                Some((index, _)) => groups[*index].snapshot.clone(),
+                None => PaneGroup::capture_docking_layout(&target_group, ctx)
+                    .ok_or_else(|| "The destination tab is unavailable for docking.".to_owned())?,
+            };
+            let destination_tree = source_group
+                .map(|(index, _)| &groups[*index])
                 .and_then(|group| group.remaining.as_ref().map(|(tree, _)| tree))
                 .unwrap_or(&snapshot.tree);
             let axes = match direction {
@@ -367,7 +372,9 @@ pub(super) fn plan_group_dock(
         destination_snapshot,
         destination_tree,
         viewport,
-        fullscreen_state: ctx.windows().platform_window(destination_window)
+        fullscreen_state: ctx
+            .windows()
+            .platform_window(destination_window)
             .map(|window| window.fullscreen_state()),
         preview,
     })
@@ -412,8 +419,13 @@ pub(super) fn commit_group_dock(
     ctx: &mut AppContext,
 ) -> Result<(), String> {
     let stale = || "The panes or window changed. Preview the move again.".to_owned();
-    let current = plan_group_dock(&plan.sources, plan.destination, ctx).map_err(|_| stale())?;
+    let count = plan.sources.len();
+    let current = plan_group_dock(&plan.sources, plan.destination, ctx).map_err(|reason| {
+        log::debug!("Docking commit rejected for {count} selected panes: {reason}");
+        stale()
+    })?;
     if !plan.matches(&current) {
+        log::debug!("Docking commit rejected for {count} selected panes: preview changed");
         return Err(stale());
     }
 

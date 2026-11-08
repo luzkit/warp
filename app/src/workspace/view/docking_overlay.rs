@@ -323,12 +323,10 @@ fn supports_window_docking_pointer(window: WindowId, app: &AppContext) -> bool {
             .is_some_and(|window| window.fullscreen_state() != FullscreenState::Fullscreen)
 }
 
-fn publish_window_docking_preview(
-    source: WindowId,
-    drop: WindowDockingDrop,
-    app: &mut AppContext,
-) {
-    let preview = drop.preview_window().map(|_| IncomingPreview { source, drop });
+fn publish_window_docking_preview(source: WindowId, drop: WindowDockingDrop, app: &mut AppContext) {
+    let preview = drop
+        .preview_window()
+        .map(|_| IncomingPreview { source, drop });
     replace_window_docking_preview(preview, app);
 }
 
@@ -482,7 +480,8 @@ impl Workspace {
         let Some(group) = workspace.get_pane_group_view(workspace.active_tab_index) else {
             return WindowDockingDrop::Invalid;
         };
-        let Some(mut target) = workspace.docking_target_geometry(group.id(), cursor, None, app) else {
+        let Some(mut target) = workspace.docking_target_geometry(group.id(), cursor, None, app)
+        else {
             return WindowDockingDrop::Invalid;
         };
         let can_split = |direction| {
@@ -518,23 +517,29 @@ impl Workspace {
         drop: WindowDockingDrop,
         ctx: &mut ViewContext<Self>,
     ) {
-        match drop {
-            WindowDockingDrop::Tab { window, index, .. } => {
-                self.move_docking_source_to_window(source, window, Some(index), ctx);
-            }
+        let (placement, committed) = match drop {
+            WindowDockingDrop::Tab { window, index, .. } => (
+                "tab",
+                self.move_docking_source_to_window(source, window, Some(index), ctx),
+            ),
             WindowDockingDrop::Split {
                 window,
                 locator,
                 operation,
                 bounds,
                 ..
-            } => {
-                self.dock_across_windows(source, window, locator, operation, bounds, ctx);
-            }
-            WindowDockingDrop::TearOut(bounds) => {
-                self.tear_out_docking_source(source, Some(bounds), ctx);
-            }
-            WindowDockingDrop::Local | WindowDockingDrop::Invalid => {}
+            } => (
+                "split",
+                self.dock_across_windows(source, window, locator, operation, bounds, ctx),
+            ),
+            WindowDockingDrop::TearOut(bounds) => (
+                "new window",
+                self.tear_out_docking_source(source, Some(bounds), ctx),
+            ),
+            WindowDockingDrop::Local | WindowDockingDrop::Invalid => return,
+        };
+        if !committed {
+            log::debug!("Pointer docking commit rejected for {placement} placement");
         }
     }
 
@@ -796,7 +801,11 @@ impl Workspace {
         let surface =
             app.element_position_by_id_at_last_frame(self.window_id, DOCKING_SURFACE_POSITION)?;
         let rectangles = group.as_ref(app).docking_preview_rects(surface, app);
-        Some(DockingDestinationPreview { group, surface, rectangles })
+        Some(DockingDestinationPreview {
+            group,
+            surface,
+            rectangles,
+        })
     }
 
     pub(super) fn render_docking_destination_preview(
@@ -816,7 +825,10 @@ impl Workspace {
         for &(pane, bounds) in &geometry.rectangles {
             let border = Border::all(1.).with_border_fill(theme.accent().with_opacity(45));
             let tile = if dense {
-                Rect::new().with_background(color).with_border(border).finish()
+                Rect::new()
+                    .with_background(color)
+                    .with_border(border)
+                    .finish()
             } else {
                 let title = group
                     .pane_by_id(pane)
@@ -828,7 +840,8 @@ impl Workspace {
                             .unwrap_or_else(|| configuration.title())
                     })
                     .filter(|title| !title.is_empty());
-                let label = title.map_or_else(|| "Pane".to_owned(), |title| format!("Pane ({title})"));
+                let label =
+                    title.map_or_else(|| "Pane".to_owned(), |title| format!("Pane ({title})"));
                 Container::new(
                     Align::new(
                         Text::new_inline(label, appearance.ui_font_family(), 12.)
@@ -886,7 +899,8 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         let source = DockingSource::Pane(drag.source);
-        if let Some(target) = self.docking_target(source, drag.destination, cursor, false, None, ctx)
+        if let Some(target) =
+            self.docking_target(source, drag.destination, cursor, false, None, ctx)
             && let Some(operation) = target.operation_at(cursor, false)
         {
             self.dock(source, target.locator, operation, target.bounds, ctx);
@@ -1032,7 +1046,8 @@ impl Workspace {
         let group = preview
             .map(|preview| &preview.group)
             .or_else(|| {
-                self.tabs.iter()
+                self.tabs
+                    .iter()
                     .find(|tab| tab.pane_group.id() == destination && !tab.detached)
                     .map(|tab| &tab.pane_group)
             })?
@@ -1050,7 +1065,11 @@ impl Workspace {
                 bounds.contains_point(cursor).then_some((pane_id, bounds))
             })
         } else if let Some(preview) = preview {
-            preview.rectangles.iter().copied().find(|(_, bounds)| bounds.contains_point(cursor))
+            preview
+                .rectangles
+                .iter()
+                .copied()
+                .find(|(_, bounds)| bounds.contains_point(cursor))
         } else {
             let surface =
                 app.element_position_by_id_at_last_frame(self.window_id, DOCKING_SURFACE_POSITION)?;
@@ -1195,7 +1214,8 @@ impl Workspace {
             return;
         };
         let theme = appearance.theme();
-        let Some(target) = self.docking_target(source, destination, cursor, flatten, preview, app) else {
+        let Some(target) = self.docking_target(source, destination, cursor, flatten, preview, app)
+        else {
             if matches!(source, DockingSource::Pane(_))
                 && tab_bar_rects_for_window(self.window_id, app)
                     .iter()

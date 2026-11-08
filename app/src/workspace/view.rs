@@ -134,8 +134,8 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
-use self::docking_overlay::{DockingDestinationPreview, DockingPaneDrag, DockingTabDrag};
 pub(super) use self::docking_overlay::init_window_docking_preview;
+use self::docking_overlay::{DockingDestinationPreview, DockingPaneDrag, DockingTabDrag};
 pub(crate) use self::docking_overlay::{handle_docking_input, pane_drag_owns_pointer};
 use self::enhanced_docking::DockingSource;
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
@@ -15135,8 +15135,14 @@ impl Workspace {
         self.tab_bar_pinned_by_popup = false;
         self.sync_window_button_visibility(ctx);
         #[cfg(not(target_family = "wasm"))]
-        let pane_modal_open = self.pane_navigator_modal.as_ref().is_some_and(ModalViewState::is_open)
-            || self.pane_layouts_modal.as_ref().is_some_and(ModalViewState::is_open);
+        let pane_modal_open = self
+            .pane_navigator_modal
+            .as_ref()
+            .is_some_and(ModalViewState::is_open)
+            || self
+                .pane_layouts_modal
+                .as_ref()
+                .is_some_and(ModalViewState::is_open);
         #[cfg(target_family = "wasm")]
         let pane_modal_open = false;
         if focus_active_tab
@@ -27320,7 +27326,8 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
+            let content =
+                self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
@@ -27332,7 +27339,8 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
+            let content =
+                self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
             Container::new(outer_column.finish())

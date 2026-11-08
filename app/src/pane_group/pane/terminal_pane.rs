@@ -216,7 +216,8 @@ impl TerminalPane {
             let manager = self.terminal_manager(ctx);
             let manager = manager.as_ref(ctx);
             if manager.persistent_session_id().is_some()
-                && (self.persistent_session_ending.get() || !manager.persistent_session_is_attached())
+                && (self.persistent_session_ending.get()
+                    || !manager.persistent_session_is_attached())
             {
                 return Some("Attach this persistent session before docking.");
             }
@@ -474,7 +475,10 @@ impl PaneContent for TerminalPane {
 
         let terminal_view = self.terminal_view(ctx);
         let preserve_agent_stream = matches!(detach_type, DetachType::Moved)
-            && terminal_view.as_ref(ctx).active_conversation_id(ctx).is_some()
+            && terminal_view
+                .as_ref(ctx)
+                .active_conversation_id(ctx)
+                .is_some()
             && self.docking_restriction(ctx).is_none();
 
         // Unsubscribe from all views in the pane stack.

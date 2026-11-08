@@ -2375,7 +2375,12 @@ fn test_docking_moves_live_local_agent_conversation_without_closing_it() {
             assert!(PaneGroup::can_dock_terminal_pane(&source, pane, ctx));
             let target = get_newly_created_pane_id(destination.as_ref(ctx), &[]);
             assert!(PaneGroup::dock_terminal_pane_between_tabs(
-                &source, pane, &destination, target, Direction::Right, ctx,
+                &source,
+                pane,
+                &destination,
+                target,
+                Direction::Right,
+                ctx,
             ));
         });
 
@@ -2391,13 +2396,18 @@ fn test_docking_moves_live_local_agent_conversation_without_closing_it() {
             assert_eq!(terminal.active_conversation_id(ctx), Some(conversation_id));
             let controller = terminal.agent_view_controller();
             assert_eq!(controller.id(), controller_id);
-            assert_eq!(controller.as_ref(ctx).pane_group_id(), Some(destination.id()));
+            assert_eq!(
+                controller.as_ref(ctx).pane_group_id(),
+                Some(destination.id())
+            );
             assert_eq!(
                 BlocklistAIHistoryModel::as_ref(ctx)
                     .terminal_surface_id_for_conversation(&conversation_id),
                 Some(terminal_view_id)
             );
-            assert!(ActiveAgentViewsModel::as_ref(ctx).is_terminal_view_attached(terminal_view_id, ctx));
+            assert!(
+                ActiveAgentViewsModel::as_ref(ctx).is_terminal_view_attached(terminal_view_id, ctx)
+            );
         });
         assert!(!conversation_closed.get());
     });
@@ -2427,7 +2437,10 @@ fn test_docking_keeps_linked_agent_conversations_in_place() {
             );
             assert!(!PaneGroup::can_dock_terminal_pane(&source, pane, ctx));
             assert_eq!(
-                terminal.terminal_view(ctx).as_ref(ctx).active_conversation_id(ctx),
+                terminal
+                    .terminal_view(ctx)
+                    .as_ref(ctx)
+                    .active_conversation_id(ctx),
                 Some(conversation_id)
             );
         });

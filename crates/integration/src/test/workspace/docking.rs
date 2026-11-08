@@ -24,18 +24,18 @@ use warpui_core::{App, EntityId, TypedActionView, WindowId, async_assert, async_
 use super::{dispatch_mouse_event, tab_center};
 use crate::Builder;
 
-mod editor;
 #[cfg(unix)]
 mod benchmark;
+mod editor;
 mod history;
 mod keyboard;
 mod keyboard_single;
 mod rearrangement;
 mod saved_layouts;
 mod windows;
-pub use editor::test_dock_editor_preserves_unsaved_buffer;
 #[cfg(unix)]
 pub use benchmark::benchmark_enhanced_pane_management;
+pub use editor::test_dock_editor_preserves_unsaved_buffer;
 pub use history::{
     test_pane_layout_resize_history_preserves_processes,
     test_pane_layout_undo_redo_preserves_processes,
@@ -48,8 +48,8 @@ pub use rearrangement::{
 };
 pub use saved_layouts::test_saved_pane_layout_preserves_processes;
 pub use windows::{
-    test_keyboard_docking_in_native_fullscreen_preserves_processes,
     test_keyboard_docking_groups_panes_across_windows,
+    test_keyboard_docking_in_native_fullscreen_preserves_processes,
     test_move_pane_between_windows_preserves_processes,
     test_tear_out_tab_layout_preserves_processes,
 };

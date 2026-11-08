@@ -58,7 +58,11 @@ impl CodePane {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn docking_locations(&self, ctx: &AppContext) -> Vec<LocalOrRemotePath> {
-        self.file_view(ctx).as_ref(ctx).open_file_locations().cloned().collect()
+        self.file_view(ctx)
+            .as_ref(ctx)
+            .open_file_locations()
+            .cloned()
+            .collect()
     }
 
     pub fn editor_status(&self, app: &AppContext) -> CodeEditorStatus {

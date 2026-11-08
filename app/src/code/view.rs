@@ -677,7 +677,11 @@ impl CodeView {
             return Some("Remote file editors cannot be docked.");
         }
         if self.drag_position.is_some()
-            || self.tab_group.iter().any(|tab| tab.mouse_state_handles.tab_draggable_state.is_tracking_pointer())
+            || self.tab_group.iter().any(|tab| {
+                tab.mouse_state_handles
+                    .tab_draggable_state
+                    .is_tracking_pointer()
+            })
         {
             return Some("Finish reordering editor tabs before docking this editor.");
         }

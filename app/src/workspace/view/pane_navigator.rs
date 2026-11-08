@@ -19,8 +19,8 @@ use warpui::{
 use super::Workspace;
 use super::enhanced_docking::DockingOperation;
 use super::group_docking::{
-    GroupDockDestination, GroupDockPlan, PaneLocation, PaneSelection, pane_selection_restriction,
-    commit_group_dock, plan_group_dock,
+    GroupDockDestination, GroupDockPlan, PaneLocation, PaneSelection, commit_group_dock,
+    pane_selection_restriction, plan_group_dock,
 };
 use crate::appearance::Appearance;
 use crate::editor::{
@@ -72,6 +72,8 @@ enum Choice {
 struct Row {
     title: String,
     detail: String,
+    search_text: String,
+    search_title_end: usize,
     restriction: Option<&'static str>,
     choice: Choice,
     activate_mouse: MouseStateHandle,
@@ -80,9 +82,14 @@ struct Row {
 
 impl Row {
     fn new(title: String, detail: String, choice: Choice) -> Self {
+        let normalized_title = title.to_lowercase();
+        let search_title_end = normalized_title.len();
+        let search_text = format!("{normalized_title} {}", detail.to_lowercase());
         Self {
             title,
             detail,
+            search_text,
+            search_title_end,
             restriction: None,
             choice,
             activate_mouse: Default::default(),
@@ -91,14 +98,19 @@ impl Row {
     }
 
     fn matches(&self, query: &str) -> bool {
-        if query.is_empty() {
-            return true;
-        }
-        let title = self.title.to_lowercase();
-        let detail = self.detail.to_lowercase();
         query
             .split_whitespace()
-            .all(|word| title.contains(word) || detail.contains(word))
+            .all(|word| self.search_text.contains(word))
+    }
+
+    fn match_rank(&self, query: &str) -> u8 {
+        if &self.search_text[..self.search_title_end] == query {
+            0
+        } else if self.search_text.contains(query) {
+            1
+        } else {
+            2
+        }
     }
 }
 
@@ -261,16 +273,7 @@ impl PaneNavigatorView {
                 let query = self.query.trim();
                 let first = self
                     .visible_rows()
-                    .min_by_key(|(_, row)| {
-                        let title = row.title.to_lowercase();
-                        if title == query {
-                            0
-                        } else if format!("{title} {}", row.detail.to_lowercase()).contains(query) {
-                            1
-                        } else {
-                            2
-                        }
-                    })
+                    .min_by_key(|(_, row)| row.match_rank(query))
                     .map(|(index, _)| index);
                 self.selected = first;
                 self.scroll = Default::default();
@@ -549,7 +552,11 @@ impl PaneNavigatorView {
                     ctx,
                 );
             }
-            Err(message) => self.show_notice(message, ctx),
+            Err(message) => {
+                let count = sources.len();
+                log::debug!("Docking preview rejected for {count} selected panes: {message}");
+                self.show_notice(message, ctx);
+            }
         }
     }
 

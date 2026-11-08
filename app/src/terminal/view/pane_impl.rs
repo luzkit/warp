@@ -106,9 +106,9 @@ impl TerminalView {
         {
             let remote = RemoteServerManager::as_ref(ctx);
             if remote.session(session_id).is_some()
-                && !remote
+                && remote
                     .client_for_session(session_id)
-                    .is_some_and(|client| !client.is_disconnected())
+                    .is_none_or(|client| client.is_disconnected())
             {
                 return Some("Wait for the remote session to connect before docking.");
             }
@@ -125,7 +125,9 @@ impl TerminalView {
         if conversation.is_child_agent_conversation()
             || conversation.is_remote_child()
             || conversation.has_active_subagent()
-            || !history.child_conversation_ids_of(&conversation_id).is_empty()
+            || !history
+                .child_conversation_ids_of(&conversation_id)
+                .is_empty()
         {
             return Some("This agent has a parent or child conversation linked to its pane.");
         }

@@ -9,7 +9,7 @@ use warpui_core::{WindowId, async_assert, async_assert_eq};
 
 use super::history::UNDO_LAYOUT;
 use super::{
-    PROCESS_SNAPSHOT, TerminalProcesses, assert_processes_preserved, record_processes,
+    PROCESS_SNAPSHOT, TerminalProcesses, assert_processes_preserved, pane_bounds, record_processes,
     saved_bounds, split_terminal_builder, terminal_processes, with_split_commands,
 };
 use crate::Builder;
@@ -17,6 +17,7 @@ use crate::Builder;
 const SEARCH: &str = "pane_navigator:search";
 const PREVIEW: &str = "pane_navigator:preview";
 const SOURCE_WINDOW: &str = "keyboard_single:source_window";
+const PREVIEW_WIDTH: &str = "keyboard_single:preview_width";
 const ORIGINAL: &[(usize, usize)] = &[(0, 0), (0, 1)];
 const SWAPPED: &[(usize, usize)] = &[(0, 1), (0, 0)];
 
@@ -27,7 +28,7 @@ fn open_keyboard_docking() -> Vec<TestStep> {
         })
 }
 
-fn choose_center_placement(placement: &'static str) -> Vec<TestStep> {
+fn choose_placement(placement: &'static str) -> Vec<TestStep> {
     let mut steps = open_keyboard_docking();
     steps.push(
         TestStep::new("Find the other pane in the same tab")
@@ -53,7 +54,51 @@ pub fn test_keyboard_docking_single_pane_actions() -> Builder {
             TestStep::new("Remember the original window")
                 .add_assertion(save_active_window_id(SOURCE_WINDOW)),
         )
-        .with_steps(choose_center_placement("Swap"))
+        .with_steps(choose_placement("Right"))
+        .with_step(
+            TestStep::new("Resize the split after opening the docking preview")
+                .with_action(|app, window_id, data| {
+                    data.insert(PREVIEW_WIDTH, pane_bounds(app, window_id, 0, 0).width());
+                    pane_group_view(app, window_id, 0).update(app, |group, ctx| {
+                        group.resize_left(ctx);
+                    });
+                })
+                .add_named_assertion_with_data_from_prior_step(
+                    "The split changed while the preview stayed open",
+                    |app, window_id, data| {
+                        let before = *data
+                            .get::<_, f32>(PREVIEW_WIDTH)
+                            .expect("The original width was recorded");
+                        let current = pane_bounds(app, window_id, 0, 0).width();
+                        async_assert!(
+                            (current - before).abs() > 1.
+                                && saved_bounds(app, window_id, PREVIEW).is_some()
+                        )
+                    },
+                ),
+        )
+        .with_step(
+            TestStep::new("Reject confirmation of the stale preview")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion("The rejected preview remains open", |app, window_id| {
+                    async_assert!(saved_bounds(app, window_id, PREVIEW).is_some())
+                })
+                .add_assertion(assert_num_panes_in_tab(0, 2))
+                .add_named_assertion_with_data_from_prior_step(
+                    "Both original terminals and processes stayed in their original positions",
+                    |app, window_id, data| {
+                        assert_processes_preserved(app, window_id, data, ORIGINAL)
+                    },
+                ),
+        )
+        .with_step(
+            TestStep::new("Dismiss the stale preview")
+                .with_keystrokes(&["escape"])
+                .add_named_assertion("The rejected preview closed", |app, window_id| {
+                    async_assert!(saved_bounds(app, window_id, PREVIEW).is_none())
+                }),
+        )
+        .with_steps(choose_placement("Swap"))
         .with_step(
             TestStep::new("Confirm Swap with Enter")
                 .with_keystrokes(&["enter"])
@@ -64,7 +109,7 @@ pub fn test_keyboard_docking_single_pane_actions() -> Builder {
                     },
                 ),
         )
-        .with_steps(choose_center_placement("Stack"))
+        .with_steps(choose_placement("Stack"))
         .with_step(
             TestStep::new("Confirm Stack with Enter")
                 .with_keystrokes(&["enter"])

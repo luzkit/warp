@@ -3,7 +3,7 @@
 use settings::Setting as _;
 use warp_core::context_flag::ContextFlag;
 use warpui::elements::{
-    ConstrainedBox, CrossAxisAlignment, Empty, Flex, MainAxisAlignment, MainAxisSize,
+    ConstrainedBox, CrossAxisAlignment, Empty, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
     ParentElement, Shrinkable,
 };
 use warpui::prelude::{ChildView, Container};
@@ -43,6 +43,7 @@ use crate::pane_group::{
 use crate::settings::app_installation_detection::{
     UserAppInstallDetectionSettings, UserAppInstallStatus,
 };
+use crate::settings::{PaneDragHandleVisibility, PaneSettings};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::shared_session::SharedSessionActionSource;
 use crate::terminal::shared_session::manager::Manager;
@@ -613,26 +614,75 @@ impl TerminalView {
             && self.agent_view_controller.as_ref(app).is_fullscreen();
         let parent_conversation_header_card = self.render_parent_conversation_header_card(app);
 
-        let left = self.maybe_render_header_back_button(app);
-        let center = self.render_header_title(is_fullscreen_agent_view, header_ctx, app);
-        let (right, min_actions_width) = self.render_header_actions(header_ctx, app);
+        let render_header = |handle: Option<Box<dyn Element>>| {
+            let back = self.maybe_render_header_back_button(app);
+            let left = if let Some(handle) = handle {
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(handle)
+                    .with_child(back)
+                    .finish()
+            } else {
+                back
+            };
+            let center = self.render_header_title(is_fullscreen_agent_view, header_ctx, app);
+            let (right, min_actions_width) = self.render_header_actions(header_ctx, app);
+            render_three_column_header(
+                left,
+                center,
+                right,
+                CenteredHeaderEdgeWidth {
+                    min: min_actions_width,
+                    max: 200.0,
+                },
+                header_ctx.header_left_inset,
+                header_ctx.draggable_state.is_dragging(),
+            )
+        };
 
-        let header = render_three_column_header(
-            left,
-            center,
-            right,
-            CenteredHeaderEdgeWidth {
-                min: min_actions_width,
-                max: 200.0,
-            },
-            header_ctx.header_left_inset,
-            header_ctx.draggable_state.is_dragging(),
-        );
+        let pane_state = self.split_pane_state(app);
+        let is_docked_stack_member = self.is_docked_stack_member(app);
+        let show_drag_handle = FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && pane_state.is_in_split_pane()
+            && !pane_state.is_maximized()
+            && !is_docked_stack_member
+            && self.supports_terminal_docking(app);
+        let header = if show_drag_handle {
+            let visibility = *PaneSettings::as_ref(app).pane_drag_handle_visibility;
+            let appearance = Appearance::as_ref(app);
+            let theme = appearance.theme();
+            Hoverable::new(header_ctx.header_hover_mouse_state.clone(), |mouse_state| {
+                let (is_visible, size) = match visibility {
+                    PaneDragHandleVisibility::OnHover => (
+                        mouse_state.is_hovered() || header_ctx.draggable_state.is_dragging(),
+                        16.,
+                    ),
+                    PaneDragHandleVisibility::AlwaysVisible => (true, 16.),
+                    PaneDragHandleVisibility::Minimal => (true, 10.),
+                };
+                let handle = if is_visible {
+                    icons::Icon::DragIndicatorVertical
+                        .to_warpui_icon(theme.sub_text_color(theme.background()))
+                        .finish()
+                } else {
+                    Empty::new().finish()
+                };
+                let handle = ConstrainedBox::new(handle)
+                    .with_height(size)
+                    .with_width(size)
+                    .finish();
+                render_header(Some(handle))
+            })
+            .with_propagate_drag()
+            .finish()
+        } else {
+            render_header(None)
+        };
         // Make only the title row draggable; the secondary row (pill
         // bar / breadcrumbs / navigation card) sits outside the drag
         // region so its own mouse-driven widgets (notably the pill
         // bar's scrollbar thumb) keep their hit-targets.
-        let draggable_header = if self.is_docked_stack_member(app) {
+        let draggable_header = if is_docked_stack_member {
             header
         } else {
             render_pane_header_draggable::<TerminalView>(
@@ -869,7 +919,8 @@ impl BackingView for TerminalView {
         is_shared
             || is_fullscreen_agent_view
             || self.is_docked_stack_member(app)
-            || FeatureFlag::ContextWindowUsageV2.is_enabled()
+            || (FeatureFlag::ContextWindowUsageV2.is_enabled()
+                || FeatureFlag::EnhancedPaneManagement.is_enabled())
                 && self.split_pane_state(app).is_in_split_pane()
     }
 

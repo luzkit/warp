@@ -203,7 +203,7 @@ impl Workspace {
                     .iter()
                     .position(|pane| pane.as_pane().id() == placement.focused)
                     .expect("A new layout tab receives its focused pane");
-                self.append_saved_layout_tab(panes.swap_remove(initial), ctx)
+                self.append_layout_tab(panes.swap_remove(initial), ctx)
             };
             group.update(ctx, |group, ctx| {
                 group.apply_saved_layout_tree(
@@ -229,7 +229,7 @@ impl Workspace {
         Ok(())
     }
 
-    fn append_saved_layout_tab(
+    pub(super) fn append_layout_tab(
         &mut self,
         pane: Box<dyn AnyPaneContent>,
         ctx: &mut ViewContext<Self>,

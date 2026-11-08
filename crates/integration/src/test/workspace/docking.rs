@@ -25,6 +25,8 @@ use super::{dispatch_mouse_event, tab_center};
 use crate::Builder;
 
 mod history;
+mod keyboard;
+mod keyboard_single;
 mod rearrangement;
 mod saved_layouts;
 mod windows;
@@ -32,12 +34,15 @@ pub use history::{
     test_pane_layout_resize_history_preserves_processes,
     test_pane_layout_undo_redo_preserves_processes,
 };
+pub use keyboard::test_keyboard_docking_groups_live_panes;
+pub use keyboard_single::test_keyboard_docking_single_pane_actions;
 pub use rearrangement::{
     test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
     test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
 };
 pub use saved_layouts::test_saved_pane_layout_preserves_processes;
 pub use windows::{
+    test_keyboard_docking_groups_panes_across_windows,
     test_move_pane_between_windows_preserves_processes,
     test_tear_out_tab_layout_preserves_processes,
 };

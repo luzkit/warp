@@ -55,6 +55,8 @@ use crate::channel::{Channel, ChannelState};
 use crate::features::FeatureFlag;
 use crate::palette::PaletteMode;
 use crate::server::telemetry::{AgentModeEntrypoint, PaletteSource};
+#[cfg(not(target_family = "wasm"))]
+use crate::settings::PaneDragHandleVisibility;
 use crate::settings_view::{self, SettingsSection, flags};
 use crate::tab::{NewSessionMenuItem, uses_vertical_tabs};
 use crate::util::bindings::{self, CustomAction, cmd_or_ctrl_shift, is_binding_pty_compliant};
@@ -90,6 +92,11 @@ pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     #[cfg(not(target_family = "wasm"))]
     app.add_singleton_model(|_| display_layouts::DisplayLayoutState::default());
+    #[cfg(not(target_family = "wasm"))]
+    {
+        app.add_singleton_model(|_| view::group_docking::PaneSelection::default());
+        view::pane_navigator::init(app);
+    }
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
 
@@ -128,6 +135,82 @@ pub fn init(app: &mut AppContext) {
         .with_enabled(|| {
             cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled()
         }),
+    ]);
+
+    #[cfg(not(target_family = "wasm"))]
+    app.register_editable_bindings([
+        EditableBinding::new(
+            "workspace:pane_navigator",
+            "Pane Navigator",
+            WorkspaceAction::OpenPaneNavigator { docking: false },
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:keyboard_docking",
+            "Keyboard Docking",
+            WorkspaceAction::OpenPaneNavigator { docking: true },
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Terminal.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:always_show_pane_drag_handles",
+            "Always Show Pane Drag Handles",
+            WorkspaceAction::SetPaneDragHandleVisibility(PaneDragHandleVisibility::AlwaysVisible),
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:show_pane_drag_handles_on_hover",
+            "Show Pane Drag Handles on Hover",
+            WorkspaceAction::SetPaneDragHandleVisibility(PaneDragHandleVisibility::OnHover),
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:minimal_pane_drag_handles",
+            "Use Minimal Pane Drag Handles",
+            WorkspaceAction::SetPaneDragHandleVisibility(PaneDragHandleVisibility::Minimal),
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:focus_moved_docking_panes",
+            "Focus Moved Panes After Docking",
+            WorkspaceAction::SetFocusMovedDockingPanes(true),
+        )
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_FocusMovedDockingPanes"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:keep_docking_focus",
+            "Keep Current Focus After Docking",
+            WorkspaceAction::SetFocusMovedDockingPanes(false),
+        )
+        .with_context_predicate(id!("Workspace") & id!("Workspace_FocusMovedDockingPanes"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:announce_pane_docking",
+            "Announce Pane Docking",
+            WorkspaceAction::SetAnnouncePaneDocking(true),
+        )
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_AnnouncePaneDocking"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
+        EditableBinding::new(
+            "workspace:mute_pane_docking",
+            "Mute Pane Docking Announcements",
+            WorkspaceAction::SetAnnouncePaneDocking(false),
+        )
+        .with_context_predicate(id!("Workspace") & id!("Workspace_AnnouncePaneDocking"))
+        .with_group(bindings::BindingGroup::Settings.as_str())
+        .with_enabled(|| FeatureFlag::EnhancedPaneManagement.is_enabled()),
     ]);
 
     app.register_editable_bindings([

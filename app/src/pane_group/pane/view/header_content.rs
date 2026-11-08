@@ -21,6 +21,8 @@ type RenderSharingControlsFn<'a> =
 pub struct HeaderRenderContext<'a> {
     /// Shared draggable state for the header.
     pub draggable_state: DraggableState,
+    /// Mouse state for the draggable title row.
+    pub header_hover_mouse_state: MouseStateHandle,
     /// Mouse state for the pane close button (owned by PaneHeader).
     pub close_button_mouse_state: MouseStateHandle,
     /// Mouse state for the pane overflow button (owned by PaneHeader).

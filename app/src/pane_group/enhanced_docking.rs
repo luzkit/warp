@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+#[cfg(not(target_family = "wasm"))]
+use std::collections::HashSet;
 
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
+#[cfg(not(target_family = "wasm"))]
+use pathfinder_geometry::vector::vec2f;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use warp_core::SessionId;
@@ -9,6 +13,8 @@ use warpui::elements::DraggableState;
 use warpui::{AppContext, EntityId, SingletonEntity, ViewContext, ViewHandle};
 
 use super::docked_stacks::DockedStack;
+#[cfg(not(target_family = "wasm"))]
+use super::tree::get_divider_layout_extent;
 use super::tree::{PaneData, PaneLayout};
 use super::{
     Direction, Event, PaneGroup, PaneId, TerminalPane, TerminalPaneId, get_minimum_pane_size,
@@ -403,6 +409,73 @@ impl PaneGroup {
             get_minimum_pane_size(ctx),
             flatten.then_some(direction),
         )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn plan_group_docking_split(
+        destination: PaneLayout,
+        incoming: PaneLayout,
+        target: PaneId,
+        direction: Direction,
+        bounds: RectF,
+        ctx: &AppContext,
+    ) -> Option<(PaneLayout, RectF, RectF)> {
+        let minimum = get_minimum_pane_size(ctx);
+        let mut destination = destination.into_pane_data();
+        let incoming = incoming.into_pane_data();
+        let target_bounds = destination
+            .docking_preview_rects(bounds, minimum)
+            .into_iter()
+            .find_map(|(pane, bounds)| (pane == target).then_some(bounds))?;
+        let divider = get_divider_layout_extent();
+        let incoming_size = match direction {
+            Direction::Left | Direction::Right => vec2f(
+                (target_bounds.width() - divider) / 2.,
+                target_bounds.height(),
+            ),
+            Direction::Up | Direction::Down => vec2f(
+                target_bounds.width(),
+                (target_bounds.height() - divider) / 2.,
+            ),
+        };
+        if !incoming.docked_subtree_fits(incoming_size, minimum, None) {
+            return None;
+        }
+
+        let incoming_panes: HashSet<_> = incoming.pane_ids().into_iter().collect();
+        destination
+            .insert_docked_subtree(target, incoming, direction, false)
+            .ok()?;
+        let mut target_bounds = None;
+        let mut incoming_bounds = None;
+        for (pane, bounds) in destination.docking_preview_rects(bounds, minimum) {
+            if pane == target {
+                target_bounds = Some(bounds);
+            } else if incoming_panes.contains(&pane) {
+                incoming_bounds = Some(incoming_bounds.map_or(bounds, |previous: RectF| {
+                    RectF::from_points(
+                        previous.origin().min(bounds.origin()),
+                        previous.lower_right().max(bounds.lower_right()),
+                    )
+                }));
+            }
+        }
+        Some((
+            destination.layout_snapshot(),
+            target_bounds?,
+            incoming_bounds?,
+        ))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn group_docking_layout_fits(
+        layout: PaneLayout,
+        size: Vector2F,
+        ctx: &AppContext,
+    ) -> bool {
+        layout
+            .into_pane_data()
+            .docked_subtree_fits(size, get_minimum_pane_size(ctx), None)
     }
 
     pub(crate) fn dock_pane_within_tab(

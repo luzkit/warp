@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use warpui::{AppContext, EntityId, ViewContext};
 
@@ -170,7 +170,7 @@ impl Workspace {
         &mut self,
         before: Option<LayoutState>,
         created: Option<EntityId>,
-        retired: Option<RetiredLayoutTab>,
+        retired: impl IntoIterator<Item = RetiredLayoutTab>,
         ctx: &AppContext,
     ) {
         let Some(before) = before else {
@@ -404,7 +404,6 @@ impl Workspace {
         }
 
         self.replay_layout_tab_changes(from, to, ctx);
-        self.activate_tab_by_pane_group_id(to.active_tab, ctx);
         ReplayResult::Applied
     }
 
@@ -414,23 +413,41 @@ impl Workspace {
         to: &LayoutState,
         ctx: &mut ViewContext<Self>,
     ) {
-        for (index, tab) in from.tabs.iter().enumerate().rev() {
-            if !to.tabs.iter().any(|target| target.id == tab.id) {
-                let retired = self.retired_layout_tab(index);
-                self.remove_tab(index, false, true, ctx);
-                self.layout_history.retired_tabs.insert(tab.id, retired);
-            }
-        }
+        let departing: HashSet<_> = from
+            .tabs
+            .iter()
+            .filter(|tab| !to.tabs.iter().any(|target| target.id == tab.id))
+            .map(|tab| tab.id)
+            .collect();
+
+        // Keep a live tab available even when replay replaces every current tab.
         for (index, tab) in to.tabs.iter().enumerate() {
             if let Some(retired) = self.layout_history.retired_tabs.remove(&tab.id) {
                 if let Some(group) = retired.group {
                     self.tab_groups.entry(group.id).or_insert(group);
                 }
+                let insertion_index = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| !departing.contains(&tab.pane_group.id()))
+                    .nth(index)
+                    .map_or(self.tabs.len(), |(index, _)| index);
                 self.tab_mru_order.push(tab.id);
-                self.tabs.insert(index, retired.tab);
-                if index <= self.active_tab_index {
+                self.tabs.insert(insertion_index, retired.tab);
+                if insertion_index <= self.active_tab_index {
                     self.active_tab_index += 1;
                 }
+            }
+        }
+
+        self.activate_tab_by_pane_group_id(to.active_tab, ctx);
+        for index in (0..self.tabs.len()).rev() {
+            let id = self.tabs[index].pane_group.id();
+            if departing.contains(&id) {
+                let retired = self.retired_layout_tab(index);
+                self.remove_tab(index, false, true, ctx);
+                self.layout_history.retired_tabs.insert(id, retired);
             }
         }
     }

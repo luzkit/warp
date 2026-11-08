@@ -58,10 +58,11 @@ use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
 use crate::server::telemetry::{InputUXChangeOrigin, TelemetryEvent};
 use crate::settings::app_icon::{AppIcon, AppIconSettings, ShowDockIconState};
 use crate::settings::{
-    AIFontName, AISettings, AppEditorSettings, CodeSettings, CursorBlink, CursorBlinkEnabled,
-    CursorDisplayType, DEFAULT_MONOSPACE_FONT_NAME, EnforceMinimumContrast, FocusPaneOnHover,
-    FontSettings, FontSettingsChangedEvent, GPUSettings, InputBoxType, InputModeSettings,
-    InputModeState, InputSettings, InputSettingsChangedEvent, MonospaceFontName, PaneSettings,
+    AIFontName, AISettings, AnnouncePaneDocking, AppEditorSettings, CodeSettings, CursorBlink,
+    CursorBlinkEnabled, CursorDisplayType, DEFAULT_MONOSPACE_FONT_NAME, EnforceMinimumContrast,
+    FocusMovedDockingPanes, FocusPaneOnHover, FontSettings, FontSettingsChangedEvent, GPUSettings,
+    InputBoxType, InputModeSettings, InputModeState, InputSettings, InputSettingsChangedEvent,
+    MonospaceFontName, PaneDragHandleVisibility, PaneDragHandleVisibilitySetting, PaneSettings,
     ShouldDimInactivePanes, ThemeSettings, UseSystemTheme, UseThinStrokes, active_theme_kind,
     respect_system_theme,
 };
@@ -1445,13 +1446,19 @@ impl AppearanceSettingsPageView {
 
         categories.push(Category::new("Input", category_widgets));
 
-        categories.push(Category::new(
-            "Panes",
-            vec![
-                Box::new(DimInactivePanesWidget::default()),
-                Box::new(FocusFollowsMouseWidget::default()),
-            ],
-        ));
+        let mut pane_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
+            Box::new(DimInactivePanesWidget::default()),
+            Box::new(FocusFollowsMouseWidget::default()),
+        ];
+        if cfg!(not(target_family = "wasm")) && FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            pane_widgets.extend([
+                Box::new(PaneDragHandleVisibilityWidget::default())
+                    as Box<dyn SettingsWidget<View = Self>>,
+                Box::new(FocusMovedDockingPanesWidget::default()),
+                Box::new(AnnouncePaneDockingWidget::default()),
+            ]);
+        }
+        categories.push(Category::new("Panes", pane_widgets));
 
         let mut block_settings_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![
             Box::new(CompactModeWidget::default()),
@@ -3990,6 +3997,160 @@ impl SettingsWidget for FocusFollowsMouseWidget {
                 })
                 .finish(),
             None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct PaneDragHandleVisibilityWidget {
+    item_states: [MouseStateHandle; 3],
+    radio_state: RadioButtonStateHandle,
+}
+
+impl SettingsWidget for PaneDragHandleVisibilityWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "pane drag handle visibility on hover always visible minimal"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        const OPTIONS: [(PaneDragHandleVisibility, &str); 3] = [
+            (PaneDragHandleVisibility::OnHover, "On hover"),
+            (PaneDragHandleVisibility::AlwaysVisible, "Always visible"),
+            (PaneDragHandleVisibility::Minimal, "Minimal"),
+        ];
+        let visibility = *PaneSettings::as_ref(app).pane_drag_handle_visibility;
+        let selected = OPTIONS.iter().position(|(option, _)| *option == visibility);
+        let radio_buttons = appearance
+            .ui_builder()
+            .radio_buttons(
+                self.item_states.to_vec(),
+                OPTIONS
+                    .iter()
+                    .map(|&(_, label)| RadioButtonItem::text(label))
+                    .collect(),
+                self.radio_state.clone(),
+                selected,
+                appearance.ui_font_size(),
+                RadioButtonLayout::Row,
+            )
+            .on_change(Rc::new(|ctx, _, index| {
+                if let Some((visibility, _)) = index.and_then(|index| OPTIONS.get(index)) {
+                    ctx.dispatch_typed_action(WorkspaceAction::SetPaneDragHandleVisibility(
+                        *visibility,
+                    ));
+                }
+            }))
+            .build()
+            .finish();
+
+        render_body_item::<AppearancePageAction>(
+            "Pane drag handle".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                PaneDragHandleVisibilitySetting::storage_key(),
+                PaneDragHandleVisibilitySetting::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            radio_buttons,
+            None,
+        )
+    }
+}
+
+#[derive(Default)]
+struct FocusMovedDockingPanesWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for FocusMovedDockingPanesWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "focus moved panes docking keep focus"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let enabled = *PaneSettings::as_ref(app).focus_moved_docking_panes;
+        render_body_item::<AppearancePageAction>(
+            "Focus moved panes".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                FocusMovedDockingPanes::storage_key(),
+                FocusMovedDockingPanes::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(enabled)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::SetFocusMovedDockingPanes(!enabled));
+                })
+                .finish(),
+            Some("Focus the moved pane after docking.".to_string()),
+        )
+    }
+}
+
+#[derive(Default)]
+struct AnnouncePaneDockingWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for AnnouncePaneDockingWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "announce pane docking accessibility screen reader"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let enabled = *PaneSettings::as_ref(app).announce_pane_docking;
+        render_body_item::<AppearancePageAction>(
+            "Announce pane docking".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                AnnouncePaneDocking::storage_key(),
+                AnnouncePaneDocking::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(enabled)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::SetAnnouncePaneDocking(!enabled));
+                })
+                .finish(),
+            Some("Announce pane docking actions to assistive technology.".to_string()),
         )
     }
 }

@@ -1,6 +1,8 @@
 use anyhow::{Result, ensure};
 use pathfinder_geometry::vector::vec2f;
-use warp::integration_testing::command_palette::open_command_palette_and_run_action;
+use warp::integration_testing::command_palette::{
+    TestStepsExt, open_command_palette_and_run_action,
+};
 use warp::integration_testing::terminal::{
     execute_long_running_command, wait_until_bootstrapped_single_pane_for_tab,
 };
@@ -466,6 +468,90 @@ pub fn test_tear_out_tab_layout_preserves_processes() -> Builder {
                 .add_named_assertion_with_data_from_prior_step(
                     "The original layout moves and its former window retains a fresh terminal",
                     |app, _, data| assert_tear_out_keeps_source(app, data),
+                ),
+        )
+}
+
+pub fn test_keyboard_docking_groups_panes_across_windows() -> Builder {
+    const SEARCH: &str = "pane_navigator:search";
+    const BEFORE: &[WindowPane] = &[
+        (SOURCE_WINDOW_KEY, 0),
+        (SOURCE_WINDOW_KEY, 1),
+        (TARGET_WINDOW_KEY, 0),
+    ];
+    const AFTER: &[WindowPane] = &[
+        (TARGET_WINDOW_KEY, 0),
+        (SOURCE_WINDOW_KEY, 0),
+        (TARGET_WINDOW_KEY, 1),
+    ];
+
+    with_split_commands(split_terminal_builder())
+        .with_step(
+            TestStep::new("Remember the source window")
+                .add_assertion(save_active_window_id(SOURCE_WINDOW_KEY)),
+        )
+        .with_step(add_and_save_window(TARGET_WINDOW_KEY))
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(execute_long_running_command(0, COMMAND.to_owned()))
+        .with_step(
+            TestStep::new("Record the live terminals in both windows")
+                .add_named_assertion_with_data_from_prior_step(
+                    "All three shells and commands are running",
+                    |app, _, data| match window_processes(app, data, BEFORE) {
+                        Ok(snapshot) => {
+                            data.insert(PROCESS_SNAPSHOT, snapshot);
+                            AssertionOutcome::Success
+                        }
+                        Err(error) => AssertionOutcome::failure(error.to_string()),
+                    },
+                ),
+        )
+        .with_steps(
+            open_command_palette_and_run_action("Pane Navigator").add_named_assertion(
+                "The navigator lists panes from both windows",
+                |app, window_id| {
+                    async_assert!(saved_bounds(app, window_id, "pane_navigator:row:2").is_some())
+                },
+            ),
+        )
+        .with_step(
+            TestStep::new("Select one pane in the first window")
+                .with_click_on_saved_position("pane_navigator:select:0"),
+        )
+        .with_step(
+            TestStep::new("Find the terminal in the second window")
+                .with_click_on_saved_position(SEARCH)
+                .with_typed_characters(&["Window 2"]),
+        )
+        .with_step(
+            TestStep::new("Select the terminal in the second window")
+                .with_keystrokes(&["shift-enter"]),
+        )
+        .with_step(
+            TestStep::new("Open keyboard docking with both selected terminals")
+                .with_keystrokes(&["alt-enter"]),
+        )
+        .with_step(
+            TestStep::new("Find a new tab in the second window")
+                .with_typed_characters(&["New tab Window 2"]),
+        )
+        .with_step(
+            TestStep::new("Preview the transfer without moving any terminal")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion("The group move can be committed", |app, window_id| {
+                    async_assert!(saved_bounds(app, window_id, "Move Panes").is_some())
+                })
+                .add_named_assertion_with_data_from_prior_step(
+                    "All three processes stay in their source panes during preview",
+                    |app, _, data| assert_window_processes(app, data, BEFORE),
+                ),
+        )
+        .with_step(
+            TestStep::new("Move both selected terminals into one tab")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion_with_data_from_prior_step(
+                    "Both moved terminals and the remaining terminal retain their processes",
+                    |app, _, data| assert_window_processes(app, data, AFTER),
                 ),
         )
 }

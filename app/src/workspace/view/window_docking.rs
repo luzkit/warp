@@ -23,7 +23,7 @@ use crate::workspace::cross_window_tab_drag::CrossWindowTabDrag;
 use crate::workspace::{PaneViewLocator, WorkspaceRegistry};
 
 impl Workspace {
-    fn accepts_window_docking(&self, ctx: &AppContext) -> bool {
+    pub(super) fn accepts_window_docking(&self, ctx: &AppContext) -> bool {
         !self.tabs.is_empty()
             && !self.is_tab_drag_preview()
             && !self.pending_pane_group_transfer
@@ -33,7 +33,11 @@ impl Workspace {
             && ctx.is_window_open(self.window_id)
     }
 
-    fn window_docking_tab_index(&self, pane_group: EntityId, ctx: &AppContext) -> Option<usize> {
+    pub(super) fn window_docking_tab_index(
+        &self,
+        pane_group: EntityId,
+        ctx: &AppContext,
+    ) -> Option<usize> {
         if cfg!(target_family = "wasm")
             || !FeatureFlag::EnhancedPaneManagement.is_enabled()
             || CrossWindowTabDrag::as_ref(ctx).is_active()
@@ -273,26 +277,55 @@ impl Workspace {
     }
 
     fn finish_window_docking_tab_transfer(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
-        if self.tab_count() == 1 {
-            if *WindowSettings::as_ref(ctx).close_empty_windows_after_pane_transfer {
-                CrossWindowTabDrag::handle(ctx).update(ctx, |drag, _| {
-                    drag.register_pending_source_close(self.window_id);
-                });
-                self.close_window_for_content_transfer(ctx);
-                return;
-            }
-
-            self.add_tab_with_pane_layout(
-                PanesLayout::SingleTerminal(Box::new(
-                    NewTerminalOptions::default().with_homepage_hidden(),
-                )),
-                Arc::new(HashMap::new()),
-                None,
-                ctx,
-            );
+        if self.tab_count() == 1 && !self.prepare_empty_docking_window(ctx) {
+            return;
         }
         self.remove_tab_without_undo(index, ctx);
         self.set_suppress_detach_panes_on_window_close(false);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) fn remove_empty_group_docking_tabs(
+        &mut self,
+        empty_groups: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if empty_groups.len() == self.tab_count() && !self.prepare_empty_docking_window(ctx) {
+            return;
+        }
+        if empty_groups.contains(&self.active_tab_pane_group().id())
+            && let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| !empty_groups.contains(&tab.pane_group.id()))
+        {
+            self.activate_tab_internal(index, ctx);
+        }
+        for index in (0..self.tabs.len()).rev() {
+            if empty_groups.contains(&self.tabs[index].pane_group.id()) {
+                self.remove_tab_without_undo(index, ctx);
+            }
+        }
+    }
+
+    fn prepare_empty_docking_window(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        if *WindowSettings::as_ref(ctx).close_empty_windows_after_pane_transfer {
+            CrossWindowTabDrag::handle(ctx).update(ctx, |drag, _| {
+                drag.register_pending_source_close(self.window_id);
+            });
+            self.close_window_for_content_transfer(ctx);
+            return false;
+        }
+
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(
+                NewTerminalOptions::default().with_homepage_hidden(),
+            )),
+            Arc::new(HashMap::new()),
+            None,
+            ctx,
+        );
+        true
     }
 
     fn plan_window_docking_split(

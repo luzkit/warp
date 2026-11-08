@@ -34,7 +34,7 @@ use crate::pane_group::{
 };
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::{SharingDialogSource, TelemetryEvent};
-use crate::settings::CodeSettings;
+use crate::settings::{CodeSettings, PaneSettings, PaneSettingsChangedEvent};
 use crate::tab::tab_position_id;
 use crate::terminal::view::TerminalAction;
 use crate::view_components::{FeaturePopup, NewFeaturePopupEvent, NewFeaturePopupLabel};
@@ -163,6 +163,18 @@ impl<P: BackingView> PaneHeader<P> {
 
         ctx.subscribe_to_model(&pane_configuration, Self::handle_pane_state_event);
         ctx.subscribe_to_model(&pane_stack, Self::handle_pane_stack_event);
+        if FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && ctx.has_singleton_model::<PaneSettings>()
+        {
+            ctx.subscribe_to_model(&PaneSettings::handle(ctx), |_, _, event, ctx| {
+                if matches!(
+                    event,
+                    PaneSettingsChangedEvent::PaneDragHandleVisibilitySetting { .. }
+                ) {
+                    ctx.notify();
+                }
+            });
+        }
 
         Self {
             pane_stack,
@@ -779,6 +791,7 @@ impl<P: BackingView> View for PaneHeader<P> {
         let header_left_inset = self.pane_configuration.as_ref(app).header_left_inset;
         let header_ctx = HeaderRenderContext {
             draggable_state: self.mouse_state_handles.draggable_state.clone(),
+            header_hover_mouse_state: self.mouse_state_handles.header_hover_handle.clone(),
             close_button_mouse_state: self.mouse_state_handles.close_button_handle.clone(),
             overflow_button_mouse_state: self.mouse_state_handles.overflow_button_handle.clone(),
             overflow_button_position_id: self.overflow_button_position_id(),

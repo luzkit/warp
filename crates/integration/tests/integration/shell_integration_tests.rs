@@ -30,6 +30,11 @@ integration_tests! {
     test_pane_layout_resize_history_preserves_processes,
     // Test the same bash and zsh processes survive saved layout preview and apply.
     test_saved_pane_layout_preserves_processes,
+    // Test both live shells survive a keyboard docking group move and undo.
+    test_keyboard_docking_groups_live_panes,
+    test_keyboard_docking_groups_panes_across_windows,
+    // Test the keyboard equivalents of existing single-pane actions.
+    test_keyboard_docking_single_pane_actions,
     // Test bash and zsh process identity through cross-window moves and tear-out.
     test_move_pane_between_windows_preserves_processes,
     test_tear_out_tab_layout_preserves_processes,

@@ -37,6 +37,7 @@ use crate::server::ids::{ServerId, SyncId};
 use crate::server::telemetry::{
     AddTabWithShellSource, AgentModeEntrypoint, PaletteSource, SharingDialogSource,
 };
+use crate::settings::PaneDragHandleVisibility;
 use crate::settings_view::{SettingsAction as SettingsTabAction, SettingsSection};
 use crate::tab::{NewSessionMenuItem, SelectedTabColor};
 use crate::tab_configs::TabConfig;
@@ -161,6 +162,12 @@ pub enum WorkspaceAction {
     RedoPaneLayoutChange,
     BalancePanes,
     OpenPaneLayouts,
+    OpenPaneNavigator {
+        docking: bool,
+    },
+    SetPaneDragHandleVisibility(PaneDragHandleVisibility),
+    SetFocusMovedDockingPanes(bool),
+    SetAnnouncePaneDocking(bool),
     RenameTab(usize),
     ResetTabName(usize),
     RenamePane(PaneViewLocator),
@@ -980,6 +987,10 @@ impl WorkspaceAction {
             | RedoPaneLayoutChange
             | BalancePanes
             | OpenPaneLayouts
+            | OpenPaneNavigator { .. }
+            | SetPaneDragHandleVisibility(_)
+            | SetFocusMovedDockingPanes(_)
+            | SetAnnouncePaneDocking(_)
             | DropTab { .. }
             | DropGroup
             | RenameTab(_)

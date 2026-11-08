@@ -12,6 +12,8 @@ mod enhanced_docking;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
+#[cfg(not(target_family = "wasm"))]
+pub(super) mod group_docking;
 pub(crate) mod launch_modal;
 mod layout_history;
 pub(crate) mod left_panel;
@@ -20,6 +22,8 @@ pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
 #[cfg(not(target_family = "wasm"))]
 mod pane_layouts_modal;
+#[cfg(not(target_family = "wasm"))]
+pub(super) mod pane_navigator;
 #[cfg(all(target_os = "macos", feature = "local_tty"))]
 mod persistent_terminals;
 pub(crate) mod right_panel;
@@ -1125,6 +1129,8 @@ pub struct Workspace {
     launch_config_save_modal: ModalViewState<LaunchConfigSaveModal>,
     #[cfg(not(target_family = "wasm"))]
     pane_layouts_modal: Option<ModalViewState<Modal<pane_layouts_modal::PaneLayoutsView>>>,
+    #[cfg(not(target_family = "wasm"))]
+    pane_navigator_modal: Option<ModalViewState<Modal<pane_navigator::PaneNavigatorView>>>,
     tab_config_params_modal: ModalViewState<Modal<TabConfigParamsModal>>,
     session_config_modal: ModalViewState<Modal<SessionConfigModal>>,
     pending_session_config_replacement: Option<PendingSessionConfigReplacement>,
@@ -3549,6 +3555,8 @@ impl Workspace {
             launch_config_save_modal,
             #[cfg(not(target_family = "wasm"))]
             pane_layouts_modal: None,
+            #[cfg(not(target_family = "wasm"))]
+            pane_navigator_modal: None,
             tab_config_params_modal,
             session_config_modal,
             pending_session_config_replacement: None,
@@ -24456,6 +24464,40 @@ impl TypedActionView for Workspace {
                 #[cfg(not(target_family = "wasm"))]
                 self.open_pane_layouts(ctx);
             }
+            OpenPaneNavigator { docking } => {
+                #[cfg(not(target_family = "wasm"))]
+                self.open_pane_navigator(*docking, ctx);
+                #[cfg(target_family = "wasm")]
+                let _ = docking;
+            }
+            SetPaneDragHandleVisibility(visibility) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    PaneSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(
+                            settings
+                                .pane_drag_handle_visibility
+                                .set_value(*visibility, ctx)
+                        );
+                    });
+                    ctx.notify();
+                }
+            }
+            SetFocusMovedDockingPanes(focus) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    PaneSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(settings.focus_moved_docking_panes.set_value(*focus, ctx));
+                    });
+                    ctx.notify();
+                }
+            }
+            SetAnnouncePaneDocking(announce) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    PaneSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(settings.announce_pane_docking.set_value(*announce, ctx));
+                    });
+                    ctx.notify();
+                }
+            }
             UndoPaneLayoutChange => self.undo_layout_change(ctx),
             RedoPaneLayoutChange => self.redo_layout_change(ctx),
             BalancePanes => {
@@ -27004,6 +27046,16 @@ impl View for Workspace {
             context.set.insert("Workspace_PersistentTerminal");
         }
 
+        if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            let settings = PaneSettings::as_ref(app);
+            if *settings.focus_moved_docking_panes {
+                context.set.insert("Workspace_FocusMovedDockingPanes");
+            }
+            if *settings.announce_pane_docking {
+                context.set.insert("Workspace_AnnouncePaneDocking");
+            }
+        }
+
         if NetworkStatus::as_ref(app).is_online() {
             context.set.insert("IsOnline");
         }
@@ -27912,6 +27964,15 @@ impl View for Workspace {
         #[cfg(not(target_family = "wasm"))]
         if let Some(modal) = self
             .pane_layouts_modal
+            .as_ref()
+            .filter(|modal| modal.is_open())
+        {
+            stack.add_child(modal.render());
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(modal) = self
+            .pane_navigator_modal
             .as_ref()
             .filter(|modal| modal.is_open())
         {

@@ -1,10 +1,12 @@
+use pathfinder_geometry::rect::RectF;
+use pathfinder_geometry::vector::vec2f;
 use warp::integration_testing::command_palette::{
     TestStepsExt, open_command_palette_and_run_action,
 };
 use warp::integration_testing::pane_group::assert_num_panes_in_tab;
 use warp::integration_testing::workspace::assert_tab_count;
 use warpui_core::async_assert;
-use warpui_core::integration::TestStep;
+use warpui_core::integration::{AssertionOutcome, TestStep};
 
 use super::history::UNDO_LAYOUT;
 use super::{
@@ -16,16 +18,33 @@ use crate::Builder;
 const MANAGE_LAYOUTS: &str = "Manage Pane Layouts";
 const NAME_FIELD: &str = "pane_layouts:name";
 const SNAPSHOT_NAME: &str = "Original tabs";
+const SPLIT_SNAPSHOT_NAME: &str = "Side-by-side panes";
 const APPLY_LAYOUT: &str = "Apply Layout";
 const SEPARATE_TABS: &[(usize, usize)] = &[(0, 0), (1, 0)];
 const SPLIT_TAB: &[(usize, usize)] = &[(0, 0), (0, 1)];
 
 pub fn test_saved_pane_layout_preserves_processes() -> Builder {
     let preview_button = format!("pane_layouts:preview:{SNAPSHOT_NAME}");
+    let split_preview_button = format!("pane_layouts:preview:{SPLIT_SNAPSHOT_NAME}");
     terminal_tabs_with_running_commands()
         .with_setup(|utils| {
             utils.set_env("XDG_STATE_HOME", Some(utils.test_dir().join("state")));
         })
+        .with_step(
+            TestStep::new("Size the window so both preview tiles can show their titles")
+                .with_action(|app, window_id, _| {
+                    let origin = app
+                        .window_bounds(&window_id)
+                        .expect("Workspace window has bounds")
+                        .origin();
+                    app.update(|ctx| {
+                        ctx.set_and_cache_window_bounds(
+                            window_id,
+                            RectF::new(origin, vec2f(1200., 640.)),
+                        );
+                    });
+                }),
+        )
         .with_step(record_processes(SEPARATE_TABS))
         .with_steps(
             open_command_palette_and_run_action(MANAGE_LAYOUTS)
@@ -72,6 +91,55 @@ pub fn test_saved_pane_layout_preserves_processes() -> Builder {
                     }
                 },
             ),
+        )
+        .with_step(
+            TestStep::new("Name the split snapshot")
+                .with_click_on_saved_position(NAME_FIELD)
+                .with_typed_characters(&[SPLIT_SNAPSHOT_NAME]),
+        )
+        .with_step(
+            TestStep::new("Save the split snapshot")
+                .with_click_on_saved_position("Save Snapshot")
+                .add_named_assertion("The split snapshot has a Preview button", {
+                    let split_preview_button = split_preview_button.clone();
+                    move |app, window_id| {
+                        async_assert!(saved_bounds(app, window_id, &split_preview_button).is_some())
+                    }
+                }),
+        )
+        .with_step(
+            TestStep::new("Preview two side-by-side panes")
+                .with_click_on_saved_position(split_preview_button)
+                .add_named_assertion("Both tiles fill the preview vertically", |app, window_id| {
+                    let bounds = |id| saved_bounds(app, window_id, id);
+                    let (Some(canvas), Some(left), Some(right)) = (
+                        bounds("pane_layouts:preview_canvas:0"),
+                        bounds("pane_layouts:preview_tile:0:0"),
+                        bounds("pane_layouts:preview_tile:0:1"),
+                    ) else {
+                        return AssertionOutcome::failure("Missing preview bounds".to_owned());
+                    };
+
+                    async_assert!(
+                        left.width() > 68.
+                            && right.width() > 68.
+                            && (left.min_x() - canvas.min_x()).abs() < 1.
+                            && (left.max_x() - right.min_x()).abs() < 1.
+                            && (right.max_x() - canvas.max_x()).abs() < 1.
+                            && (left.min_y() - canvas.min_y()).abs() < 1.
+                            && (right.min_y() - canvas.min_y()).abs() < 1.
+                            && (left.max_y() - canvas.max_y()).abs() < 1.
+                            && (right.max_y() - canvas.max_y()).abs() < 1.,
+                        "Expected titled tiles side by side across {canvas:?}, got {left:?} and {right:?}"
+                    )
+                }),
+        )
+        .with_step(
+            TestStep::new("Return to the list of saved layouts")
+                .with_click_on_saved_position("Back")
+                .add_named_assertion("The layout list is visible", |app, window_id| {
+                    async_assert!(saved_bounds(app, window_id, NAME_FIELD).is_some())
+                }),
         )
         .with_step(
             TestStep::new("Preview the snapshot without applying it")

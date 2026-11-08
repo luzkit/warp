@@ -1,7 +1,7 @@
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
-    Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
-    CrossAxisAlignment, Empty, Flex, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    Align, Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CrossAxisAlignment, Empty, Flex, MouseStateHandle, OffsetPositioning, ParentAnchor,
     ParentElement, ParentOffsetBounds, Rect, SavePosition, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::ui_components::button::ButtonVariant;
@@ -434,7 +434,7 @@ fn render_tab_preview(
     let theme = appearance.theme();
     let mut tiles =
         Stack::new().with_child(Rect::new().with_background(theme.surface_1()).finish());
-    for pane in plan.preview_panes(tab, space) {
+    for (index, pane) in plan.preview_panes(tab, space).into_iter().enumerate() {
         let size = pane.bounds.size() * scale;
         let title = preview
             .pane_titles
@@ -453,16 +453,24 @@ fn render_tab_preview(
         } else {
             Empty::new().finish()
         };
-        let tile = Container::new(label)
+        let tile = Container::new(Align::new(label).top_left().finish())
             .with_horizontal_padding(4.)
             .with_background(theme.surface_2())
             .with_border(Border::all(1.).with_border_fill(theme.outline()))
             .finish();
+        let tile = ConstrainedBox::new(tile)
+            .with_width(size.x())
+            .with_height(size.y())
+            .finish();
+        let tile = if cfg!(feature = "integration_tests") {
+            SavePosition::new(tile, &format!("pane_layouts:preview_tile:{tab}:{index}"))
+                .for_single_frame()
+                .finish()
+        } else {
+            tile
+        };
         tiles.add_positioned_child(
-            ConstrainedBox::new(tile)
-                .with_width(size.x())
-                .with_height(size.y())
-                .finish(),
+            tile,
             OffsetPositioning::offset_from_parent(
                 pane.bounds.origin() * scale,
                 ParentOffsetBounds::ParentByPosition,
@@ -471,10 +479,17 @@ fn render_tab_preview(
             ),
         );
     }
-    ConstrainedBox::new(tiles.finish())
+    let canvas = ConstrainedBox::new(tiles.finish())
         .with_width(space.width * scale)
         .with_height(space.height * scale)
-        .finish()
+        .finish();
+    if cfg!(feature = "integration_tests") {
+        SavePosition::new(canvas, &format!("pane_layouts:preview_canvas:{tab}"))
+            .for_single_frame()
+            .finish()
+    } else {
+        canvas
+    }
 }
 
 impl Entity for PaneLayoutsView {

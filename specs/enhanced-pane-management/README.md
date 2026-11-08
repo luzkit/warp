@@ -170,7 +170,7 @@ Cross-tab previews require an inactive destination whose pane area is clear of o
 
 ### Saved pane layouts
 
-Open **Manage Pane Layouts** from the Command Palette in a terminal-only window.
+Open **Manage Pane Layouts** from the Command Palette in a terminal-only window. A template or snapshot captures every tab in that window. To save only a split tab, select it and run **Move Tab Layout to New Window** before saving.
 
 - Enter a name and choose **Save Template** to record the tab, split, and stack structure, or **Save Snapshot** to also record which live terminal belongs in each slot.
 - Choose **Preview** to see how the layout fits the current window. If its proportions make panes too small, Warp offers the arrangements that fit from **Rebalance**, **Stack overflow**, and **Use more tabs**. Extra live terminals keep their own tabs. Unavailable snapshot terminals leave unfilled slots. **Apply Layout** moves the current terminals, and **Undo Pane Layout Change** reverses the edit.
@@ -302,6 +302,7 @@ cargo test --locked -p warp --lib --features gui,enhanced_pane_management,drag_t
 | Milestone 5 integration checks | Twelve runs passed across zsh and Bash on Apple Silicon macOS. The new test saved two tabs as a snapshot, docked the terminals into one tab, previewed the snapshot without moving anything, applied it, and undid the change. It compared terminal view IDs, session IDs, shell and foreground process IDs, and process start times. Five existing docking, stack, history, resize, and tear-out tests also passed on both shells. |
 | Milestone 5 focused unit checks | All 15 passed. Coverage included versioned import and portable export, catalog persistence, missing and extra sessions, nested balance and overflow alternatives, display geometry and recovery, and history. |
 | Milestone 5 lint and SSD build | App and integration Clippy passed with warnings denied. The launcher accepted `--help`. The signed `dev.warp.WarpOss` bundle passed strict signature verification with CDHash `4b4cc2059d4da9e3cc5180dcee82047ef6505541`. |
+| Milestone 5 preview follow-up | Titled pane outlines fill the planned rectangles. The integration test verified full-height side-by-side boxes and live process preservation on zsh and Bash. App and integration Clippy passed with warnings denied. The SSD launcher uses the signed bundle with CDHash `e7bff843edbf370b1a5a8a639553c225a1f6345e`. |
 | Milestone 5 platform coverage | Physical disconnect and reconnect, Linux, and Windows are pending. Monitor geometry transitions were simulated in the unit tests. |
 | Milestone 4 integration checks | Eleven tests passed with zsh and Bash on Apple Silicon macOS. The native pointer case verified split preview, Escape and retry, moving a pane to a second window, and moving the active split layout back through the destination tab strip. The offscreen Command Palette case tore out an entire split twice and verified the close and keep source-window policies. The tests compared view IDs, session IDs, shell and foreground process IDs, start times, and focus. |
 | Milestone 4 WarpUI transfer tests | All 16 focused tests passed, including reparenting a view before transferring its former and current parents. |

@@ -6,12 +6,13 @@ use warp::integration_testing::command_palette::{
 use warp::integration_testing::pane_group::assert_num_panes_in_tab;
 use warp::integration_testing::workspace::assert_tab_count;
 use warpui_core::async_assert;
+use warpui_core::event::Event;
 use warpui_core::integration::{AssertionOutcome, TestStep};
 
 use super::history::UNDO_LAYOUT;
 use super::{
-    assert_processes_preserved, preview_right, record_processes, release_tab, saved_bounds,
-    terminal_tabs_with_running_commands,
+    assert_processes_preserved, dispatch_mouse_event, preview_right, record_processes, release_tab,
+    saved_bounds, terminal_tabs_with_running_commands,
 };
 use crate::Builder;
 
@@ -20,6 +21,7 @@ const NAME_FIELD: &str = "pane_layouts:name";
 const SNAPSHOT_NAME: &str = "Original tabs";
 const SPLIT_SNAPSHOT_NAME: &str = "Side-by-side panes";
 const APPLY_LAYOUT: &str = "Apply Layout";
+const SAVE_DISPLAY_PROFILE: &str = "Save Display Profile";
 const SEPARATE_TABS: &[(usize, usize)] = &[(0, 0), (1, 0)];
 const SPLIT_TAB: &[(usize, usize)] = &[(0, 0), (0, 1)];
 
@@ -100,10 +102,17 @@ pub fn test_saved_pane_layout_preserves_processes() -> Builder {
         .with_step(
             TestStep::new("Save the split snapshot")
                 .with_click_on_saved_position("Save Snapshot")
-                .add_named_assertion("The split snapshot has a Preview button", {
+                .add_named_assertion("Both saved layouts have aligned Preview buttons", {
+                    let preview_button = preview_button.clone();
                     let split_preview_button = split_preview_button.clone();
                     move |app, window_id| {
-                        async_assert!(saved_bounds(app, window_id, &split_preview_button).is_some())
+                        let (Some(original), Some(split)) = (
+                            saved_bounds(app, window_id, &preview_button),
+                            saved_bounds(app, window_id, &split_preview_button),
+                        ) else {
+                            return AssertionOutcome::failure("Missing saved layout buttons".to_owned());
+                        };
+                        async_assert!((original.min_x() - split.min_x()).abs() < 1.)
                     }
                 }),
         )
@@ -135,11 +144,57 @@ pub fn test_saved_pane_layout_preserves_processes() -> Builder {
                 }),
         )
         .with_step(
+            TestStep::new("Save the split as a display profile when a display is available")
+                .with_action(|app, window_id, data| {
+                    let Some(button) = saved_bounds(app, window_id, SAVE_DISPLAY_PROFILE) else {
+                        return;
+                    };
+                    let position = button.center();
+                    data.insert(SAVE_DISPLAY_PROFILE, true);
+                    for event in [
+                        Event::LeftMouseDown {
+                            position,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                            is_first_mouse: false,
+                        },
+                        Event::LeftMouseUp {
+                            position,
+                            modifiers: Default::default(),
+                        },
+                    ] {
+                        dispatch_mouse_event(app, window_id, event);
+                    }
+                }),
+        )
+        .with_step(
             TestStep::new("Return to the list of saved layouts")
                 .with_click_on_saved_position("Back")
                 .add_named_assertion("The layout list is visible", |app, window_id| {
                     async_assert!(saved_bounds(app, window_id, NAME_FIELD).is_some())
-                }),
+                })
+                .add_named_assertion_with_data_from_prior_step(
+                    "The display profile's Preview button sits beside its name",
+                    {
+                        let preview_button = preview_button.clone();
+                        move |app, window_id, data| {
+                            if data.get::<_, bool>(SAVE_DISPLAY_PROFILE).is_none() {
+                                return AssertionOutcome::Success;
+                            }
+                            let (Some(name), Some(profile_preview), Some(layout_preview)) = (
+                                saved_bounds(app, window_id, "pane_layouts:display_profile_name"),
+                                saved_bounds(app, window_id, "Preview Display Profile"),
+                                saved_bounds(app, window_id, &preview_button),
+                            ) else {
+                                return AssertionOutcome::failure("Missing display profile row".to_owned());
+                            };
+                            async_assert!(
+                                (name.center().y() - profile_preview.center().y()).abs() < 1.
+                                    && (profile_preview.min_x() - layout_preview.min_x()).abs() < 1.
+                            )
+                        }
+                    },
+                ),
         )
         .with_step(
             TestStep::new("Preview the snapshot without applying it")

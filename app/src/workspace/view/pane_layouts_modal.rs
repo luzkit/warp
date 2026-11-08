@@ -25,6 +25,7 @@ use crate::workspace::pane_layouts::{
 
 const MODAL_WIDTH: f32 = 620.;
 const MODAL_HEIGHT: f32 = 560.;
+const CATALOG_NAME_WIDTH: f32 = 180.;
 const PREVIEW_WIDTH: f32 = 500.;
 const PREVIEW_HEIGHT: f32 = 132.;
 
@@ -221,27 +222,41 @@ impl PaneLayoutsView {
                 ))
                 .finish(),
         );
-        let mut controls = Flex::row().with_spacing(8.).with_child(layout_button(
-            "Import from Clipboard",
-            &self.mouse.import,
-            LayoutsAction::Import,
-            false,
-            appearance,
-        ));
+        column.add_child(
+            Flex::row()
+                .with_child(layout_button(
+                    "Import from Clipboard",
+                    &self.mouse.import,
+                    LayoutsAction::Import,
+                    false,
+                    appearance,
+                ))
+                .finish(),
+        );
         if let Some(profile) = &self.display_profile {
-            controls.add_child(layout_button(
-                "Preview Display Profile",
-                &self.mouse.preview_profile,
-                LayoutsAction::PreviewDisplayProfile,
-                false,
-                appearance,
-            ));
-            column.add_child(layout_text(
-                format!("Display profile · {profile}"),
-                appearance,
-            ));
+            let label = catalog_name(format!("Display profile · {profile}"), appearance);
+            let label = if cfg!(feature = "integration_tests") {
+                SavePosition::new(label, "pane_layouts:display_profile_name")
+                    .for_single_frame()
+                    .finish()
+            } else {
+                label
+            };
+            column.add_child(
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(8.)
+                    .with_child(Shrinkable::new(1., label).finish())
+                    .with_child(layout_button(
+                        "Preview Display Profile",
+                        &self.mouse.preview_profile,
+                        LayoutsAction::PreviewDisplayProfile,
+                        false,
+                        appearance,
+                    ))
+                    .finish(),
+            );
         }
-        column.add_child(controls.finish());
         if self.rows.is_empty() {
             column.add_child(layout_text("No saved pane layouts yet.", appearance));
         }
@@ -264,7 +279,7 @@ impl PaneLayoutsView {
                     .with_child(
                         Shrinkable::new(
                             1.,
-                            layout_text(format!("{} · {kind}", row.name), appearance),
+                            catalog_name(format!("{} · {kind}", row.name), appearance),
                         )
                         .finish(),
                     )
@@ -387,6 +402,12 @@ fn strategy_label(strategy: LayoutStrategy) -> &'static str {
         LayoutStrategy::Stack => "Stack overflow",
         LayoutStrategy::Tabs => "Use more tabs",
     }
+}
+
+fn catalog_name(label: String, appearance: &Appearance) -> Box<dyn Element> {
+    ConstrainedBox::new(layout_text(label, appearance))
+        .with_width(CATALOG_NAME_WIDTH)
+        .finish()
 }
 
 fn layout_text(label: impl Into<String>, appearance: &Appearance) -> Box<dyn Element> {

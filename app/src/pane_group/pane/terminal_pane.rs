@@ -200,13 +200,29 @@ impl TerminalPane {
     }
 
     pub(in crate::pane_group) fn supports_terminal_docking(&self, ctx: &AppContext) -> bool {
+        self.docking_restriction(ctx).is_none()
+    }
+
+    pub(in crate::pane_group) fn docking_restriction(
+        &self,
+        ctx: &AppContext,
+    ) -> Option<&'static str> {
         if self.view.as_ref(ctx).pane_stack().as_ref(ctx).depth() != 1 {
-            return false;
+            return Some("Return to the main pane before docking.");
         }
 
-        self.terminal_view(ctx)
-            .as_ref(ctx)
-            .supports_terminal_docking(ctx)
+        #[cfg(all(target_os = "macos", feature = "local_tty"))]
+        {
+            let manager = self.terminal_manager(ctx);
+            let manager = manager.as_ref(ctx);
+            if manager.persistent_session_id().is_some()
+                && (self.persistent_session_ending.get() || !manager.persistent_session_is_attached())
+            {
+                return Some("Attach this persistent session before docking.");
+            }
+        }
+
+        self.terminal_view(ctx).as_ref(ctx).docking_restriction(ctx)
     }
 
     pub(in crate::pane_group) fn subscribe_global_pane_models(
@@ -456,6 +472,11 @@ impl PaneContent for TerminalPane {
             self.delete_blocks(ctx);
         }
 
+        let terminal_view = self.terminal_view(ctx);
+        let preserve_agent_stream = matches!(detach_type, DetachType::Moved)
+            && terminal_view.as_ref(ctx).active_conversation_id(ctx).is_some()
+            && self.docking_restriction(ctx).is_none();
+
         // Unsubscribe from all views in the pane stack.
         let pane_stack = self.view.as_ref(ctx).pane_stack().clone();
         let contents = pane_stack.as_ref(ctx).entries().to_vec();
@@ -473,15 +494,15 @@ impl PaneContent for TerminalPane {
             ctx.unsubscribe_to_view(&view);
         }
 
-        // Notify the active agent views model that the terminal view has been closed
-        // (and that any active views are no longer active). On a `HiddenForClose` detach,
-        // `attach` will re-register via `register_agent_view_controller` when the tab is
-        // restored, so this is safe to run unconditionally.
-        let terminal_view_id = self.terminal_view(ctx).id();
+        let terminal_view_id = terminal_view.id();
         ActiveAgentViewsModel::handle(ctx).update(ctx, |model, ctx| {
             for terminal_view_id in terminal_view_ids {
-                model.unregister_agent_view_controller(terminal_view_id, ctx);
-                model.unregister_ambient_session(terminal_view_id, ctx);
+                if preserve_agent_stream {
+                    model.clear_moving_terminal_window_focus(terminal_view_id, ctx);
+                } else {
+                    model.unregister_agent_view_controller(terminal_view_id, ctx);
+                    model.unregister_ambient_session(terminal_view_id, ctx);
+                }
             }
         });
 

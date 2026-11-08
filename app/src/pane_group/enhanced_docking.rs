@@ -19,16 +19,32 @@ use super::tree::{PaneData, PaneLayout};
 use super::{
     Direction, Event, PaneGroup, PaneId, TerminalPane, TerminalPaneId, get_minimum_pane_size,
 };
+use crate::ai::agent::conversation::AIConversationId;
+#[cfg(not(target_family = "wasm"))]
+use crate::code::buffer_location::LocalOrRemotePath;
 use crate::pane_group::pane::{AnyPaneContent, DetachType};
 use crate::workspace::sync_inputs::SyncedInputState;
 
-type TerminalIdentity = (EntityId, Option<SessionId>);
+#[derive(PartialEq, Eq, Clone)]
+enum DockingPaneIdentity {
+    Terminal {
+        view: EntityId,
+        session: Option<SessionId>,
+        persistent_owner: Option<Uuid>,
+        conversation: Option<AIConversationId>,
+    },
+    #[cfg(not(target_family = "wasm"))]
+    Editor {
+        view: EntityId,
+        files: Vec<LocalOrRemotePath>,
+    },
+}
 
 #[derive(Clone)]
 pub(crate) struct DockingLayoutSnapshot {
     pub(crate) tree: PaneLayout,
     stacks: Vec<DockedStack>,
-    panes: HashMap<PaneId, Option<TerminalIdentity>>,
+    panes: HashMap<PaneId, Option<DockingPaneIdentity>>,
     focused: PaneId,
     active_session: Option<TerminalPaneId>,
 }
@@ -78,17 +94,7 @@ impl PaneGroup {
         let panes = group
             .pane_contents
             .keys()
-            .map(|&pane| {
-                let terminal = group.terminal_view_from_pane_id(pane, ctx).map(|view| {
-                    let session = view
-                        .as_ref(ctx)
-                        .active_session()
-                        .as_ref(ctx)
-                        .session_id(ctx);
-                    (view.id(), session)
-                });
-                (pane, terminal)
-            })
+            .map(|&pane| (pane, group.docking_pane_identity(pane, ctx)))
             .collect();
         Some(DockingLayoutSnapshot {
             tree: group.panes.layout_snapshot(),
@@ -99,9 +105,68 @@ impl PaneGroup {
         })
     }
 
+    fn docking_pane_identity(&self, pane: PaneId, ctx: &AppContext) -> Option<DockingPaneIdentity> {
+        if let Some(terminal) = self.terminal_session_by_id(pane) {
+            let view = terminal.terminal_view(ctx);
+            let session = view.as_ref(ctx).active_session().as_ref(ctx).session_id(ctx);
+            #[cfg(target_os = "macos")]
+            let persistent_owner = terminal.terminal_manager(ctx).as_ref(ctx).persistent_session_id();
+            #[cfg(not(target_os = "macos"))]
+            let persistent_owner = None;
+            return Some(DockingPaneIdentity::Terminal {
+                view: view.id(),
+                session,
+                persistent_owner,
+                conversation: view.as_ref(ctx).active_conversation_id(ctx),
+            });
+        }
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(code) = self.code_pane_by_id(pane) {
+            return Some(DockingPaneIdentity::Editor {
+                view: code.file_view(ctx).id(),
+                files: code.docking_locations(ctx),
+            });
+        }
+        None
+    }
+
+    fn docking_content_restriction(&self, pane: PaneId, ctx: &AppContext) -> Option<&'static str> {
+        if let Some(terminal) = self.terminal_session_by_id(pane) {
+            return terminal.docking_restriction(ctx);
+        }
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(editor) = self.code_pane_by_id(pane) {
+            return editor.docking_restriction(ctx);
+        }
+        Some("This pane type cannot be moved with pane docking.")
+    }
+
     pub(crate) fn can_replay_docking_move(&self, pane: PaneId, ctx: &AppContext) -> bool {
-        self.terminal_session_by_id(pane)
-            .is_some_and(|terminal| terminal.supports_terminal_docking(ctx))
+        self.docking_content_restriction(pane, ctx).is_none()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn group_docking_restriction(
+        handle: &ViewHandle<Self>,
+        ctx: &AppContext,
+    ) -> Option<&'static str> {
+        let group = handle.as_ref(ctx);
+        if group.is_focused_pane_maximized(ctx) || (group.right_panel_open && group.is_right_panel_maximized) {
+            return Some("Restore the maximized pane before docking.");
+        }
+        if group.child_agent_origin.is_some() || !group.child_agent_panes.is_empty() {
+            return Some("Keep linked agent panes in their original tab.");
+        }
+        if group.panes.num_hidden_panes() != 0 || group.pane_count() != group.pane_contents.len() {
+            return Some("Show hidden panes and unstack panes before moving a group.");
+        }
+        if SyncedInputState::as_ref(ctx)
+            .should_sync_this_pane_group(handle.id(), handle.window_id(ctx))
+        {
+            return Some("Turn off synchronized input before docking.");
+        }
+        group.panes.pane_ids().into_iter()
+            .find_map(|pane| group.docking_content_restriction(pane, ctx))
     }
 
     pub(crate) fn take_layout_history_panes(
@@ -158,14 +223,8 @@ impl PaneGroup {
                 members,
             })
             .collect();
-        self.replace_docking_layout(
-            tree,
-            stacks,
-            focused,
-            focused.as_terminal_pane_id(),
-            incoming,
-            ctx,
-        );
+        let active_session = focused.as_terminal_pane_id().or_else(|| self.active_session_id(ctx));
+        self.replace_docking_layout(tree, stacks, focused, active_session, incoming, ctx);
     }
 
     pub(crate) fn set_saved_layout_tab_title(
@@ -234,6 +293,9 @@ impl PaneGroup {
         self.handle_pane_count_change(ctx);
         self.focus_pane(focused, false, ctx);
         self.update_pane_history(focused);
+        let active_session = active_session.filter(|session| {
+            self.pane_contents.contains_key(&PaneId::from(*session))
+        }).or_else(|| self.panes.pane_ids().into_iter().find_map(|pane| pane.as_terminal_pane_id()));
         self.focus_state.update(ctx, |state, ctx| {
             state.set_active_session(active_session, ctx);
         });

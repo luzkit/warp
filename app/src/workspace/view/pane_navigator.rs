@@ -19,7 +19,7 @@ use warpui::{
 use super::Workspace;
 use super::enhanced_docking::DockingOperation;
 use super::group_docking::{
-    GroupDockDestination, GroupDockPlan, PaneLocation, PaneSelection, can_select_pane,
+    GroupDockDestination, GroupDockPlan, PaneLocation, PaneSelection, pane_selection_restriction,
     commit_group_dock, plan_group_dock,
 };
 use crate::appearance::Appearance;
@@ -72,6 +72,7 @@ enum Choice {
 struct Row {
     title: String,
     detail: String,
+    restriction: Option<&'static str>,
     choice: Choice,
     activate_mouse: MouseStateHandle,
     select_mouse: MouseStateHandle,
@@ -82,6 +83,7 @@ impl Row {
         Self {
             title,
             detail,
+            restriction: None,
             choice,
             activate_mouse: Default::default(),
             select_mouse: Default::default(),
@@ -326,17 +328,19 @@ impl PaneNavigatorView {
             return;
         };
         let location = *location;
-        if can_select_pane(location, ctx) {
-            PaneSelection::handle(ctx).update(ctx, |selection, ctx| {
-                selection.toggle(location);
-                ctx.notify();
-            });
-            self.selected = Some(index);
-            self.announce(ctx);
-            ctx.notify();
-        } else {
-            self.show_notice("This pane is unavailable for docking.".to_owned(), ctx);
+        if !PaneSelection::as_ref(ctx).members().contains(&location)
+            && let Some(reason) = pane_selection_restriction(location, ctx)
+        {
+            self.show_notice(reason.to_owned(), ctx);
+            return;
         }
+        PaneSelection::handle(ctx).update(ctx, |selection, ctx| {
+            selection.toggle(location);
+            ctx.notify();
+        });
+        self.selected = Some(index);
+        self.announce(ctx);
+        ctx.notify();
     }
 
     fn accept(&mut self, ctx: &mut ViewContext<Self>) {
@@ -375,6 +379,10 @@ impl PaneNavigatorView {
                 ctx,
             ),
             (Stage::Destinations { sources }, Choice::Pane(target)) => {
+                if let Some(reason) = row.restriction {
+                    self.show_notice(reason.to_owned(), ctx);
+                    return;
+                }
                 let mut rows: Vec<_> = [
                     Direction::Left,
                     Direction::Right,
@@ -395,6 +403,8 @@ impl PaneNavigatorView {
                 .collect();
                 if let [source] = sources.as_slice()
                     && source.window_id == target.window_id
+                    && source.pane_id.is_terminal_pane()
+                    && target.pane_id.is_terminal_pane()
                 {
                     rows.extend([
                         Row::new(
@@ -506,7 +516,7 @@ impl PaneNavigatorView {
     fn start_docking(&mut self, ctx: &mut ViewContext<Self>) {
         let sources = selected_sources(self.origin, ctx);
         if sources.is_empty() {
-            self.show_notice("Select a terminal pane to dock.".to_owned(), ctx);
+            self.show_notice("Select a pane to dock.".to_owned(), ctx);
             return;
         }
         self.open_destinations(sources, ctx);
@@ -602,7 +612,10 @@ impl PaneNavigatorView {
                 }
                 _ => "",
             };
-            format!("{} · {}{status}", row.title, row.detail)
+            match row.restriction {
+                Some(reason) => format!("{} · {}{status} · {reason}", row.title, row.detail),
+                None => format!("{} · {}{status}", row.title, row.detail),
+            }
         } else {
             self.stage.title().to_owned()
         };
@@ -625,7 +638,10 @@ impl PaneNavigatorView {
             .with_spacing(5.);
         let members = PaneSelection::as_ref(app).members();
         for (index, row) in self.visible_rows() {
-            let row_label = format!("{} · {}", row.title, row.detail);
+            let row_label = match row.restriction {
+                Some(reason) => format!("{} · {} · {reason}", row.title, row.detail),
+                None => format!("{} · {}", row.title, row.detail),
+            };
             let mut layout = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(8.);
@@ -636,7 +652,7 @@ impl PaneNavigatorView {
                     .ui_builder()
                     .checkbox(row.select_mouse.clone(), None)
                     .check(members.contains(&pane));
-                if !can_select_pane(pane, app) {
+                if row.restriction.is_some() && !members.contains(&pane) {
                     checkbox = checkbox.disabled();
                 }
                 let checkbox = checkbox
@@ -833,6 +849,7 @@ impl Workspace {
             || self.is_tab_drag_preview()
             || self.docking_tab_drag.is_some()
             || self.docking_pane_drag.is_some()
+            || self.current_workspace_state.is_native_quit_modal_open
             || self.tabs.is_empty()
         {
             return;
@@ -930,6 +947,7 @@ fn navigator_rows(
             ));
             if let Some([source]) = sources
                 && source.window_id == window
+                && source.pane_id.is_terminal_pane()
             {
                 rows.push(Row::new(
                     "New window".to_owned(),
@@ -943,15 +961,13 @@ fn navigator_rows(
                 continue;
             }
             let group = tab.pane_group.as_ref(ctx);
+            let restriction = workspace.pane_group_selection_restriction(tab.pane_group.id(), ctx);
             let detail = format!(
                 "{window_name} · Tab {} · {}",
                 tab_index + 1,
                 group.display_title(ctx),
             );
             for (pane_index, pane_id) in group.visible_pane_ids().into_iter().enumerate() {
-                if !pane_id.is_terminal_pane() {
-                    continue;
-                }
                 let pane = PaneLocation {
                     window_id: window,
                     pane_group_id: tab.pane_group.id(),
@@ -968,13 +984,15 @@ fn navigator_rows(
                         .unwrap_or_else(|| configuration.title())
                         .to_owned()
                 });
-                rows.push(Row::new(
+                let mut row = Row::new(
                     title
                         .filter(|title| !title.is_empty())
                         .unwrap_or_else(|| format!("Pane {}", pane_index + 1)),
                     detail.clone(),
                     Choice::Pane(pane),
-                ));
+                );
+                row.restriction = restriction;
+                rows.push(row);
             }
         }
     }

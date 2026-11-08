@@ -5,6 +5,8 @@ use std::fs;
 use std::time::Duration;
 
 pub use docking::{
+    test_dock_editor_preserves_unsaved_buffer,
+    test_keyboard_docking_in_native_fullscreen_preserves_processes,
     test_dock_entire_tab_layout, test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
     test_dock_tab_preserves_running_processes, test_keyboard_docking_groups_live_panes,
     test_keyboard_docking_groups_panes_across_windows, test_keyboard_docking_single_pane_actions,

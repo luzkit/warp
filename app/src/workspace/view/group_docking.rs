@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use pathfinder_geometry::rect::RectF;
+use warpui::platform::FullscreenState;
 use warpui::{AppContext, Entity, EntityId, SingletonEntity, ViewHandle, WindowId};
 
 use super::Workspace;
@@ -104,6 +105,7 @@ pub(super) struct GroupDockPlan {
     destination_snapshot: Option<DockingLayoutSnapshot>,
     destination_tree: PaneLayout,
     viewport: RectF,
+    fullscreen_state: Option<FullscreenState>,
     preview: Option<(RectF, RectF)>,
 }
 
@@ -114,6 +116,7 @@ impl GroupDockPlan {
 
     fn matches(&self, current: &Self) -> bool {
         self.viewport == current.viewport
+            && self.fullscreen_state == current.fullscreen_state
             && self.destination_tree == current.destination_tree
             && self.preview == current.preview
             && self.groups.len() == current.groups.len()
@@ -144,38 +147,48 @@ fn docking_group(
     workspace: &Workspace,
     group: EntityId,
     ctx: &AppContext,
-) -> Option<ViewHandle<PaneGroup>> {
-    let index = workspace.window_docking_tab_index(group, ctx)?;
-    let handle = &workspace.tabs[index].pane_group;
+) -> Result<ViewHandle<PaneGroup>, &'static str> {
+    if workspace.has_docking_child_tab(group, ctx) {
+        return Err("Keep linked agent panes in their original tab.");
+    }
+    let index = workspace.window_docking_tab_index(group, ctx)
+        .ok_or("This tab is unavailable for docking.");
+    let handle = &workspace.tabs[index?].pane_group;
     let group = handle.as_ref(ctx);
-    (PaneGroup::can_dock_terminal_layout(handle, ctx)
-        && !group.has_saved_layout_side_panel()
-        && !group.is_previewing_resize()
-        && !group.any_pane_being_dragged(ctx))
-    .then(|| handle.clone())
+    if group.is_previewing_resize() || group.any_pane_being_dragged(ctx) {
+        return Err("Finish dragging or resizing before docking.");
+    }
+    if let Some(reason) = PaneGroup::group_docking_restriction(handle, ctx) {
+        return Err(reason);
+    }
+    if group.has_saved_layout_side_panel() {
+        return Err("Close the tools and assistant panels before docking.");
+    }
+    Ok(handle.clone())
 }
 
 impl Workspace {
-    pub(super) fn can_select_group_pane(
+    pub(super) fn pane_group_selection_restriction(
         &self,
         pane_group_id: EntityId,
-        pane_id: PaneId,
         ctx: &AppContext,
-    ) -> bool {
-        docking_group(self, pane_group_id, ctx)
-            .is_some_and(|group| PaneGroup::can_dock_terminal_pane(&group, pane_id, ctx))
+    ) -> Option<&'static str> {
+        docking_group(self, pane_group_id, ctx).err()
     }
 }
 
-pub(super) fn can_select_pane(location: PaneLocation, ctx: &AppContext) -> bool {
-    FeatureFlag::EnhancedPaneManagement.is_enabled()
-        && docking_workspace(location.window_id, ctx).is_some_and(|workspace| {
-            workspace.as_ref(ctx).can_select_group_pane(
-                location.pane_group_id,
-                location.pane_id,
-                ctx,
-            )
-        })
+pub(super) fn pane_selection_restriction(
+    location: PaneLocation,
+    ctx: &AppContext,
+) -> Option<&'static str> {
+    let Some(workspace) = docking_workspace(location.window_id, ctx) else {
+        return Some("This window is unavailable for docking.");
+    };
+    match docking_group(workspace.as_ref(ctx), location.pane_group_id, ctx) {
+        Ok(group) if group.as_ref(ctx).has_pane_id(location.pane_id) => None,
+        Ok(_) => Some("This pane is no longer available."),
+        Err(reason) => Some(reason),
+    }
 }
 
 pub(super) fn plan_group_dock(
@@ -189,7 +202,7 @@ pub(super) fn plan_group_dock(
         return Err("Finish the current drag before docking panes.".to_owned());
     }
     if sources.is_empty() {
-        return Err("Select at least one terminal pane.".to_owned());
+        return Err("Select at least one pane.".to_owned());
     }
     let destination_window = destination.window_id();
     let workspace = docking_workspace(destination_window, ctx)
@@ -207,10 +220,11 @@ pub(super) fn plan_group_dock(
         .ok_or_else(|| "The destination window does not have a visible pane area.".to_owned())?;
 
     let mut seen = HashSet::new();
+    let mut editor_files = HashSet::new();
     let mut groups = Vec::<SourceGroup>::new();
     for &source in sources {
         if !seen.insert(source.pane_id) {
-            return Err("A terminal pane appears more than once in the selection.".to_owned());
+            return Err("A pane appears more than once in the selection.".to_owned());
         }
         let source_workspace = docking_workspace(source.window_id, ctx)
             .ok_or_else(|| "A selected pane’s window is unavailable.".to_owned())?;
@@ -219,8 +233,21 @@ pub(super) fn plan_group_dock(
             return Err("Move panes between windows in the same team.".to_owned());
         }
         let group = docking_group(source_workspace, source.pane_group_id, ctx)
-            .filter(|group| PaneGroup::can_dock_terminal_pane(group, source.pane_id, ctx))
-            .ok_or_else(|| "A selected pane is no longer available for docking.".to_owned())?;
+            .map_err(str::to_owned)?;
+        let group_ref = group.as_ref(ctx);
+        if !group_ref.has_pane_id(source.pane_id) {
+            return Err("A selected pane is no longer available for docking.".to_owned());
+        }
+        if let Some(editor) = group_ref.code_pane_by_id(source.pane_id) {
+            if source.window_id != destination_window {
+                return Err("Keep this editor in its current window.".to_owned());
+            }
+            for file in editor.docking_locations(ctx) {
+                if !editor_files.insert(file) {
+                    return Err("Two selected editors have the same file open.".to_owned());
+                }
+            }
+        }
         if let Some(source_group) = groups.iter_mut().find(|group| group.key == source.key()) {
             source_group.moving.push(source.pane_id);
         } else {
@@ -248,10 +275,10 @@ pub(super) fn plan_group_dock(
         subtrees.push(selected.layout_snapshot());
 
         let mut remaining = snapshot.clone().into_pane_data();
-        for &pane in &group.moving {
-            remaining.remove(pane);
-        }
-        if !remaining.is_empty() {
+        if group.moving.len() != remaining.len() {
+            for &pane in &group.moving {
+                remaining.remove(pane);
+            }
             let workspace = docking_workspace(group.key.0, ctx).expect("Validated source window");
             let original_focus = workspace
                 .as_ref(ctx)
@@ -274,8 +301,19 @@ pub(super) fn plan_group_dock(
                 return Err("Choose a destination outside the selection.".to_owned());
             }
             let target_group = docking_group(workspace, target.pane_group_id, ctx)
-                .filter(|group| PaneGroup::can_dock_terminal_pane(group, target.pane_id, ctx))
-                .ok_or_else(|| "The destination pane is unavailable for docking.".to_owned())?;
+                .map_err(str::to_owned)?;
+            let target_ref = target_group.as_ref(ctx);
+            if !target_ref.has_pane_id(target.pane_id) {
+                return Err("The destination pane is unavailable for docking.".to_owned());
+            }
+            if !editor_files.is_empty() && target_ref.pane_ids()
+                .filter(|pane| !seen.contains(pane))
+                .filter_map(|pane| target_ref.code_pane_by_id(pane))
+                .flat_map(|editor| editor.docking_locations(ctx))
+                .any(|file| editor_files.contains(&file))
+            {
+                return Err("The destination already has one of the selected files open.".to_owned());
+            }
             let snapshot = PaneGroup::capture_docking_layout(&target_group, ctx)
                 .ok_or_else(|| "The destination tab is unavailable for docking.".to_owned())?;
             let destination_tree = groups
@@ -329,6 +367,8 @@ pub(super) fn plan_group_dock(
         destination_snapshot,
         destination_tree,
         viewport,
+        fullscreen_state: ctx.windows().platform_window(destination_window)
+            .map(|window| window.fullscreen_state()),
         preview,
     })
 }

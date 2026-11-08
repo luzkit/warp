@@ -397,6 +397,8 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_keyboard_docking_groups_live_panes);
     register_test!(test_keyboard_docking_groups_panes_across_windows);
     register_test!(test_keyboard_docking_single_pane_actions);
+    register_test!(test_dock_editor_preserves_unsaved_buffer);
+    register_test!(test_keyboard_docking_in_native_fullscreen_preserves_processes);
     register_test!(test_move_pane_between_windows_preserves_processes);
     register_test!(test_tear_out_tab_layout_preserves_processes);
     register_test!(test_reorder_tabs_with_drag);

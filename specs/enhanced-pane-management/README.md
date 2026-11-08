@@ -189,6 +189,14 @@ Press **Alt+Enter** in the navigator or run **Keyboard Docking** from the Comman
 
 Use **Settings → Appearance → Panes** to choose when the drag grip appears, whether focus follows moved panes, and whether the navigator announces moves and selection through assistive technology. The Command Palette also exposes these preferences.
 
+### Docking editors, agents, and unavailable sessions
+
+**Pane Navigator** and **Keyboard Docking** can move a local editor into a split or a new tab within its current window. The original editor and all its file tabs move with it. An edited buffer keeps its unsaved changes. The planner rejects a move into a tab where another selected or destination editor already owns the same file. Editors opened for remote files, agent actions, rules, or skills remain in their owning context.
+
+An independent live local agent can move with its terminal, including between windows. The move keeps the active conversation controller and stream attached. Linked parent and child agents, shared sessions, and cloud agent panes stay with their owners. The navigator explains the restriction when it encounters an unsupported pane.
+
+Restore a maximized pane before using group docking. In a fullscreen window, use **Keyboard Docking** or the explicit window actions for placement. For a detached persistent session, attach it through Warp’s existing session controls before moving it. A disconnected or ended terminal remains in place until the existing terminal lifecycle makes it writable again. Pane docking uses the persistent owner identity through the terminal manager.
+
 ## Build and validation
 
 Build from the isolated worktree with the pinned Rust toolchain, Protobuf, Xcode and Metal tools, and the repository's macOS bundling prerequisites. This invokes the macOS runner directly to select the OSS binary and keep the debug bundle in the worktree.

@@ -29,6 +29,7 @@ impl Workspace {
             && !self.pending_pane_group_transfer
             && !self.suppress_detach_panes_on_window_close
             && !self.current_workspace_state.is_agent_management_view_open
+            && !self.current_workspace_state.is_native_quit_modal_open
             && quake_mode_window_id() != Some(self.window_id)
             && ctx.is_window_open(self.window_id)
     }

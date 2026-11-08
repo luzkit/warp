@@ -10,6 +10,7 @@ use warp::integration_testing::view_getters::{pane_group_view, workspace_view};
 use warp::integration_testing::window::{add_and_save_window, save_active_window_id};
 use warpui_core::event::Event;
 use warpui_core::integration::{AssertionOutcome, StepDataMap, TestStep};
+use warpui_core::platform::FullscreenState;
 use warpui_core::{App, WindowId, async_assert, async_assert_eq};
 
 use super::super::{
@@ -21,7 +22,8 @@ use super::{
     COMMAND, DOCK_POINT, PREVIEW_POSITION, PROCESS_SNAPSHOT, TerminalProcesses,
     assert_processes_preserved, pane_bounds, pane_overflow_button_id, pane_position_id,
     record_processes, release_tab, saved_bounds, shell_supports_process_tests,
-    split_terminal_builder, tab_center, terminal_processes, with_split_commands,
+    split_terminal_builder, tab_center, terminal_processes, terminal_tabs_with_running_commands,
+    with_split_commands,
 };
 use crate::Builder;
 
@@ -554,4 +556,118 @@ pub fn test_keyboard_docking_groups_panes_across_windows() -> Builder {
                     |app, _, data| assert_window_processes(app, data, AFTER),
                 ),
         )
+}
+
+pub fn test_keyboard_docking_in_native_fullscreen_preserves_processes() -> Builder {
+    const SEPARATE_TABS: &[(usize, usize)] = &[(0, 0), (1, 0)];
+    const RIGHT_SPLIT: &[(usize, usize)] = &[(0, 1), (0, 0)];
+
+    terminal_tabs_with_running_commands()
+        .set_should_run_test(|| {
+            cfg!(target_os = "macos")
+                && std::env::var_os("WARPUI_USE_REAL_DISPLAY_IN_INTEGRATION_TESTS").is_some()
+                && shell_supports_process_tests()
+        })
+        .with_step(
+            TestStep::new("Remember the original window")
+                .add_assertion(save_active_window_id(SOURCE_WINDOW_KEY)),
+        )
+        .with_step(record_processes(SEPARATE_TABS))
+        .with_step(toggle_saved_window_fullscreen(
+            "Enter native fullscreen",
+            FullscreenState::Fullscreen,
+        ))
+        .with_steps(
+            open_command_palette_and_run_action("Keyboard Docking").add_named_assertion(
+                "Keyboard Docking opens in fullscreen",
+                |app, window| {
+                    async_assert!(saved_bounds(app, window, "pane_navigator:search").is_some())
+                },
+            ),
+        )
+        .with_step(
+            TestStep::new("Find the second tab as a destination").with_typed_characters(&["Tab 2"]),
+        )
+        .with_step(TestStep::new("Choose the destination pane").with_keystrokes(&["enter"]))
+        .with_step(TestStep::new("Find the right split placement").with_typed_characters(&["Right"]))
+        .with_step(
+            TestStep::new("Preview the right split in fullscreen")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion("The split preview is visible", |app, window| {
+                    async_assert!(saved_bounds(app, window, "pane_navigator:preview").is_some())
+                })
+                .add_named_assertion_with_data_from_prior_step(
+                    "Preview leaves both live terminals in their tabs",
+                    |app, _, data| {
+                        let window = saved_window(data, SOURCE_WINDOW_KEY);
+                        assert_processes_preserved(app, window, data, SEPARATE_TABS)
+                    },
+                ),
+        )
+        .with_step(
+            TestStep::new("Dock the first pane on the right")
+                .with_keystrokes(&["enter"])
+                .add_named_assertion_with_data_from_prior_step(
+                    "The original window stays fullscreen",
+                    |app, _, data| {
+                        let window = saved_window(data, SOURCE_WINDOW_KEY);
+                        assert_window_fullscreen(app, window, FullscreenState::Fullscreen)
+                    },
+                )
+                .add_named_assertion_with_data_from_prior_step(
+                    "Both original processes are in the split",
+                    |app, _, data| {
+                        let window = saved_window(data, SOURCE_WINDOW_KEY);
+                        assert_processes_preserved(app, window, data, RIGHT_SPLIT)
+                    },
+                ),
+        )
+        .with_step(toggle_saved_window_fullscreen(
+            "Leave native fullscreen",
+            FullscreenState::Normal,
+        ))
+        .with_step(
+            TestStep::new("Verify the docked processes after leaving fullscreen")
+                .add_named_assertion_with_data_from_prior_step(
+                    "Both original processes remain in the split",
+                    |app, _, data| {
+                        let window = saved_window(data, SOURCE_WINDOW_KEY);
+                        assert_processes_preserved(app, window, data, RIGHT_SPLIT)
+                    },
+                ),
+        )
+}
+
+fn toggle_saved_window_fullscreen(name: &str, expected: FullscreenState) -> TestStep {
+    TestStep::new(name)
+        .with_action(|app, _, data| {
+            let window = saved_window(data, SOURCE_WINDOW_KEY);
+            app.update(|ctx| ctx.windows().show_window_and_focus_app(window));
+            workspace_view(app, window).update(app, |_, ctx| ctx.toggle_fullscreen());
+        })
+        .add_named_assertion_with_data_from_prior_step(
+            "The original window completed the native fullscreen transition",
+            move |app, _, data| {
+                let window = saved_window(data, SOURCE_WINDOW_KEY);
+                assert_window_fullscreen(app, window, expected)
+            },
+        )
+}
+
+fn assert_window_fullscreen(
+    app: &App,
+    window: WindowId,
+    expected: FullscreenState,
+) -> AssertionOutcome {
+    let (active, state) = app.read(|ctx| {
+        let windows = ctx.windows();
+        (
+            windows.active_window(),
+            windows.platform_window(window).map(|window| window.fullscreen_state()),
+        )
+    });
+    async_assert!(
+        active == Some(window) && state == Some(expected),
+        "Expected {window:?} in {expected:?}, active window was {active:?} and state was {state:?}"
+    )
 }

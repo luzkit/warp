@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,7 +34,7 @@ use super::child_agent::{
 };
 use super::*;
 use crate::ai::AIRequestUsageModel;
-use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
+use crate::ai::active_agent_views_model::{ActiveAgentViewsEvent, ActiveAgentViewsModel};
 use crate::ai::agent::StartAgentExecutionMode;
 use crate::ai::agent::api::ServerConversationToken;
 use crate::ai::agent::conversation::{
@@ -2337,6 +2339,176 @@ fn create_shared_session_viewer_without_cloud_mode_does_not_populate_ambient_age
                 terminal_view.as_ref(ctx).ambient_agent_view_model().is_none(),
                 "non-cloud-mode shared-session viewer must not construct an ambient_agent_view_model; existing callers depend on this",
             );
+        });
+    });
+}
+
+#[test]
+fn test_docking_moves_live_local_agent_conversation_without_closing_it() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+    let _pane_management = FeatureFlag::EnhancedPaneManagement.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let source = mock_pane_group(&mut app, Default::default());
+        let destination = mock_pane_group(&mut app, Default::default());
+        let (pane, terminal_view_id, controller_id, conversation_id) =
+            source.update(&mut app, |group, ctx| {
+                let pane = get_newly_created_pane_id(group, &[]);
+                let conversation_id = start_parent_conversation(group, pane, ctx);
+                enter_agent_view_for_conversation(group, pane, conversation_id, ctx);
+                let terminal = group.terminal_view_from_pane_id(pane, ctx).unwrap();
+                let controller_id = terminal.as_ref(ctx).agent_view_controller().id();
+                (pane, terminal.id(), controller_id, conversation_id)
+            });
+        let conversation_closed = Rc::new(Cell::new(false));
+        app.update(|ctx| {
+            let conversation_closed = conversation_closed.clone();
+            ctx.subscribe_to_model(&ActiveAgentViewsModel::handle(ctx), move |_, event, _| {
+                if matches!(event, ActiveAgentViewsEvent::ConversationClosed { conversation_id: id } if *id == conversation_id) {
+                    conversation_closed.set(true);
+                }
+            });
+        });
+
+        app.update(|ctx| {
+            assert!(PaneGroup::can_dock_terminal_pane(&source, pane, ctx));
+            let target = get_newly_created_pane_id(destination.as_ref(ctx), &[]);
+            assert!(PaneGroup::dock_terminal_pane_between_tabs(
+                &source, pane, &destination, target, Direction::Right, ctx,
+            ));
+        });
+
+        app.read(|ctx| {
+            assert!(!source.as_ref(ctx).has_pane_id(pane));
+            let moved = destination
+                .as_ref(ctx)
+                .terminal_view_from_pane_id(pane, ctx)
+                .expect("the original terminal moved to the destination");
+            assert_eq!(moved.id(), terminal_view_id);
+            assert_eq!(moved.window_id(ctx), destination.window_id(ctx));
+            let terminal = moved.as_ref(ctx);
+            assert_eq!(terminal.active_conversation_id(ctx), Some(conversation_id));
+            let controller = terminal.agent_view_controller();
+            assert_eq!(controller.id(), controller_id);
+            assert_eq!(controller.as_ref(ctx).pane_group_id(), Some(destination.id()));
+            assert_eq!(
+                BlocklistAIHistoryModel::as_ref(ctx)
+                    .terminal_surface_id_for_conversation(&conversation_id),
+                Some(terminal_view_id)
+            );
+            assert!(ActiveAgentViewsModel::as_ref(ctx).is_terminal_view_attached(terminal_view_id, ctx));
+        });
+        assert!(!conversation_closed.get());
+    });
+}
+
+#[test]
+fn test_docking_keeps_linked_agent_conversations_in_place() {
+    let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let source = mock_pane_group(&mut app, Default::default());
+        let (pane, conversation_id) = source.update(&mut app, |group, ctx| {
+            let pane = get_newly_created_pane_id(group, &[]);
+            let conversation_id = start_parent_conversation(group, pane, ctx);
+            restore_child_conversation(group, pane, conversation_id, ctx);
+            enter_agent_view_for_conversation(group, pane, conversation_id, ctx);
+            (pane, conversation_id)
+        });
+
+        app.read(|ctx| {
+            let group = source.as_ref(ctx);
+            let terminal = group.terminal_session_by_id(pane).unwrap();
+            assert_eq!(
+                terminal.docking_restriction(ctx),
+                Some("This agent has a parent or child conversation linked to its pane.")
+            );
+            assert!(!PaneGroup::can_dock_terminal_pane(&source, pane, ctx));
+            assert_eq!(
+                terminal.terminal_view(ctx).as_ref(ctx).active_conversation_id(ctx),
+                Some(conversation_id)
+            );
+        });
+    });
+}
+
+#[cfg(all(target_os = "macos", feature = "local_tty"))]
+#[test]
+fn test_docking_rejects_disconnected_persistent_placeholder() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let id = Uuid::new_v4();
+        let group = mock_pane_group(
+            &mut app,
+            MockOptions {
+                layout: PanesLayout::PersistentTerminal(Box::new(PersistentTerminalLayout {
+                    id,
+                    name: None,
+                    snapshot: None,
+                    live_conversations: Vec::new(),
+                    connection: PersistentPtyConnection::Disconnected,
+                })),
+                ..Default::default()
+            },
+        );
+
+        app.read(|ctx| {
+            let pane = get_newly_created_pane_id(group.as_ref(ctx), &[]);
+            let terminal = group.as_ref(ctx).terminal_session_by_id(pane).unwrap();
+            assert_eq!(terminal.persistent_session_id(ctx), Some(id));
+            assert_eq!(
+                terminal.docking_restriction(ctx),
+                Some("Attach this persistent session before docking.")
+            );
+            assert!(!PaneGroup::can_dock_terminal_pane(&group, pane, ctx));
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn test_docking_requires_restoring_a_maximized_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let group = mock_pane_group(&mut app, Default::default());
+        group.update(&mut app, |group, ctx| {
+            group.add_terminal_pane(Direction::Right, None, ctx);
+            group.toggle_maximize_pane(ctx);
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                PaneGroup::group_docking_restriction(&group, ctx),
+                Some("Restore the maximized pane before docking.")
+            );
+        });
+        group.update(&mut app, |group, ctx| group.toggle_maximize_pane(ctx));
+        app.read(|ctx| assert_eq!(PaneGroup::group_docking_restriction(&group, ctx), None));
+    });
+}
+
+#[test]
+fn test_docking_rejects_terminated_terminal_session() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let group = mock_pane_group(&mut app, Default::default());
+
+        app.update(|ctx| {
+            let pane = get_newly_created_pane_id(group.as_ref(ctx), &[]);
+            let terminal = group.as_ref(ctx).terminal_session_by_id(pane).unwrap();
+            assert!(terminal.docking_restriction(ctx).is_none());
+            terminal
+                .terminal_view(ctx)
+                .as_ref(ctx)
+                .model
+                .lock()
+                .finalize_exit(warp_terminal::event::ExitReason::ProcessKilled);
+            assert_eq!(
+                terminal.docking_restriction(ctx),
+                Some("Docking requires a writable terminal session.")
+            );
+            assert!(!PaneGroup::can_dock_terminal_pane(&group, pane, ctx));
         });
     });
 }

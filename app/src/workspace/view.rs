@@ -9243,8 +9243,8 @@ impl Workspace {
             // current pane group. Instead, focus the existing pane and jump.
             if let Some(location) = source.location() {
                 let pane_group_id = self.active_tab_pane_group().id();
-                let existing_locator = CodeManager::handle(ctx).read(ctx, |manager, _| {
-                    manager.get_locator_for_location_in_tab(pane_group_id, &location)
+                let existing_locator = CodeManager::handle(ctx).read(ctx, |manager, ctx| {
+                    manager.get_locator_for_location_in_tab(pane_group_id, &location, ctx)
                 });
 
                 if let Some(locator) = existing_locator {
@@ -15132,7 +15132,13 @@ impl Workspace {
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
         self.tab_bar_pinned_by_popup = false;
         self.sync_window_button_visibility(ctx);
+        #[cfg(not(target_family = "wasm"))]
+        let pane_modal_open = self.pane_navigator_modal.as_ref().is_some_and(ModalViewState::is_open)
+            || self.pane_layouts_modal.as_ref().is_some_and(ModalViewState::is_open);
+        #[cfg(target_family = "wasm")]
+        let pane_modal_open = false;
         if focus_active_tab
+            && !pane_modal_open
             // If the user did not do any action on the command palette (eg. closed via shortcut or clicking away)
             // we always force the focus back onto the terminal input
             // Otherwise we check if any other views are open before moving focus back to terminal input

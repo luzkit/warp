@@ -130,6 +130,10 @@ impl CodeView {
         0
     }
 
+    pub(crate) fn has_open_file_location(&self, location: &LocalOrRemotePath) -> bool {
+        self.source.location().as_ref() == Some(location)
+    }
+
     pub fn active_tab_index(&self) -> usize {
         0
     }

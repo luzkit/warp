@@ -40,6 +40,7 @@ use crate::pane_group::pane::{PaneStack, view};
 use crate::pane_group::{
     BackingView, PaneGroup, SplitPaneState, TOGGLE_MAXIMIZE_PANE_BINDING_NAME,
 };
+use crate::remote_server::manager::RemoteServerManager;
 use crate::settings::app_installation_detection::{
     UserAppInstallDetectionSettings, UserAppInstallStatus,
 };
@@ -73,15 +74,63 @@ impl TerminalView {
     }
 
     pub(crate) fn supports_terminal_docking(&self, ctx: &AppContext) -> bool {
-        if self.agent_view_controller.as_ref(ctx).is_active()
-            || self.is_ambient_agent_session(ctx)
-            || self.is_orchestration_split_off()
-        {
-            return false;
+        self.docking_restriction(ctx).is_none()
+    }
+
+    pub(crate) fn docking_restriction(&self, ctx: &AppContext) -> Option<&'static str> {
+        if self.split_pane_state(ctx).is_maximized() {
+            return Some("Restore this maximized pane before docking.");
+        }
+        if self.is_orchestration_split_off() {
+            return Some("This child agent belongs to its parent pane.");
+        }
+        if self.is_ambient_agent_session(ctx) {
+            return Some("Docking is available for local agent panes.");
         }
 
-        let model = self.model.lock();
-        !model.is_read_only() && !model.shared_session_status().is_sharer_or_viewer()
+        {
+            let model = self.model.lock();
+            if model.shared_session_status().is_sharer_or_viewer() {
+                return Some("Leave or stop sharing this session before docking.");
+            }
+            if model.is_dummy_cloud_mode_session() || model.is_cloud_agent_conversation() {
+                return Some("Docking is available for local agent panes.");
+            }
+            if model.is_read_only() {
+                return Some("Docking requires a writable terminal session.");
+            }
+        }
+
+        if let Some(session_id) = self.active_session.as_ref(ctx).session_id(ctx)
+            && ctx.has_singleton_model::<RemoteServerManager>()
+        {
+            let remote = RemoteServerManager::as_ref(ctx);
+            if remote.session(session_id).is_some()
+                && !remote
+                    .client_for_session(session_id)
+                    .is_some_and(|client| !client.is_disconnected())
+            {
+                return Some("Wait for the remote session to connect before docking.");
+            }
+        }
+
+        let conversation_id = self.active_conversation_id(ctx)?;
+        let history = BlocklistAIHistoryModel::as_ref(ctx);
+        let Some(conversation) = history
+            .all_live_conversations_for_terminal_surface(self.view_id)
+            .find(|conversation| conversation.id() == conversation_id)
+        else {
+            return Some("Wait for this agent conversation to finish opening before docking.");
+        };
+        if conversation.is_child_agent_conversation()
+            || conversation.is_remote_child()
+            || conversation.has_active_subagent()
+            || !history.child_conversation_ids_of(&conversation_id).is_empty()
+        {
+            return Some("This agent has a parent or child conversation linked to its pane.");
+        }
+
+        None
     }
 
     fn docking_group<'a>(&self, ctx: &'a AppContext) -> Option<(EntityId, &'a PaneGroup)> {

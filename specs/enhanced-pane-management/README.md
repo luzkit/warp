@@ -374,9 +374,13 @@ Use the feature-off run at the same pane count as the provisional development bu
 
 The isolated tree partition averaged 3.3, 17.0, and 38.4 µs per operation at 10, 50, and 100 panes, versus 15.5, 101.9, and 227.6 µs for the previous projection method. Each size ran 500 operations in the debug build.
 
+#### Fork installer
+
+The Apple Silicon WarpOss installer enables enhanced pane management and cross-window docking at launch. Other build channels retain their own feature defaults. The private release controller signs and notarizes the installer from the merged source tag.
+
 #### Rollout gates
 
-1. Keep `EnhancedPaneManagement` opt-in in the isolated development build and use the feature-off control for regressions.
+1. Use the isolated development build and the feature-off control for regression checks. The fork installer is the first distribution with pane management enabled.
 2. Start an internal pilot after the targeted keyboard, pointer, lifecycle, and process identity checks pass on its supported platform. Capture debug rejection reasons and repeat the benchmark on the pilot build. The diagnostics contain selected pane counts and fixed reasons.
 3. Expand to preview after verifying platform-specific window behavior, native screen readers, display changes, and the performance budgets. The release flag stays off until those checks and the preview are complete.
 

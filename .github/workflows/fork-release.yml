@@ -2,21 +2,27 @@ name: Fork macOS installer
 
 on:
   workflow_dispatch:
+    inputs:
+      allow_hosted_build:
+        description: Build this ref on a disposable GitHub-hosted Mac (use the private controller for reviewed master)
+        default: false
+        type: boolean
   pull_request:
     branches: [master]
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - '.github/workflows/fork-release.yml'
-      - '.cargo/**'
-      - 'app/**'
-      - 'crates/**'
-      - 'resources/**'
-      - 'script/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'about.toml'
-      - 'about.hbs'
+      - ".github/workflows/fork-release.yml"
+      - ".cargo/**"
+      - "app/**"
+      - "crates/**"
+      - "resources/**"
+      - "script/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "about.toml"
+      - "about.hbs"
+      - "specs/GH9416/fork-installer.md"
 
 permissions:
   contents: read
@@ -27,45 +33,14 @@ concurrency:
 
 jobs:
   check-script:
-    if: ${{ github.repository == 'luzkit/warp' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) }}
-    outputs:
-      build_required: ${{ steps.changes.outputs.build_required }}
+    if: ${{ github.repository == 'luzkit/warp' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
-          fetch-depth: 2
-      - name: Select validation scope
-        id: changes
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          python3 - <<'PYTHON'
-          import os
-          from pathlib import Path
-          import subprocess
-
-          packaging = {
-              '.github/workflows/fork-release.yml',
-              'script/ci/fork-notarized-release.yml',
-              'script/macos/bundle-fork',
-              'script/macos/fork_signing.py',
-              'script/macos/notarize_fork.py',
-              'script/macos/test_fork_signing.py',
-              'script/macos/test_notarize_fork.py',
-              'specs/GH9416/fork-installer.md',
-          }
-          build = True
-          if os.environ['EVENT_NAME'] == 'pull_request':
-              changed = subprocess.check_output(
-                  ['git', 'diff', '--name-only', '-z', 'HEAD^1', 'HEAD']
-              ).decode().split('\0')
-              build = any(path and path not in packaging for path in changed)
-          with Path(os.environ['GITHUB_OUTPUT']).open('a') as output:
-              output.write(f'build_required={str(build).lower()}\n')
-          PYTHON
       - name: Test signing and artifact validation
         run: python3 -m unittest discover -s script/macos -p 'test_*fork*.py'
       - name: Check packaging script
@@ -82,27 +57,39 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
           printf 'self-hosted-runner:\n  labels: [personal-mac]\n' > "$RUNNER_TEMP/actionlint.yaml"
           "$RUNNER_TEMP/actionlint" -config-file "$RUNNER_TEMP/actionlint.yaml" \
-            .github/workflows/fork-release.yml script/ci/fork-notarized-release.yml
+            .github/workflows/fork-release.yml script/ci/fork-notarized-release.yml \
+            script/ci/fork-validate.yml
+      - name: Summarize validation coverage
+        if: ${{ github.event_name != 'workflow_dispatch' || !inputs.allow_hosted_build }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          Packaging tests, shell checks, and workflow lint passed. Native compilation was not run.
+
+          Reviewed master snapshots use the private luzkit/warp-release controller on homelab and personal-mac.
+          To compile an unmerged ref, manually run this workflow on that repository branch with allow_hosted_build=true.
+          Only disposable hosted runners accept public PR source. Snapshot artifacts expire after one day.
+          EOF
 
   build:
-    if: ${{ needs.check-script.outputs.build_required == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_hosted_build }}
     needs: check-script
     runs-on: macos-15
     timeout-minutes: 180
     env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_RELEASE_DEBUG: '0'
-      CARGO_PROFILE_RELEASE_LTO: 'false'
-      CARGO_INCREMENTAL: '0'
-      HOMEBREW_NO_AUTO_UPDATE: '1'
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_INCREMENTAL: "0"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
           lfs: true
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
-          xcode-version: '26'
+          xcode-version: "26"
       - name: Install build tools
         run: |
           test "$(uname -m)" = arm64
@@ -115,7 +102,7 @@ jobs:
           key: fork-macos-arm64-release-v1
           cache-all-crates: false
           cache-on-failure: true
-          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          save-if: false
       - name: Install packaging tools
         run: |
           ./script/install_cargo_bundle
@@ -134,4 +121,4 @@ jobs:
           path: ${{ steps.bundle.outputs.artifact_dir }}/*
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 1

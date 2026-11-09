@@ -1,0 +1,191 @@
+name: Validate reviewed Warp source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full reviewed commit SHA that must equal current luzkit/warp master
+        required: true
+        type: string
+      allow_mac_build:
+        description: Build an ad-hoc snapshot on personal-mac without Developer ID signing or notarization
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-notarized-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    if: ${{ vars.WARP_RELEASE_ENABLED == 'true' && github.repository == 'luzkit/warp-release' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: [self-hosted, Linux]
+    container: ubuntu:24.04
+    timeout-minutes: 10
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - name: Install isolated validation tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git python3 shellcheck
+      - name: Resolve explicitly reviewed master
+        id: source
+        env:
+          EXPECTED_SHA: ${{ inputs.source_sha }}
+        run: |
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]
+          master_sha="$(git ls-remote https://github.com/luzkit/warp.git refs/heads/master | cut -f1)"
+          if [[ "$EXPECTED_SHA" != "$master_sha" ]]; then
+            echo '::error::source_sha must be the exact current reviewed luzkit/warp master commit; PR refs are not allowed.'
+            exit 1
+          fi
+          printf 'source_sha=%s\nversion=snapshot-%s\n' "$EXPECTED_SHA" "${EXPECTED_SHA:0:12}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: ${{ steps.source.outputs.source_sha }}
+          path: snapshot-control-${{ github.run_id }}-${{ github.run_attempt }}-validate
+          persist-credentials: false
+      - name: Validate frozen source and packaging code
+        working-directory: snapshot-control-${{ github.run_id }}-${{ github.run_attempt }}-validate
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          python3 -B -m unittest discover -s script/macos -p 'test_*fork*.py'
+          bash -n script/macos/bundle-fork
+          shellcheck script/macos/bundle-fork
+      - name: Check workflow and embedded shell
+        working-directory: snapshot-control-${{ github.run_id }}-${{ github.run_attempt }}-validate
+        run: |
+          archive="$RUNNER_TEMP/actionlint-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.tar.gz"
+          tools_dir="$(mktemp -d "$RUNNER_TEMP/fork-lint.XXXXXX")"
+          trap 'rm -rf -- "$tools_dir"; rm -f -- "$archive"' EXIT
+          curl --fail --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$archive"
+          printf '%s  %s\n' 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 "$archive" | sha256sum --check -
+          tar -xzf "$archive" -C "$tools_dir" actionlint
+          printf 'self-hosted-runner:\n  labels: [personal-mac]\n' > "$tools_dir/actionlint.yaml"
+          "$tools_dir/actionlint" -config-file "$tools_dir/actionlint.yaml" \
+            .github/workflows/fork-release.yml script/ci/fork-notarized-release.yml \
+            script/ci/fork-validate.yml
+      - name: Summarize trusted validation
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          ALLOW_MAC_BUILD: ${{ inputs.allow_mac_build }}
+        run: |
+          printf 'Validated reviewed master %s on homelab. Mac snapshot requested: %s. This workflow does not invoke Developer ID signing or submit to Apple.\n' \
+            "$SOURCE_SHA" "$ALLOW_MAC_BUILD" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove isolated validation checkout
+        if: always()
+        run: rm -rf -- "$GITHUB_WORKSPACE/snapshot-control-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-validate"
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' "$GITHUB_WORKSPACE/..")" "$GITHUB_WORKSPACE"
+
+  build:
+    needs: validate
+    if: ${{ vars.WARP_RELEASE_ENABLED == 'true' && github.repository == 'luzkit/warp-release' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.allow_mac_build }}
+    runs-on: [self-hosted, macOS, ARM64, personal-mac]
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_INCREMENTAL: "0"
+      CARGO_HOME: /Users/github-runner/.cargo
+      RUSTUP_HOME: /Users/github-runner/.rustup
+      DEVELOPER_DIR: /Applications/Xcode-27.2.app/Contents/Developer
+      TOOLCHAINS: com.apple.dt.toolchain.Metal.32023.922.4
+    steps:
+      - name: Configure runner-local tool paths
+        id: configure
+        run: |
+          test "$(id -un)" = github-runner
+          test "$HOME" = /Users/github-runner
+          test -x "$HOME/.cargo/bin/rustup"
+          test -x /opt/homebrew/bin/git-lfs
+          printf '%s\n' /opt/homebrew/bin "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          printf 'CARGO_TARGET_DIR=%s/snapshot-control-%s-%s-build/target\n' \
+            "$GITHUB_WORKSPACE" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: luzkit/warp
+          ref: ${{ needs.validate.outputs.source_sha }}
+          path: snapshot-control-${{ github.run_id }}-${{ github.run_attempt }}-build
+          persist-credentials: false
+          lfs: true
+      - name: Verify preinstalled build tools
+        working-directory: snapshot-control-${{ github.run_id }}-${{ github.run_attempt }}-build
+        run: |
+          trap 'echo "::error::Provision the pinned runner build tools before retrying; this job does not install them."' ERR
+          test "$(uname -m)" = arm64
+          test "$(command -v cargo)" = "$HOME/.cargo/bin/cargo"
+          toolchain="$(python3 - <<'PY'
+          from pathlib import Path
+          import tomllib
+
+          print(tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])
+          PY
+          )"
+          rustup run "$toolchain" rustc --version
+          rustup run "$toolchain" cargo --version
+          test "$(cargo-binstall -V)" = 1.18.1
+          bundle_version="$(cargo-bundle --version)"
+          bundle_version="${bundle_version##* }"
+          test "${bundle_version#v}" = 0.11.0
+          test "$(cargo-about --version)" = 'cargo-about 0.8.4'
+          protoc --version
+          jq --version
+          pkg-config --version
+          git lfs version
+          xcode_version="$(xcodebuild -version)"
+          printf '%s\n' "$xcode_version"
+          test "$xcode_version" = $'Xcode 27.2\nBuild version 27B52'
+          metal_version="$(xcrun -sdk macosx metal --version)"
+          printf '%s\n' "$metal_version"
+          test "${metal_version%%$'\n'*}" = 'Apple metal version 32023.922 (metalfe-32023.922.4)'
+      - name: Allocate snapshot output
+        id: paths
+        run: |
+          output_dir="$(mktemp -d "$RUNNER_TEMP/fork-snapshot-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.XXXXXX")"
+          printf 'output=%s\n' "$output_dir" >> "$GITHUB_OUTPUT"
+      - name: Build ad-hoc snapshot
+        id: bundle
+        working-directory: snapshot-control-${{ github.run_id }}-${{ github.run_attempt }}-build
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+          WARP_FORK_SIGNING_MODE: ad-hoc
+          OUTPUT_DIR: ${{ steps.paths.outputs.output }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          ./script/macos/bundle-fork "$RELEASE_VERSION" "$OUTPUT_DIR"
+      - name: Upload ad-hoc development snapshot
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fork-snapshot-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.bundle.outputs.artifact_dir }}/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Remove isolated build workspace
+        if: ${{ always() && steps.configure.outcome == 'success' }}
+        run: |
+          rm -rf -- "$GITHUB_WORKSPACE/snapshot-control-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-build"
+      - name: Remove snapshot output
+        if: ${{ always() && steps.paths.outputs.output != '' }}
+        env:
+          OUTPUT_DIR: ${{ steps.paths.outputs.output }}
+        run: rm -rf -- "$OUTPUT_DIR"

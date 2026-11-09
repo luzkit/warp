@@ -113,12 +113,13 @@ without LTO or debug symbols. Each run uses its own source checkout, Cargo targe
 directory, and installer output. The target directory stays within that checkout
 for the DockTilePlugin build and is removed with the checkout after the job. The
 installer is under `RUNNER_TEMP`; Cargo registry downloads remain in the runner
-account's Cargo home.
+account's Cargo home. Unsigned release intermediates expire after one day; signed
+installers and notarization receipts remain available for 14 days.
 The workflow checks preinstalled tools and does not install packages or change the
 global Xcode selection. It scopes Cargo paths, `DEVELOPER_DIR`, and Metal
 `TOOLCHAINS` to the build job. It does not restore an Actions Rust cache onto the
-persistent Mac, preserving the installed Cargo tools. Public PR snapshots retain
-their separate hosted-runner cache.
+persistent Mac, preserving the installed Cargo tools. Opt-in public snapshots may restore their separate hosted-runner cache but no
+longer save new caches.
 
 The build generates license attribution and settings schema, verifies the ad-hoc
 app signature and architecture, and verifies the disk image. Linux handles source
@@ -159,17 +160,49 @@ credential, permission broadening, or full build is needed for this check. Apple
 [notarization guidance](https://developer.apple.com/documentation/technotes/tn3147-migrating-to-the-latest-notarization-tool)
 describes the profile's default Keychain storage.
 
-## Development snapshots
+## Development validation and snapshots
 
-**Actions → Fork macOS installer → Run workflow** in the public fork produces a
-downloadable **ad-hoc signed, unnotarized** snapshot for development, retained for
-7 days. These are distinct from notarized versioned releases and never publish
-release assets. macOS may require first-launch approval for these snapshots.
+Source and packaging PRs matching the workflow path filters, including drafts,
+run credential-free signing/artifact regression tests,
+shell checks, and workflow lint on disposable hosted Ubuntu runners. Native Rust/macOS
+compilation is **not automatic**. A passing PR validation job confirms those focused
+checks only; it is not evidence that the app compiles. Public PR code never runs on
+the homelab or signing Mac, including same-repository PRs.
 
-Non-draft source PRs build a proposed-merge snapshot with read-only permissions.
-Packaging-only PRs run signing/artifact regression tests, shell checks, and workflow
-lint; the notarized release run performs the full native build and real Apple
-verification before distribution. Tags do not trigger ad-hoc release publication.
+For an unmerged repository branch that needs native validation, manually run
+**Fork macOS installer** on that branch in the public fork with
+`allow_hosted_build=true`. It tests and builds the same dispatch commit on a
+disposable GitHub-hosted Mac. It does not accept arbitrary PR numbers or pull PR
+code into a default-branch dispatch. Contributor-fork PRs keep the automatic focused
+checks; native validation requires a separate isolated PR build or a reviewed
+repository branch. Do not run unreviewed PR code in a master-scoped dispatch, where
+it could affect default-branch caches.
+
+For reviewed `master`, use **Validate reviewed Warp source** in the private
+[`luzkit/warp-release`](https://github.com/luzkit/warp-release) repository instead.
+Its mirrored template is [`script/ci/fork-validate.yml`](../../script/ci/fork-validate.yml).
+Run it only from `main`, with `source_sha` set to the full 40-character reviewed
+commit. It must equal current `luzkit/warp:master`; tags, branches, and PR refs are
+not accepted. `WARP_RELEASE_ENABLED=true` and existing private runner-group access
+are required, just as for signed releases. It validates on the homelab Linux pool
+by default. Set `allow_mac_build=true` only when a native snapshot is wanted.
+This uses the provisioned personal Mac, serializes with signed releases, and has
+no hosted fallback. It uses isolated per-run checkouts and removes its own build
+and temporary output directories after completion, including failures where cleanup
+can run. Abrupt termination may still need operator cleanup.
+
+The private snapshot workflow does not invoke Developer ID signing or notarization,
+but the build still executes as the signing runner account. Ad-hoc signing is not
+a security sandbox: only explicitly reviewed `master` source belongs on that Mac.
+Do not broaden runner groups to public repositories or forward public PR artifacts
+into the private pipeline.
+
+Both snapshot paths produce an **ad-hoc signed, unnotarized** development installer,
+retained for **one day**. They never publish release assets. macOS may require
+first-launch approval. Hosted snapshots may restore existing Rust caches but do not
+save new ones. Shorter retention applies to new artifacts only; it does not delete
+previous artifacts, caches, or published releases. Tags do not trigger ad-hoc release
+publication.
 
 ## Local build
 

@@ -146,10 +146,10 @@ jobs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
       unsigned_sha256: ${{ steps.digest.outputs.sha256 }}
     env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_RELEASE_DEBUG: '0'
-      CARGO_PROFILE_RELEASE_LTO: 'false'
-      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_INCREMENTAL: "0"
       CARGO_HOME: /Users/github-runner/.cargo
       RUSTUP_HOME: /Users/github-runner/.rustup
       DEVELOPER_DIR: /Applications/Xcode-27.2.app/Contents/Developer
@@ -229,7 +229,7 @@ jobs:
           path: ${{ steps.bundle.outputs.artifact_dir }}/*
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 1
       - name: Remove isolated build workspace
         if: ${{ always() && steps.configure.outcome == 'success' }}
         run: |

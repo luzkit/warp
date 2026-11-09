@@ -34,11 +34,13 @@ use crate::pane_group::{
 };
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::{SharingDialogSource, TelemetryEvent};
-use crate::settings::CodeSettings;
+use crate::settings::{CodeSettings, PaneSettings, PaneSettingsChangedEvent};
 use crate::tab::tab_position_id;
 use crate::terminal::view::TerminalAction;
 use crate::view_components::{FeaturePopup, NewFeaturePopupEvent, NewFeaturePopupLabel};
-use crate::workspace::{TabBarDropTargetData, TabBarLocation, VerticalTabsPaneDropTargetData};
+use crate::workspace::{
+    TabBarDropTargetData, TabBarLocation, VerticalTabsPaneDropTargetData, WorkspaceAction,
+};
 
 mod sharing;
 
@@ -161,6 +163,18 @@ impl<P: BackingView> PaneHeader<P> {
 
         ctx.subscribe_to_model(&pane_configuration, Self::handle_pane_state_event);
         ctx.subscribe_to_model(&pane_stack, Self::handle_pane_stack_event);
+        if FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && ctx.has_singleton_model::<PaneSettings>()
+        {
+            ctx.subscribe_to_model(&PaneSettings::handle(ctx), |_, _, event, ctx| {
+                if matches!(
+                    event,
+                    PaneSettingsChangedEvent::PaneDragHandleVisibilitySetting { .. }
+                ) {
+                    ctx.notify();
+                }
+            });
+        }
 
         Self {
             pane_stack,
@@ -196,6 +210,9 @@ impl<P: BackingView> PaneHeader<P> {
         focus_handle: PaneFocusHandle,
         ctx: &mut ViewContext<Self>,
     ) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         ctx.subscribe_to_model(
             focus_handle.focus_state_handle(),
             |_me, _, event, ctx| match event {
@@ -265,6 +282,23 @@ impl<P: BackingView> PaneHeader<P> {
     #[cfg(feature = "integration_tests")]
     pub fn is_overlay_open(&self) -> bool {
         !matches!(self.open_overlay, OpenOverlay::None)
+    }
+
+    pub(crate) fn drag_state(&self) -> &DraggableState {
+        &self.mouse_state_handles.draggable_state
+    }
+
+    pub(crate) fn refresh_docking_drag(&self, ctx: &mut ViewContext<Self>) {
+        for handle in [
+            &self.mouse_state_handles.header_click_handle,
+            &self.mouse_state_handles.close_button_handle,
+            &self.mouse_state_handles.overflow_button_handle,
+        ] {
+            if let Ok(mut state) = handle.lock() {
+                state.reset_interaction_state();
+            }
+        }
+        ctx.notify();
     }
 
     pub fn set_overflow_menu_items(
@@ -757,6 +791,7 @@ impl<P: BackingView> View for PaneHeader<P> {
         let header_left_inset = self.pane_configuration.as_ref(app).header_left_inset;
         let header_ctx = HeaderRenderContext {
             draggable_state: self.mouse_state_handles.draggable_state.clone(),
+            header_hover_mouse_state: self.mouse_state_handles.header_hover_handle.clone(),
             close_button_mouse_state: self.mouse_state_handles.close_button_handle.clone(),
             overflow_button_mouse_state: self.mouse_state_handles.overflow_button_handle.clone(),
             overflow_button_position_id: self.overflow_button_position_id(),
@@ -922,6 +957,14 @@ impl<P: BackingView> TypedActionView for PaneHeader<P> {
             }
             PaneHeaderAction::PaneHeaderDragStarted => {
                 send_telemetry_from_ctx!(TelemetryEvent::PaneDragInitiated, ctx);
+                if FeatureFlag::EnhancedPaneManagement.is_enabled()
+                    && let Some(focus_handle) = &self.focus_handle
+                    && focus_handle.pane_id().is_terminal_pane()
+                {
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::StartPaneDockingDrag(
+                        focus_handle.pane_id(),
+                    ));
+                }
             }
             PaneHeaderAction::PaneHeaderDragged {
                 origin,

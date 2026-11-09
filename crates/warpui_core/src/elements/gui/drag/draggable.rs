@@ -35,6 +35,11 @@ impl DraggableState {
         matches!(*self.inner.lock(), DragState::Dragging { .. })
     }
 
+    /// Whether a press is held for a potential or active drag.
+    pub fn is_tracking_pointer(&self) -> bool {
+        !matches!(self.read(), DragState::None)
+    }
+
     /// When true, the drag overlay visual will not be painted.
     /// Used during preview capture to exclude the drag ghost from the captured frame.
     pub fn suppress_overlay_paint(&self) -> bool {
@@ -163,6 +168,9 @@ type Handler = Box<dyn FnMut(&mut EventContext, &AppContext, RectF)>;
 type DragDropHandler =
     Box<dyn FnMut(&mut EventContext, &AppContext, RectF, Option<&dyn DropTargetData>)>;
 
+type PositionedDropHandler =
+    Box<dyn FnMut(&mut EventContext, &AppContext, RectF, Option<&dyn DropTargetData>, Vector2F)>;
+
 pub enum AcceptedByDropTarget {
     Yes,
     No,
@@ -265,7 +273,7 @@ pub struct Draggable {
     start_handler: Option<Handler>,
     drag_handler: Option<DragDropHandler>,
     is_accepted_by_drop_target_handler: Option<AcceptedByDropTargetHandler>,
-    drop_handler: Option<DragDropHandler>,
+    drop_handler: Option<PositionedDropHandler>,
     /// Whether to use the copy cursor while dragging on a valid drop target.
     use_copy_cursor_when_dragging_over_drop_target: bool,
 }
@@ -375,6 +383,16 @@ impl Draggable {
     where
         F: FnMut(&mut EventContext, &AppContext, RectF, Option<&dyn DropTargetData>) + 'static,
     {
+        self.set_on_drop(callback);
+        self
+    }
+
+    /// Add a drop callback that also receives the actual mouse-up position.
+    pub fn on_drop_at<F>(mut self, callback: F) -> Self
+    where
+        F: FnMut(&mut EventContext, &AppContext, RectF, Option<&dyn DropTargetData>, Vector2F)
+            + 'static,
+    {
         self.drop_handler = Some(Box::new(callback));
         self
     }
@@ -406,11 +424,13 @@ impl Draggable {
     }
 
     /// Add a callback which will be called on mouse up when dragging ends.
-    pub fn set_on_drop<F>(&mut self, callback: F)
+    pub fn set_on_drop<F>(&mut self, mut callback: F)
     where
         F: FnMut(&mut EventContext, &AppContext, RectF, Option<&dyn DropTargetData>) + 'static,
     {
-        self.drop_handler = Some(Box::new(callback));
+        self.drop_handler = Some(Box::new(move |ctx, app, rect, target, _| {
+            callback(ctx, app, rect, target);
+        }));
     }
 
     /// Determine the drag origin based on the specified axis and any cached bounds.
@@ -633,7 +653,7 @@ impl Element for Draggable {
                 }
                 handled
             }
-            Event::LeftMouseUp { .. } => match current_state {
+            Event::LeftMouseUp { position, .. } => match current_state {
                 DragState::None => handled,
                 DragState::WaitingToDrag { .. } => {
                     self.state.store(DragState::None);
@@ -659,7 +679,7 @@ impl Element for Draggable {
                     };
 
                     if let Some(callback) = self.drop_handler.as_mut() {
-                        callback(ctx, app, rect, draggable_data.as_deref());
+                        callback(ctx, app, rect, draggable_data.as_deref(), *position);
                     }
 
                     ctx.reset_cursor();

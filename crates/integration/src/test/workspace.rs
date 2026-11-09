@@ -1,8 +1,24 @@
 //! Integration tests for workspace-level behavior.
 
+mod docking;
 use std::fs;
 use std::time::Duration;
 
+#[cfg(unix)]
+pub use docking::benchmark_enhanced_pane_management;
+pub use docking::{
+    test_dock_editor_preserves_unsaved_buffer, test_dock_entire_tab_layout,
+    test_dock_pane_across_tabs, test_dock_tab_into_nested_split,
+    test_dock_tab_preserves_running_processes, test_keyboard_docking_groups_live_panes,
+    test_keyboard_docking_groups_panes_across_windows,
+    test_keyboard_docking_in_native_fullscreen_preserves_processes,
+    test_keyboard_docking_single_pane_actions, test_move_pane_between_windows_preserves_processes,
+    test_move_split_pane_to_new_tab_from_overflow,
+    test_pane_layout_resize_history_preserves_processes,
+    test_pane_layout_undo_redo_preserves_processes, test_saved_pane_layout_preserves_processes,
+    test_stack_terminal_tabs_and_extract_member, test_swap_panes_from_header_drag,
+    test_tear_out_tab_layout_preserves_processes,
+};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use settings::Setting as _;

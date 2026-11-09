@@ -9,10 +9,10 @@ use pathfinder_geometry::vector::Vector2F;
 use session_sharing_protocol::common::Role;
 use session_sharing_protocol::sharer::RoleUpdateReason;
 use warp_util::user_input::UserInput;
-use warpui::EntityId;
 use warpui::elements::HyperlinkUrl;
 use warpui::event::ModifiersState;
 use warpui::units::Lines;
+use warpui::{EntityId, WindowId};
 
 use super::inline_banner::{
     AwsBedrockLoginBannerAction, AwsCliNotInstalledBannerAction, OpenInWarpBannerAction,
@@ -46,6 +46,7 @@ use crate::terminal::view::RichContentSecretTooltipInfo;
 use crate::terminal::view::inline_banner::AgentModeSetupSpeedbumpBannerAction;
 use crate::terminal::view::passive_suggestions::PromptSuggestionResolution;
 use crate::workflows::workflow::Workflow;
+use crate::workspace::PaneViewLocator;
 
 /// Version of the agent onboarding flow (non-legacy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +203,12 @@ pub enum TerminalAction {
     ClearSelectionsWhenShellMode,
     Close,
     ToggleMaximizePane,
+    MovePaneToNewTab,
+    MovePaneToWindow {
+        source: PaneViewLocator,
+        destination: Option<WindowId>,
+    },
+    ShowStackedPane(PaneViewLocator),
     SplitRight(Option<AvailableShell>),
     SplitLeft(Option<AvailableShell>),
     SplitDown(Option<AvailableShell>),
@@ -566,6 +573,9 @@ impl fmt::Debug for TerminalAction {
             SplitDown(_) => f.write_str("SplitDown"),
             SplitUp(_) => f.write_str("SplitUp"),
             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
+            MovePaneToNewTab => f.write_str("MovePaneToNewTab"),
+            MovePaneToWindow { .. } => f.write_str("MovePaneToWindow"),
+            ShowStackedPane(_) => f.write_str("ShowStackedPane"),
             PromptContextMenu {
                 position_offset_from_prompt,
             } => write!(

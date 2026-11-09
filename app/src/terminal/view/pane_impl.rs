@@ -3,7 +3,7 @@
 use settings::Setting as _;
 use warp_core::context_flag::ContextFlag;
 use warpui::elements::{
-    ConstrainedBox, CrossAxisAlignment, Empty, Flex, MainAxisAlignment, MainAxisSize,
+    ConstrainedBox, CrossAxisAlignment, Empty, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
     ParentElement, Shrinkable,
 };
 use warpui::prelude::{ChildView, Container};
@@ -12,7 +12,7 @@ use warpui::ui_components::components::UiComponent;
 #[cfg(not(target_arch = "wasm32"))]
 use warpui::ui_components::components::UiComponentStyles;
 use warpui::{
-    AppContext, Element, ModelHandle, SingletonEntity, TypedActionView, ViewContext,
+    AppContext, Element, EntityId, ModelHandle, SingletonEntity, TypedActionView, ViewContext,
     WeakModelHandle,
 };
 
@@ -37,10 +37,14 @@ use crate::pane_group::pane::view::header::components::{
 };
 use crate::pane_group::pane::view::header::{PANE_HEADER_HEIGHT, render_pane_header_draggable};
 use crate::pane_group::pane::{PaneStack, view};
-use crate::pane_group::{BackingView, SplitPaneState, TOGGLE_MAXIMIZE_PANE_BINDING_NAME};
+use crate::pane_group::{
+    BackingView, PaneGroup, SplitPaneState, TOGGLE_MAXIMIZE_PANE_BINDING_NAME,
+};
+use crate::remote_server::manager::RemoteServerManager;
 use crate::settings::app_installation_detection::{
     UserAppInstallDetectionSettings, UserAppInstallStatus,
 };
+use crate::settings::{PaneDragHandleVisibility, PaneSettings};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::shared_session::SharedSessionActionSource;
 use crate::terminal::shared_session::manager::Manager;
@@ -52,9 +56,10 @@ use crate::ui_components::buttons::icon_button_with_color;
 use crate::ui_components::icon_with_status::render_icon_with_status;
 use crate::ui_components::{blended_colors, icons};
 use crate::util::bindings::keybinding_name_to_display_string;
-use crate::workspace::tab_settings::TabSettings;
 #[cfg(target_arch = "wasm32")]
-use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
+use crate::workspace::WorkspaceAction;
+use crate::workspace::tab_settings::TabSettings;
+use crate::workspace::{MOVE_TO_OWN_TAB_LABEL, PaneViewLocator, Workspace, WorkspaceRegistry};
 
 /// Total size of the agent icon-with-status component rendered in the pane header.
 /// Sub-components (circle, badge, cloud) are derived inside `render_icon_with_status`.
@@ -66,6 +71,88 @@ impl TerminalView {
     /// Returns a reference to the focus handle if one has been set.
     pub fn focus_handle(&self) -> Option<&PaneFocusHandle> {
         self.focus_handle.as_ref()
+    }
+
+    pub(crate) fn supports_terminal_docking(&self, ctx: &AppContext) -> bool {
+        self.docking_restriction(ctx).is_none()
+    }
+
+    pub(crate) fn docking_restriction(&self, ctx: &AppContext) -> Option<&'static str> {
+        if self.split_pane_state(ctx).is_maximized() {
+            return Some("Restore this maximized pane before docking.");
+        }
+        if self.is_orchestration_split_off() {
+            return Some("This child agent belongs to its parent pane.");
+        }
+        if self.is_ambient_agent_session(ctx) {
+            return Some("Docking is available for local agent panes.");
+        }
+
+        {
+            let model = self.model.lock();
+            if model.shared_session_status().is_sharer_or_viewer() {
+                return Some("Leave or stop sharing this session before docking.");
+            }
+            if model.is_dummy_cloud_mode_session() || model.is_cloud_agent_conversation() {
+                return Some("Docking is available for local agent panes.");
+            }
+            if model.is_read_only() {
+                return Some("Docking requires a writable terminal session.");
+            }
+        }
+
+        if let Some(session_id) = self.active_session.as_ref(ctx).session_id(ctx)
+            && ctx.has_singleton_model::<RemoteServerManager>()
+        {
+            let remote = RemoteServerManager::as_ref(ctx);
+            if remote.session(session_id).is_some()
+                && remote
+                    .client_for_session(session_id)
+                    .is_none_or(|client| client.is_disconnected())
+            {
+                return Some("Wait for the remote session to connect before docking.");
+            }
+        }
+
+        let conversation_id = self.active_conversation_id(ctx)?;
+        let history = BlocklistAIHistoryModel::as_ref(ctx);
+        let Some(conversation) = history
+            .all_live_conversations_for_terminal_surface(self.view_id)
+            .find(|conversation| conversation.id() == conversation_id)
+        else {
+            return Some("Wait for this agent conversation to finish opening before docking.");
+        };
+        if conversation.is_child_agent_conversation()
+            || conversation.is_remote_child()
+            || conversation.has_active_subagent()
+            || !history
+                .child_conversation_ids_of(&conversation_id)
+                .is_empty()
+        {
+            return Some("This agent has a parent or child conversation linked to its pane.");
+        }
+
+        None
+    }
+
+    fn docking_group<'a>(&self, ctx: &'a AppContext) -> Option<(EntityId, &'a PaneGroup)> {
+        if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            return None;
+        }
+        let group_id = self.agent_view_controller.as_ref(ctx).pane_group_id()?;
+        let workspace = WorkspaceRegistry::as_ref(ctx).get(self.window_id, ctx)?;
+        let group = workspace
+            .as_ref(ctx)
+            .get_pane_group_view_with_id(group_id)?
+            .as_ref(ctx);
+        Some((group_id, group))
+    }
+
+    fn is_docked_stack_member(&self, ctx: &AppContext) -> bool {
+        self.focus_handle().is_some_and(|focus| {
+            self.docking_group(ctx)
+                .is_some_and(|(_, group)| group.docked_stack_members(focus.pane_id()).is_some())
+        })
     }
 
     fn handle_focus_state_event(
@@ -465,7 +552,8 @@ impl TerminalView {
         let show_close_button = self
             .focus_handle
             .as_ref()
-            .is_some_and(|h| h.is_in_split_pane(app));
+            .is_some_and(|h| h.is_in_split_pane(app))
+            || self.is_docked_stack_member(app);
         right_row.add_child(
             render_pane_header_buttons::<TerminalAction, TerminalAction>(
                 header_ctx,
@@ -577,31 +665,84 @@ impl TerminalView {
             && self.agent_view_controller.as_ref(app).is_fullscreen();
         let parent_conversation_header_card = self.render_parent_conversation_header_card(app);
 
-        let left = self.maybe_render_header_back_button(app);
-        let center = self.render_header_title(is_fullscreen_agent_view, header_ctx, app);
-        let (right, min_actions_width) = self.render_header_actions(header_ctx, app);
+        let render_header = |handle: Option<Box<dyn Element>>| {
+            let back = self.maybe_render_header_back_button(app);
+            let left = if let Some(handle) = handle {
+                Flex::row()
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(handle)
+                    .with_child(back)
+                    .finish()
+            } else {
+                back
+            };
+            let center = self.render_header_title(is_fullscreen_agent_view, header_ctx, app);
+            let (right, min_actions_width) = self.render_header_actions(header_ctx, app);
+            render_three_column_header(
+                left,
+                center,
+                right,
+                CenteredHeaderEdgeWidth {
+                    min: min_actions_width,
+                    max: 200.0,
+                },
+                header_ctx.header_left_inset,
+                header_ctx.draggable_state.is_dragging(),
+            )
+        };
 
-        let header = render_three_column_header(
-            left,
-            center,
-            right,
-            CenteredHeaderEdgeWidth {
-                min: min_actions_width,
-                max: 200.0,
-            },
-            header_ctx.header_left_inset,
-            header_ctx.draggable_state.is_dragging(),
-        );
+        let pane_state = self.split_pane_state(app);
+        let is_docked_stack_member = self.is_docked_stack_member(app);
+        let show_drag_handle = FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && pane_state.is_in_split_pane()
+            && !pane_state.is_maximized()
+            && !is_docked_stack_member
+            && self.supports_terminal_docking(app);
+        let header = if show_drag_handle {
+            let visibility = *PaneSettings::as_ref(app).pane_drag_handle_visibility;
+            let appearance = Appearance::as_ref(app);
+            let theme = appearance.theme();
+            Hoverable::new(header_ctx.header_hover_mouse_state.clone(), |mouse_state| {
+                let (is_visible, size) = match visibility {
+                    PaneDragHandleVisibility::OnHover => (
+                        mouse_state.is_hovered() || header_ctx.draggable_state.is_dragging(),
+                        16.,
+                    ),
+                    PaneDragHandleVisibility::AlwaysVisible => (true, 16.),
+                    PaneDragHandleVisibility::Minimal => (true, 10.),
+                };
+                let handle = if is_visible {
+                    icons::Icon::DragIndicatorVertical
+                        .to_warpui_icon(theme.sub_text_color(theme.background()))
+                        .finish()
+                } else {
+                    Empty::new().finish()
+                };
+                let handle = ConstrainedBox::new(handle)
+                    .with_height(size)
+                    .with_width(size)
+                    .finish();
+                render_header(Some(handle))
+            })
+            .with_propagate_drag()
+            .finish()
+        } else {
+            render_header(None)
+        };
         // Make only the title row draggable; the secondary row (pill
         // bar / breadcrumbs / navigation card) sits outside the drag
         // region so its own mouse-driven widgets (notably the pill
         // bar's scrollbar thumb) keep their hit-targets.
-        let draggable_header = render_pane_header_draggable::<TerminalView>(
-            self.pane_configuration.clone(),
-            header,
-            header_ctx.draggable_state.clone(),
-            app,
-        );
+        let draggable_header = if is_docked_stack_member {
+            header
+        } else {
+            render_pane_header_draggable::<TerminalView>(
+                self.pane_configuration.clone(),
+                header,
+                header_ctx.draggable_state.clone(),
+                app,
+            )
+        };
         self.maybe_add_parent_navigation_card(
             draggable_header,
             parent_conversation_header_card,
@@ -651,6 +792,28 @@ impl BackingView for TerminalView {
         &self,
         ctx: &AppContext,
     ) -> Vec<MenuItem<Self::PaneHeaderOverflowMenuAction>> {
+        let pane_state = self.split_pane_state(ctx);
+        let can_move_pane = FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && self
+                .pane_stack
+                .as_ref()
+                .and_then(|stack| stack.upgrade(ctx))
+                .is_some_and(|stack| stack.as_ref(ctx).depth() == 1)
+            && self.supports_terminal_docking(ctx);
+        let can_move_to_new_tab =
+            can_move_pane && (pane_state.is_in_split_pane() || self.is_docked_stack_member(ctx));
+        let window_move = if can_move_pane {
+            self.focus_handle().and_then(|focus| {
+                let pane = PaneViewLocator {
+                    pane_group_id: self.agent_view_controller.as_ref(ctx).pane_group_id()?,
+                    pane_id: focus.pane_id(),
+                };
+                let options = Workspace::pane_window_move_options(self.window_id, pane, ctx);
+                Some((pane, options))
+            })
+        } else {
+            None
+        };
         let model = self.model.lock();
         let mut items = vec![];
         let source = SharedSessionActionSource::PaneHeader;
@@ -704,12 +867,12 @@ impl BackingView for TerminalView {
         }
 
         // Split-pane related items.
-        if self.split_pane_state(ctx).is_in_split_pane() {
+        if pane_state.is_in_split_pane() {
             if !items.is_empty() {
                 items.push(MenuItem::Separator);
             }
 
-            let is_maximized = self.split_pane_state(ctx).is_maximized();
+            let is_maximized = pane_state.is_maximized();
             items.push(
                 MenuItemFields::toggle_pane_action(is_maximized)
                     .with_on_select_action(TerminalAction::ToggleMaximizePane)
@@ -719,6 +882,78 @@ impl BackingView for TerminalView {
                     ))
                     .into_item(),
             );
+        }
+        if can_move_to_new_tab {
+            if !pane_state.is_in_split_pane() && !items.is_empty() {
+                items.push(MenuItem::Separator);
+            }
+            items.push(
+                MenuItemFields::new(MOVE_TO_OWN_TAB_LABEL)
+                    .with_on_select_action(TerminalAction::MovePaneToNewTab)
+                    .into_item(),
+            );
+        }
+
+        if let Some((source, (can_tear_out, windows))) = window_move
+            && (can_tear_out || !windows.is_empty())
+        {
+            if !items.is_empty() && !pane_state.is_in_split_pane() && !can_move_to_new_tab {
+                items.push(MenuItem::Separator);
+            }
+            if can_tear_out {
+                items.push(
+                    MenuItemFields::new("Move to new window")
+                        .with_on_select_action(TerminalAction::MovePaneToWindow {
+                            source,
+                            destination: None,
+                        })
+                        .into_item(),
+                );
+            }
+            items.extend(windows.into_iter().map(|(window, title)| {
+                MenuItemFields::new(format!("Move to {title}"))
+                    .with_on_select_action(TerminalAction::MovePaneToWindow {
+                        source,
+                        destination: Some(window),
+                    })
+                    .into_item()
+            }));
+        }
+
+        if let Some(focus_handle) = self.focus_handle()
+            && let Some((pane_group_id, group)) = self.docking_group(ctx)
+            && let Some(members) = group.docked_stack_members(focus_handle.pane_id())
+        {
+            if !items.is_empty() {
+                items.push(MenuItem::Separator);
+            }
+            for (index, &pane_id) in members.iter().enumerate() {
+                let number = index + 1;
+                let title = group
+                    .pane_by_id(pane_id)
+                    .map(|pane| {
+                        let configuration = pane.pane_configuration();
+                        let configuration = configuration.as_ref(ctx);
+                        configuration
+                            .custom_vertical_tabs_title()
+                            .unwrap_or_else(|| configuration.title())
+                            .to_owned()
+                    })
+                    .filter(|title| !title.is_empty());
+                let label = match title {
+                    Some(title) => format!("Stacked pane {number} ({title})"),
+                    None => format!("Stacked pane {number}"),
+                };
+                items.push(
+                    MenuItemFields::new(label)
+                        .with_on_select_action(TerminalAction::ShowStackedPane(PaneViewLocator {
+                            pane_group_id,
+                            pane_id,
+                        }))
+                        .with_disabled(pane_id == focus_handle.pane_id())
+                        .into_item(),
+                );
+            }
         }
 
         items
@@ -734,7 +969,9 @@ impl BackingView for TerminalView {
             && self.agent_view_controller.as_ref(app).is_fullscreen();
         is_shared
             || is_fullscreen_agent_view
-            || FeatureFlag::ContextWindowUsageV2.is_enabled()
+            || self.is_docked_stack_member(app)
+            || (FeatureFlag::ContextWindowUsageV2.is_enabled()
+                || FeatureFlag::EnhancedPaneManagement.is_enabled())
                 && self.split_pane_state(app).is_in_split_pane()
     }
 
@@ -753,6 +990,9 @@ impl BackingView for TerminalView {
 
     /// Sets the focus handle for this terminal view, enabling it to track its split pane state.
     fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, ctx: &mut ViewContext<Self>) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         self.focus_handle = Some(focus_handle.clone());
         // Subscribe to focus state changes to update pane state when focus/split state changes
         ctx.subscribe_to_model(

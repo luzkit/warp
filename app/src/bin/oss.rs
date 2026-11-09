@@ -24,6 +24,19 @@ fn main() -> Result<()> {
     if cfg!(debug_assertions) {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
+    #[cfg(all(
+        target_os = "macos",
+        feature = "release_bundle",
+        feature = "extern_plist"
+    ))]
+    {
+        use warp_core::features::FeatureFlag;
+
+        state = state.with_additional_features(&[
+            FeatureFlag::EnhancedPaneManagement,
+            FeatureFlag::DragTabsToWindows,
+        ]);
+    }
     ChannelState::set(state);
 
     #[cfg(all(target_os = "macos", feature = "local_tty"))]

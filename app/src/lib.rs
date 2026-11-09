@@ -1971,10 +1971,11 @@ pub(crate) fn initialize_app(
     );
 
     // Teach our app that sometimes option means meta.
-    ctx.set_event_munger(move |event, ctx| {
+    ctx.set_event_munger(move |event, window_id, ctx| {
         let extra_meta_keys = *KeysSettings::as_ref(ctx).extra_meta_keys;
         apply_extra_meta_keys(event, extra_meta_keys);
         apply_scroll_multiplier(event, ctx);
+        workspace::view::handle_docking_input(event, window_id, ctx)
     });
 
     // Rewrite recognized Warp web URLs (sessions, Drive, settings, home) into local
@@ -2723,6 +2724,8 @@ pub(crate) fn app_callbacks(
                 display_count.0 = new_display_count;
                 ctx.notify();
             });
+            #[cfg(not(target_family = "wasm"))]
+            workspace::display_layouts::handle_screen_change(ctx);
         })),
         on_cpu_awakened: Some(Box::new(move |ctx| {
             SystemStats::handle(ctx).update(ctx, move |system, ctx| {
@@ -2981,6 +2984,8 @@ pub(crate) fn app_callbacks(
             });
         })),
         on_active_window_changed: Some(Box::new(move |ctx| {
+            #[cfg(not(target_family = "wasm"))]
+            workspace::display_layouts::handle_screen_change(ctx);
             let windowing_model = ctx.windows();
             let active_window_id = windowing_model.active_window();
             let key_window_is_modal_panel = windowing_model.key_window_is_modal_panel();
@@ -3014,9 +3019,13 @@ pub(crate) fn app_callbacks(
             ctx.dispatch_global_action("workspace:save_app", &());
         })),
         on_window_moved: Some(Box::new(move |ctx| {
+            #[cfg(not(target_family = "wasm"))]
+            workspace::display_layouts::handle_screen_change(ctx);
             ctx.dispatch_global_action("workspace:save_app", &());
         })),
         on_window_resized: Some(Box::new(move |ctx| {
+            #[cfg(not(target_family = "wasm"))]
+            workspace::display_layouts::handle_screen_change(ctx);
             ctx.dispatch_global_action("workspace:save_app", &());
         })),
         ..Default::default()

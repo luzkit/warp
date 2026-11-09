@@ -19,7 +19,7 @@ use session_sharing_protocol::common::{
     ParticipantId, Role, RoleRequestId, RoleRequestRejectedReason, RoleRequestResponse, SessionId,
 };
 use settings::Setting as _;
-use tree::DEFAULT_FLEX_VALUE;
+use tree::{DEFAULT_FLEX_VALUE, DividerAdjustment, PaneLayout, ResizePreview};
 use typed_path::TypedPath;
 use url::Url;
 use uuid::Uuid;
@@ -178,9 +178,12 @@ use crate::{cmd_or_ctrl_shift, send_telemetry_from_ctx};
 
 mod ambient_pane_restoration;
 mod child_agent;
+mod docked_stacks;
+mod enhanced_docking;
 pub(crate) use child_agent::materialization::{
     ChildPaneMaterialization, decide_child_pane_materialization,
 };
+pub(crate) use enhanced_docking::DockingLayoutSnapshot;
 pub mod focus_state;
 pub mod pane;
 pub mod tree;
@@ -231,7 +234,7 @@ const MINIMUM_PANE_SIZE: f32 = 50.;
 const MINIMUM_PANE_SIZE_UDI: f32 = 190.;
 const KEYBOARD_RESIZE_DELTA: f32 = 10.;
 
-fn get_minimum_pane_size(app: &AppContext) -> f32 {
+pub(crate) fn get_minimum_pane_size(app: &AppContext) -> f32 {
     use crate::settings::InputSettings;
     if InputSettings::as_ref(app).is_universal_developer_input_enabled(app) {
         MINIMUM_PANE_SIZE_UDI
@@ -293,7 +296,7 @@ pub enum PaneGroupAction {
         target_pane_id: PaneId,
         direction: Direction,
     },
-    EndResizing,
+    EndResizing(Vector2F),
     ResizeLeft,
     ResizeRight,
     ResizeUp,
@@ -491,6 +494,9 @@ pub fn init(app: &mut AppContext) {
 
 pub enum Event {
     AppStateChanged,
+    LayoutResized {
+        before: PaneLayout,
+    },
     Escape,
     Exited {
         add_to_undo_stack: bool,
@@ -788,6 +794,11 @@ pub struct DraggedBorder {
     previous_mouse_location: Vector2F,
 }
 
+struct AdaptiveDividerDrag {
+    before: PaneLayout,
+    preview: Option<ResizePreview>,
+}
+
 /// Options that can be set when adding a new local terminal pane.
 #[derive(Debug, Default, Clone)]
 pub struct NewTerminalOptions {
@@ -888,6 +899,7 @@ pub struct PaneGroup {
     user_default_shell_unsupported_banner_model_handle: ModelHandle<BannerState>,
     model_event_sender: Option<SyncSender<ModelEvent>>,
     panes: PaneData,
+    docked_stacks: Vec<docked_stacks::DockedStack>,
     /// Centralized focus state model. Panes subscribe to this to derive their split pane state.
     focus_state: ModelHandle<focus_state::PaneGroupFocusState>,
     pane_history: Vec<PaneId>,
@@ -904,6 +916,7 @@ pub struct PaneGroup {
     // the context menu event.
     share_block_modal: ViewHandle<ShareBlockModal>,
     dragged_border: Option<DraggedBorder>,
+    adaptive_divider_drag: Option<AdaptiveDividerDrag>,
     user_default_shell_changed_banner: ViewHandle<Banner<PaneGroupAction>>,
 
     /// If there is an open share session modal, the pane ID of its terminal. Only terminal panes
@@ -1245,6 +1258,17 @@ impl PaneGroup {
         event: &PaneViewEvent,
         ctx: &mut ViewContext<PaneGroup>,
     ) {
+        if self.docked_stack_members(pane_id).is_some()
+            && matches!(
+                event,
+                PaneViewEvent::MovePaneWithinPaneGroup { .. }
+                    | PaneViewEvent::DroppedOnTabBar { .. }
+                    | PaneViewEvent::DraggedOntoTabBar { .. }
+            )
+        {
+            return;
+        }
+
         if self.pane_contents.contains_key(&pane_id) {
             match event {
                 PaneViewEvent::MovePaneWithinPaneGroup {
@@ -2103,6 +2127,7 @@ impl PaneGroup {
                     .filter_map(|(flex, node)| {
                         if let PaneNode::Leaf(pane_id) = node
                             && self.panes.is_hidden_closed_pane(pane_id)
+                            && self.docked_stack_members(*pane_id).is_none()
                         {
                             // Don't snapshot hidden panes (undo, move, job,
                             // child agent, etc.). Child agent panes are
@@ -2122,68 +2147,72 @@ impl PaneGroup {
                     children,
                 })
             }
-            PaneNode::Leaf(pane_id) => {
-                // If this leaf is the replacement side of an active swap,
-                // persist the original instead. The swap is UX-only and
-                // the replacement (a child agent pane) is rebuilt off-tree
-                // on restart.
-                let snapshot_pane_id = self
-                    .panes
-                    .original_pane_for_replacement(*pane_id)
-                    .unwrap_or(*pane_id);
-                let is_substituted = snapshot_pane_id != *pane_id;
-                // Did the visible leaf hold the active session at snapshot
-                // time? On restore the original takes the slot, so it
-                // should inherit the active-session marker.
-                let visible_leaf_is_active_session =
-                    pane_id.as_terminal_pane_id() == self.active_session_id(app);
-                let mut contents = match self.pane_contents.get(&snapshot_pane_id) {
-                    Some(pane) => pane.as_pane().snapshot(app),
-                    None => {
-                        // Create a new pane uuid if we have a bug where we didn't save it
-                        // properly. This approach will allow us to keep the uniqueness constraints
-                        // intact so we don't fail to save the snapshot.
-                        report_error!("Failed to get session data for pane, so used a new uuid");
-                        LeafContents::Terminal(TerminalPaneSnapshot {
-                            uuid: Uuid::new_v4().as_bytes().to_vec(),
-                            cwd: None,
-                            is_active: visible_leaf_is_active_session,
-                            is_read_only: false,
-                            shell_launch_data: None,
-                            input_config: Some(InputConfig::new(app)),
-                            llm_model_override: None,
-                            active_profile_id: None,
-                            conversation_ids_to_restore: Vec::new(),
-                            active_conversation_id: None,
-                        })
-                    }
-                };
+            PaneNode::Leaf(pane_id) => self
+                .snapshot_docked_stack(*pane_id, app)
+                .unwrap_or_else(|| self.snapshot_for_leaf(app, *pane_id)),
+        }
+    }
 
-                // After substitution, propagate the visible leaf's
-                // active-session bit so restore focuses the right pane.
-                if is_substituted
-                    && visible_leaf_is_active_session
-                    && let LeafContents::Terminal(ref mut snapshot) = contents
-                {
-                    snapshot.is_active = true;
-                }
-                let custom_vertical_tabs_title =
-                    self.pane_contents.get(&snapshot_pane_id).and_then(|pane| {
-                        pane.as_pane()
-                            .pane_configuration()
-                            .as_ref(app)
-                            .custom_vertical_tabs_title()
-                            .map(str::to_owned)
-                    });
-                PaneNodeSnapshot::Leaf(LeafSnapshot {
-                    // Focus is tracked against the visible leaf, not the
-                    // substituted original.
-                    is_focused: *pane_id == self.focused_pane_id(app),
-                    custom_vertical_tabs_title,
-                    contents,
+    fn snapshot_for_leaf(&self, app: &AppContext, pane_id: PaneId) -> PaneNodeSnapshot {
+        // If this leaf is the replacement side of an active swap,
+        // persist the original instead. The swap is UX-only and
+        // the replacement (a child agent pane) is rebuilt off-tree
+        // on restart.
+        let snapshot_pane_id = self
+            .panes
+            .original_pane_for_replacement(pane_id)
+            .unwrap_or(pane_id);
+        let is_substituted = snapshot_pane_id != pane_id;
+        // Did the visible leaf hold the active session at snapshot
+        // time? On restore the original takes the slot, so it
+        // should inherit the active-session marker.
+        let visible_leaf_is_active_session =
+            pane_id.as_terminal_pane_id() == self.active_session_id(app);
+        let mut contents = match self.pane_contents.get(&snapshot_pane_id) {
+            Some(pane) => pane.as_pane().snapshot(app),
+            None => {
+                // Create a new pane uuid if we have a bug where we didn't save it
+                // properly. This approach will allow us to keep the uniqueness constraints
+                // intact so we don't fail to save the snapshot.
+                report_error!("Failed to get session data for pane, so used a new uuid");
+                LeafContents::Terminal(TerminalPaneSnapshot {
+                    uuid: Uuid::new_v4().as_bytes().to_vec(),
+                    cwd: None,
+                    is_active: visible_leaf_is_active_session,
+                    is_read_only: false,
+                    shell_launch_data: None,
+                    input_config: Some(InputConfig::new(app)),
+                    llm_model_override: None,
+                    active_profile_id: None,
+                    conversation_ids_to_restore: Vec::new(),
+                    active_conversation_id: None,
                 })
             }
+        };
+
+        // After substitution, propagate the visible leaf's
+        // active-session bit so restore focuses the right pane.
+        if is_substituted
+            && visible_leaf_is_active_session
+            && let LeafContents::Terminal(ref mut snapshot) = contents
+        {
+            snapshot.is_active = true;
         }
+        let custom_vertical_tabs_title =
+            self.pane_contents.get(&snapshot_pane_id).and_then(|pane| {
+                pane.as_pane()
+                    .pane_configuration()
+                    .as_ref(app)
+                    .custom_vertical_tabs_title()
+                    .map(str::to_owned)
+            });
+        PaneNodeSnapshot::Leaf(LeafSnapshot {
+            // Focus is tracked against the visible leaf, not the
+            // substituted original.
+            is_focused: pane_id == self.focused_pane_id(app),
+            custom_vertical_tabs_title,
+            contents,
+        })
     }
 
     /// Find the PaneId for a given TerminalView EntityId if it exists within this PaneGroup.
@@ -3141,22 +3170,8 @@ impl PaneGroup {
             me.discard_pane(*pane_id, ctx);
         });
 
-        // Catch-up share for children that existed before the parent
-        // started sharing — `inherit_share_for_local_child` only fires at
-        // child-pane creation time.
         #[cfg(not(target_family = "wasm"))]
-        ctx.subscribe_to_model(
-            &BlocklistAIHistoryModel::handle(ctx),
-            |me, _, event, ctx| {
-                if let BlocklistAIHistoryEvent::LocalSharedSessionEstablished {
-                    conversation_id,
-                    ..
-                } = event
-                {
-                    me.transitively_share_existing_local_children(*conversation_id, ctx);
-                }
-            },
-        );
+        Self::subscribe_to_child_sharing_events(ctx);
 
         let active_file_model = ctx.add_model(|_| ActiveFileModel::new());
 
@@ -3165,6 +3180,7 @@ impl PaneGroup {
             user_default_shell_unsupported_banner_model_handle,
             model_event_sender,
             panes: pane_data,
+            docked_stacks: Vec::new(),
             focus_state,
             pane_history,
             pane_contents,
@@ -3172,6 +3188,7 @@ impl PaneGroup {
             terminal_with_open_share_block_modal: None,
             share_block_modal: share_modal,
             dragged_border: None,
+            adaptive_divider_drag: None,
             user_default_shell_changed_banner,
             terminal_with_open_share_session_modal: None,
             share_session_modal,
@@ -3206,6 +3223,25 @@ impl PaneGroup {
         ctx.notify();
 
         pane_group
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn subscribe_to_child_sharing_events(ctx: &mut ViewContext<Self>) {
+        // Catch-up share for children that existed before the parent
+        // started sharing — `inherit_share_for_local_child` only fires at
+        // child-pane creation time.
+        ctx.subscribe_to_model(
+            &BlocklistAIHistoryModel::handle(ctx),
+            |me, _, event, ctx| {
+                if let BlocklistAIHistoryEvent::LocalSharedSessionEstablished {
+                    conversation_id,
+                    ..
+                } = event
+                {
+                    me.transitively_share_existing_local_children(*conversation_id, ctx);
+                }
+            },
+        );
     }
 
     /// Returns the conversation's owner, excluding panes detached for undo-close.
@@ -3584,6 +3620,9 @@ impl PaneGroup {
         replace: PaneId,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !self.reveal_docked_stack_member(replace, ctx) {
+            return;
+        }
         let resources = TerminalViewResources {
             tips_completed: self.tips_completed.clone(),
             server_api: self.server_api.clone(),
@@ -3674,6 +3713,7 @@ impl PaneGroup {
         self.panes
             .visible_pane_ids()
             .into_iter()
+            .chain(self.docked_stack_pane_ids())
             .find(|&pane_id| self.persistent_session_id(pane_id, ctx) == Some(id))
     }
 
@@ -3718,7 +3758,9 @@ impl PaneGroup {
         id: Uuid,
         ctx: &mut ViewContext<Self>,
     ) {
-        if self.find_persistent_session(id, ctx) == Some(pane_id) {
+        let in_layout = self.docked_stack_members(pane_id).is_some()
+            || (self.panes.is_pane_in_tree(pane_id) && !self.panes.is_pane_hidden(&pane_id));
+        if in_layout && self.persistent_session_id(pane_id, ctx) == Some(id) {
             self.close_pane_internal(pane_id, false, ctx);
         }
     }
@@ -4684,6 +4726,10 @@ impl PaneGroup {
         pane_id: &PaneId,
         ctx: &mut ViewContext<Self>,
     ) -> Option<Box<dyn AnyPaneContent>> {
+        if self.docked_stack_members(*pane_id).is_some() {
+            return None;
+        }
+
         // Clear any hidden pane entry since the pane is being permanently removed from this group.
         self.panes.remove_hidden_pane(*pane_id);
 
@@ -5103,6 +5149,10 @@ impl PaneGroup {
             self.terminal_with_open_share_block_modal = None;
         }
 
+        if self.close_docked_stack_member(pane_id, ctx) {
+            return;
+        }
+
         // Child agent panes return to off-tree state instead of being
         // destroyed; future pill clicks re-host the same view. The view
         // keeps ownership of its conversation, so we skip the
@@ -5308,7 +5358,9 @@ impl PaneGroup {
             }
             ctx.emit(Event::TerminalViewStateChanged);
             ctx.emit(Event::AppStateChanged);
-        } else if !self.panes.is_pane_in_tree(pane_id) {
+        } else if !self.panes.is_pane_in_tree(pane_id)
+            && self.docked_stack_members(pane_id).is_none()
+        {
             log::warn!(
                 "reveal_and_focus_pane: pane {pane_id:?} is off-tree; focus will land on a non-visible pane"
             );
@@ -5349,8 +5401,14 @@ impl PaneGroup {
         if success {
             // For permanent replacements, clean up the original pane
             if !is_temporary {
+                let was_stacked = self.docked_stack_members(original_pane_id).is_some();
+                self.replace_docked_stack_member(original_pane_id, replacement_pane_id, ctx);
                 self.clean_up_pane(original_pane_id, ctx);
-                self.pane_contents.remove(&original_pane_id);
+                if let Some(original) = self.pane_contents.remove(&original_pane_id)
+                    && was_stacked
+                {
+                    self.restore_docking_source_subscriptions(original.as_ref(), ctx);
+                }
             }
             self.restore_child_agents_for_terminal_pane_if_needed(replacement_pane_id, ctx);
 
@@ -5649,6 +5707,9 @@ impl PaneGroup {
     }
 
     pub fn hide_pane_for_move(&mut self, id: PaneId, ctx: &mut ViewContext<Self>) {
+        if self.docked_stack_members(id).is_some() {
+            return;
+        }
         self.panes.hide_pane_for_move(id);
 
         ctx.notify();
@@ -5970,6 +6031,9 @@ impl PaneGroup {
         direction: Direction,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.docked_stack_members(id).is_some() {
+            return;
+        }
         self.panes.clear_hidden_panes_from_move();
         // Also clear hidden closed panes since rearranging invalidates undo functionality
         self.clear_hidden_closed_panes(ctx);
@@ -5993,6 +6057,10 @@ impl PaneGroup {
         direction: Direction,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.docked_stack_members(id).is_some() {
+            return;
+        }
+
         // Before we do a move, clear any hidden panes
         self.panes.clear_hidden_panes_from_move();
         // Also clear hidden closed panes since rearranging invalidates undo functionality
@@ -6179,6 +6247,9 @@ impl PaneGroup {
     /// Toggles whether or not the focused pane is maximized.
     fn toggle_maximize_pane(&mut self, ctx: &mut ViewContext<Self>) {
         if self.pane_count() > 1 {
+            if self.is_previewing_resize() {
+                self.cancel_resizing(ctx);
+            }
             self.focus_state.update(ctx, |focus_state, ctx| {
                 focus_state.toggle_focused_pane_maximized(ctx);
             });
@@ -6239,7 +6310,7 @@ impl PaneGroup {
         // If user clicks on a pane quickly after dragging the border, a race condition
         // could happen where the mouse down movement is considered as part of dragging.
         // We clear the dragging state here to avoid such conditions.
-        self.dragged_border = None;
+        self.cancel_resizing(ctx);
         if self.focus_pane_and_record_in_history(id, ctx) {
             ctx.emit(Event::AppStateChanged);
             ctx.emit(Event::PaneFocused);
@@ -6280,11 +6351,17 @@ impl PaneGroup {
         self.dragged_border.is_some()
     }
 
+    pub(crate) fn is_previewing_resize(&self) -> bool {
+        self.adaptive_divider_drag.is_some()
+    }
+
     // The drag event pertains to the divider being dragged between panes.
     // If there's no active dragging state on the pane, the event is propagated up
     // to workspace in case there the sidebar divider is being dragged.
     fn maybe_resize_pane(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
-        if self.dragged_border.is_some() {
+        if self.is_previewing_resize() {
+            self.preview_resize_at(position, ctx);
+        } else if self.dragged_border.is_some() {
             self.resize_pane(position, ctx);
         }
     }
@@ -6304,13 +6381,24 @@ impl PaneGroup {
     }
 
     pub fn start_resizing(&mut self, info: DraggedBorder, ctx: &mut ViewContext<Self>) {
-        // Clear hidden closed panes since resizing invalidates undo functionality
-        self.clear_hidden_closed_panes(ctx);
+        if self.panes.supports_adaptive_resize() {
+            self.adaptive_divider_drag = Some(AdaptiveDividerDrag {
+                before: self.panes.layout_snapshot(),
+                preview: None,
+            });
+        } else {
+            // The legacy resize commits on every mouse movement.
+            self.clear_hidden_closed_panes(ctx);
+        }
         self.dragged_border = Some(info);
     }
 
     pub fn reset_pane_sizes(&mut self, border_id: EntityId, ctx: &mut ViewContext<Self>) {
-        self.dragged_border = None;
+        self.cancel_resizing(ctx);
+        if self.panes.supports_adaptive_resize() {
+            self.adjust_divider(border_id, DividerAdjustment::Reset, ctx);
+            return;
+        }
         if self.panes.reset_pane_sizes(border_id) {
             self.clear_hidden_closed_panes(ctx);
             ctx.notify();
@@ -6318,53 +6406,128 @@ impl PaneGroup {
         }
     }
 
-    pub fn end_resizing(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(crate) fn cancel_resizing(&mut self, ctx: &mut ViewContext<Self>) {
         self.dragged_border = None;
+        if self
+            .adaptive_divider_drag
+            .take()
+            .is_some_and(|drag| drag.preview.is_some())
+        {
+            ctx.notify();
+        }
+    }
+
+    pub(crate) fn preview_resize_at(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
+        let (Some(border), Some(drag)) = (self.dragged_border, &mut self.adaptive_divider_drag)
+        else {
+            return;
+        };
+        let delta = border
+            .direction
+            .along(position - border.previous_mouse_location);
+        let preview =
+            self.panes
+                .plan_divider_resize(border.border_id, DividerAdjustment::Move(delta), ctx);
+        if preview.map(|preview| preview.offset) != drag.preview.map(|preview| preview.offset) {
+            drag.preview = preview;
+            ctx.notify();
+        }
+    }
+
+    pub(crate) fn commit_resize_at(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
+        let border = self.dragged_border.take();
+        let Some(drag) = self.adaptive_divider_drag.take() else {
+            ctx.emit(Event::AppStateChanged);
+            return;
+        };
+        ctx.notify();
+        let Some(border) = border else {
+            return;
+        };
+        if !self.panes.supports_adaptive_resize()
+            || self.is_focused_pane_maximized(ctx)
+            || self.panes.layout_snapshot() != drag.before
+        {
+            return;
+        }
+        let delta = border
+            .direction
+            .along(position - border.previous_mouse_location);
+        if let Some(resize) =
+            self.panes
+                .plan_divider_resize(border.border_id, DividerAdjustment::Move(delta), ctx)
+            && self.panes.apply_divider_resize(resize, ctx)
+        {
+            self.finish_adaptive_resize(drag.before, ctx);
+        }
+    }
+
+    fn adjust_divider(
+        &mut self,
+        border_id: EntityId,
+        adjustment: DividerAdjustment,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(resize) = self.panes.plan_divider_resize(border_id, adjustment, ctx) else {
+            return;
+        };
+        let before = self.panes.layout_snapshot();
+        if self.panes.apply_divider_resize(resize, ctx) {
+            self.finish_adaptive_resize(before, ctx);
+        }
+    }
+
+    pub(crate) fn balance_panes(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.panes.supports_adaptive_resize() || self.is_focused_pane_maximized(ctx) {
+            return;
+        }
+        self.cancel_resizing(ctx);
+        let before = self.panes.layout_snapshot();
+        if self.panes.balance() {
+            self.finish_adaptive_resize(before, ctx);
+        }
+    }
+
+    fn finish_adaptive_resize(&mut self, before: PaneLayout, ctx: &mut ViewContext<Self>) {
+        self.clear_hidden_closed_panes(ctx);
+        ctx.notify();
+        ctx.emit(Event::LayoutResized { before });
+        ctx.emit(Event::AppStateChanged);
+    }
+
+    fn resize_by_keyboard(
+        &mut self,
+        axis: SplitDirection,
+        delta: f32,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let focused = self.focused_pane_id(ctx);
+        if self.panes.supports_adaptive_resize() {
+            self.cancel_resizing(ctx);
+            if let Some(divider) = self.panes.divider_for_pane(focused, axis) {
+                self.adjust_divider(divider, DividerAdjustment::Move(delta), ctx);
+            }
+            return;
+        }
+        self.panes.adjust_pane_size_by_id(focused, axis, delta, ctx);
+        ctx.notify();
         ctx.emit(Event::AppStateChanged);
     }
 
     pub fn resize_left(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Horizontal,
-            -KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Horizontal, -KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     pub fn resize_right(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Horizontal,
-            KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Horizontal, KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     pub fn resize_up(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Vertical,
-            -KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Vertical, -KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     pub fn resize_down(&mut self, ctx: &mut ViewContext<Self>) {
-        self.panes.adjust_pane_size_by_id(
-            self.focused_pane_id(ctx),
-            SplitDirection::Vertical,
-            KEYBOARD_RESIZE_DELTA,
-            ctx,
-        );
-        ctx.notify();
-        ctx.emit(Event::AppStateChanged);
+        self.resize_by_keyboard(SplitDirection::Vertical, KEYBOARD_RESIZE_DELTA, ctx);
     }
 
     fn handle_user_default_shell_changed_banner_event(
@@ -8024,7 +8187,7 @@ impl PaneGroup {
         if FeatureFlag::UndoClosedPanes.is_enabled() && self.is_pane_hidden_for_close(id) {
             return false;
         }
-        if !self.pane_contents.contains_key(&id) {
+        if !self.pane_contents.contains_key(&id) || !self.reveal_docked_stack_member(id, ctx) {
             return false;
         }
         // Saves the handle of a currently focused terminal pane before switching away from it.
@@ -8195,6 +8358,11 @@ impl PaneGroup {
     pub fn attach_pane(&self, pane: &dyn AnyPaneContent, ctx: &mut ViewContext<Self>) {
         // Attach the pane.
         let pane = pane.as_pane();
+        if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            let window = ctx.window_id();
+            let group = ctx.view_id();
+            ctx.record_structural_view_parent(window, pane.id().creation_order_id(), group);
+        }
         let focus_handle = focus_state::PaneFocusHandle::new(pane.id(), self.focus_state.clone());
         pane.attach(self, focus_handle, ctx);
 
@@ -8561,7 +8729,7 @@ impl TypedActionView for PaneGroup {
             ResizeMove(position) => self.maybe_resize_pane(*position, ctx),
             StartResizing(border) => self.start_resizing(*border, ctx),
             ResetPaneSizes(border_id) => self.reset_pane_sizes(*border_id, ctx),
-            EndResizing => self.end_resizing(ctx),
+            EndResizing(position) => self.commit_resize_at(*position, ctx),
             ResizeLeft => self.resize_left(ctx),
             ResizeRight => self.resize_right(ctx),
             ResizeUp => self.resize_up(ctx),
@@ -8624,13 +8792,17 @@ impl View for PaneGroup {
         // view up in a window that no longer holds it and panic with a
         // "circular view reference". The per-pane views (and their backing
         // terminal/editor views) are reached via the structural parent graph
-        // and `PaneView::child_view_ids`.
-        vec![
+        // and `PaneView::child_view_ids`. Stack members must also be listed explicitly because
+        // only the active member is rendered.
+        [
             self.share_block_modal.id(),
             self.share_session_modal.id(),
             self.shared_session_role_change_modal.id(),
             self.user_default_shell_changed_banner.id(),
         ]
+        .into_iter()
+        .chain(self.docked_stack_view_ids())
+        .collect()
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
@@ -8651,13 +8823,17 @@ impl View for PaneGroup {
         let main_content = if self.is_focused_pane_maximized(app) {
             self.focused_pane_id(app).render(app)
         } else {
-            EventHandler::new(self.panes.render(appearance.theme(), app))
+            let preview = self
+                .adaptive_divider_drag
+                .as_ref()
+                .and_then(|drag| drag.preview);
+            EventHandler::new(self.panes.render(appearance.theme(), preview, app))
                 .on_mouse_dragged(move |ctx, _, position| {
                     ctx.dispatch_typed_action(PaneGroupAction::ResizeMove(position));
                     DispatchEventResult::StopPropagation
                 })
-                .on_left_mouse_up(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(PaneGroupAction::EndResizing);
+                .on_left_mouse_up(move |ctx, _, position| {
+                    ctx.dispatch_typed_action(PaneGroupAction::EndResizing(position));
                     DispatchEventResult::StopPropagation
                 })
                 .finish()

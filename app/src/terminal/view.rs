@@ -27871,6 +27871,9 @@ impl TypedActionView for TerminalView {
             | AltSelect(_)
             | AltMouseAction(_)
             | ToggleMaximizePane
+            | MovePaneToNewTab
+            | MovePaneToWindow { .. }
+            | ShowStackedPane(_)
             | PromptContextMenu { .. }
             | OpenInputContextMenu { .. }
             | InputContextMenuItem(_)
@@ -28184,6 +28187,25 @@ impl TypedActionView for TerminalView {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
+            MovePaneToNewTab => {
+                if let Some(focus_handle) = self.focus_handle() {
+                    ctx.dispatch_typed_action_deferred(WorkspaceAction::MovePaneToNewTab(
+                        focus_handle.pane_id(),
+                    ));
+                }
+            }
+            MovePaneToWindow {
+                source,
+                destination,
+            } => {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::MovePaneToWindow {
+                    pane: Some(*source),
+                    destination: *destination,
+                });
+            }
+            ShowStackedPane(locator) => {
+                ctx.dispatch_typed_action_deferred(WorkspaceAction::FocusPane(*locator));
+            }
             PromptContextMenu {
                 position_offset_from_prompt,
             } => self.show_prompt_context_menu(*position_offset_from_prompt, ctx),
@@ -29129,6 +29151,17 @@ impl TypedActionView for TerminalView {
 impl View for TerminalView {
     fn ui_name() -> &'static str {
         "Terminal"
+    }
+
+    fn on_window_transferred(
+        &mut self,
+        _: WindowId,
+        new_window_id: WindowId,
+        _: &mut ViewContext<Self>,
+    ) {
+        if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            self.window_id = new_window_id;
+        }
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {

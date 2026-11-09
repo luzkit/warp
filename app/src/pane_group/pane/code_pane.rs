@@ -5,6 +5,8 @@ use super::{
     DetachType, PaneConfiguration, PaneContent, PaneId, PaneView, ShareableLink, ShareableLinkError,
 };
 use crate::app_state::{CodePaneSnapShot, CodePaneTabSnapshot, LeafContents};
+#[cfg(not(target_family = "wasm"))]
+use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code::editor_management::{CodeEditorStatus, CodeManager, CodeSource};
 use crate::code::view::{CodeView, CodeViewEvent};
 use crate::pane_group::PaneGroup;
@@ -49,6 +51,20 @@ impl CodePane {
         self.view.as_ref(ctx).child(ctx)
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn docking_restriction(&self, ctx: &AppContext) -> Option<&'static str> {
+        self.file_view(ctx).as_ref(ctx).docking_restriction()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn docking_locations(&self, ctx: &AppContext) -> Vec<LocalOrRemotePath> {
+        self.file_view(ctx)
+            .as_ref(ctx)
+            .open_file_locations()
+            .cloned()
+            .collect()
+    }
+
     pub fn editor_status(&self, app: &AppContext) -> CodeEditorStatus {
         CodeEditorStatus::editor_status(&self.file_view(app), app)
     }
@@ -66,8 +82,8 @@ impl PaneContent for CodePane {
         };
         let pane_group_id = ctx.view_id();
 
-        let existing_locator = CodeManager::handle(ctx).read(ctx, |manager, _ctx| {
-            manager.get_locator_for_location_in_tab(pane_group_id, &location)
+        let existing_locator = CodeManager::handle(ctx).read(ctx, |manager, ctx| {
+            manager.get_locator_for_location_in_tab(pane_group_id, &location, ctx)
         });
 
         // If the file is already open in the same tab, don't restore it, just focus it (and jump).
@@ -163,11 +179,11 @@ impl PaneContent for CodePane {
             group.handle_pane_view_event(pane_id, event, ctx);
         });
 
-        let source = self.file_view(ctx).as_ref(ctx).source().clone();
+        let file_view = self.file_view(ctx);
+        let source = file_view.as_ref(ctx).source().clone();
         let pane_group_id = ctx.view_id();
-        let window_id = ctx.window_id();
         CodeManager::handle(ctx).update(ctx, |manager, _ctx| {
-            manager.register_pane(pane_group_id, window_id, pane_id, source);
+            manager.register_pane(pane_group_id, pane_id, source, Some(file_view.downgrade()));
         });
     }
 
@@ -182,14 +198,9 @@ impl PaneContent for CodePane {
         ctx.unsubscribe_to_view(&file_view);
         ctx.unsubscribe_to_view(&self.view);
 
-        // Deregister from CodeManager for both HiddenForClose and Closed cases
-        // This ensures files can be opened elsewhere even during the undo grace period
-        if matches!(detach_type, DetachType::HiddenForClose | DetachType::Closed) {
-            let source = self.file_view(ctx).as_ref(ctx).source().clone();
-            CodeManager::handle(ctx).update(ctx, |manager, _ctx| {
-                manager.deregister_pane(&source);
-            });
-        }
+        CodeManager::handle(ctx).update(ctx, |manager, _ctx| {
+            manager.deregister_pane(self.id());
+        });
 
         // Only cleanup tabs when the pane is actually being destroyed (not during undo grace period)
         // This preserves the tab state so it can be properly restored via undo-close
@@ -244,3 +255,7 @@ impl PaneContent for CodePane {
         self.view.as_ref(ctx).is_being_dragged()
     }
 }
+
+#[cfg(all(test, feature = "local_fs", not(target_family = "wasm")))]
+#[path = "code_pane_tests.rs"]
+mod tests;

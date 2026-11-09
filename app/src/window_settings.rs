@@ -88,6 +88,16 @@ define_settings_group!(WindowSettings, settings: [
         toml_path: "appearance.window.left_panel_visibility_across_tabs",
         description: "Whether the left panel visibility is shared across all tabs.",
     },
+    close_empty_windows_after_pane_transfer: CloseEmptyWindowsAfterPaneTransfer {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "appearance.window.close_empty_windows_after_pane_transfer",
+        description: "Close the source window when moving its last pane or tab to another window.",
+    },
     zoom_level: ZoomLevel {
         type: u16,
         default: 100,

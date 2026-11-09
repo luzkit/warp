@@ -1,11 +1,13 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
 
 use ai::skills::SkillReference;
 use serde::{Deserialize, Serialize};
 use warp_util::path::LineAndColumnArg;
-use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WindowId};
+use warpui::{
+    AppContext, Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WeakViewHandle,
+    WindowId,
+};
 
 use super::buffer_location::LocalOrRemotePath;
 use super::view::CodeView;
@@ -258,10 +260,9 @@ impl CodeSource {
 }
 
 struct CodePaneData {
-    #[allow(unused)]
-    window_id: WindowId,
-    #[allow(unused)]
+    source: CodeSource,
     locator: PaneViewLocator,
+    editor: Option<WeakViewHandle<CodeView>>,
 }
 
 // Allow dead_code here for wasm compilation
@@ -275,57 +276,61 @@ pub enum CodeManagerEvent {
 /// 2) Allow other sources to listen for events emitted when code pane is closed.
 #[derive(Default)]
 pub struct CodeManager {
-    source_to_pane_data: HashMap<CodeSource, CodePaneData>,
+    panes: HashMap<PaneId, CodePaneData>,
 }
 
 impl CodeManager {
-    /// Register a new pane in the code manager.
     pub fn register_pane(
         &mut self,
         pane_group_id: EntityId,
-        window_id: WindowId,
         pane_id: PaneId,
         source: CodeSource,
+        editor: Option<WeakViewHandle<CodeView>>,
     ) {
-        let entry = self.source_to_pane_data.entry(source.omit_line_col());
-        if let Entry::Vacant(entry) = entry {
-            entry.insert(CodePaneData {
-                window_id,
+        self.panes.insert(
+            pane_id,
+            CodePaneData {
+                source: source.omit_line_col(),
                 locator: PaneViewLocator {
                     pane_group_id,
                     pane_id,
                 },
-            });
-        } else {
-            log::warn!("Ignoring duplicate code pane registration");
-        }
+                editor,
+            },
+        );
     }
 
-    /// De-register an open code pane when it's removed from a pane group.
-    pub fn deregister_pane(&mut self, source: &CodeSource) {
-        self.source_to_pane_data.remove(&source.omit_line_col());
+    pub fn deregister_pane(&mut self, pane_id: PaneId) {
+        self.panes.remove(&pane_id);
     }
 
-    /// Returns the locator for a code pane that already has the given `LocalOrRemotePath`
-    /// open in the given pane group. Works for both local and remote files.
+    /// Find the pane that owns an open file in a particular pane group.
     pub fn get_locator_for_location_in_tab(
         &self,
         pane_group_id: EntityId,
         location: &LocalOrRemotePath,
+        ctx: &AppContext,
     ) -> Option<PaneViewLocator> {
-        self.source_to_pane_data
-            .iter()
-            .find(|(source, data)| {
-                data.locator.pane_group_id == pane_group_id
-                    && source.location().as_ref() == Some(location)
+        self.panes
+            .values()
+            .filter(|data| data.locator.pane_group_id == pane_group_id)
+            .find(|data| match &data.editor {
+                Some(editor) => editor
+                    .upgrade(ctx)
+                    .and_then(|editor| editor.try_as_ref(ctx))
+                    .map_or_else(
+                        || data.source.location().as_ref() == Some(location),
+                        |editor| editor.has_open_file_location(location),
+                    ),
+                None => data.source.location().as_ref() == Some(location),
             })
-            .map(|(_, data)| data.locator)
+            .map(|data| data.locator)
     }
 
     // Allow dead_code here for wasm compilation
     #[allow(dead_code)]
     pub fn complete_pending_diffs(&mut self, source: CodeSource, ctx: &mut ModelContext<Self>) {
-        if !self.source_to_pane_data.contains_key(&source) {
+        if !self.panes.values().any(|data| data.source == source) {
             log::warn!("Trying to complete an edit on a source that doesn't exist");
         }
 

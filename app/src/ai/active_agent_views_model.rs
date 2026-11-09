@@ -253,6 +253,21 @@ impl ActiveAgentViewsModel {
         }
     }
 
+    pub(crate) fn clear_moving_terminal_window_focus(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        // A move keeps the same controller and stream consumer. Closing its registration here
+        // would briefly close the conversation and could tear down the event stream.
+        let count = self.focused_terminal_states.len();
+        self.focused_terminal_states
+            .retain(|_, state| state.focused_terminal_id != terminal_view_id);
+        if self.focused_terminal_states.len() != count {
+            ctx.emit(ActiveAgentViewsEvent::TerminalViewFocused);
+        }
+    }
+
     /// Whether the terminal view still belongs to an attached pane, including hidden child panes.
     pub(crate) fn is_terminal_view_attached(
         &self,

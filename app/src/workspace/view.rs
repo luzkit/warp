@@ -7,17 +7,28 @@ pub(crate) mod codex_modal;
 pub mod conversation_list;
 #[cfg(enable_crash_recovery)]
 mod crash_recovery;
+mod docking_overlay;
+mod enhanced_docking;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
+#[cfg(not(target_family = "wasm"))]
+pub(super) mod group_docking;
 pub(crate) mod launch_modal;
+mod layout_history;
 pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+#[cfg(not(target_family = "wasm"))]
+mod pane_layouts_modal;
+#[cfg(not(target_family = "wasm"))]
+pub(super) mod pane_navigator;
 #[cfg(all(target_os = "macos", feature = "local_tty"))]
 mod persistent_terminals;
 pub(crate) mod right_panel;
+#[cfg(not(target_family = "wasm"))]
+mod saved_pane_layouts;
 mod startup_directory;
 mod tab_grouping;
 #[cfg(test)]
@@ -26,6 +37,7 @@ pub(crate) mod tests;
 mod vertical_tabs;
 #[cfg(target_family = "wasm")]
 mod wasm_view;
+mod window_docking;
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -122,6 +134,10 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
+pub(super) use self::docking_overlay::init_window_docking_preview;
+use self::docking_overlay::{DockingDestinationPreview, DockingPaneDrag, DockingTabDrag};
+pub(crate) use self::docking_overlay::{handle_docking_input, pane_drag_owns_pointer};
+use self::enhanced_docking::DockingSource;
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     SummaryPaneKind, SummaryPaneKindIcons, VERTICAL_TABS_SETTINGS_BUTTON_POSITION_ID,
@@ -1012,6 +1028,7 @@ fn query_for_rewind_prefill(inputs: &[AIAgentInput]) -> Option<String> {
 /// `insert_transferred_tab_at_index`. Captures the pane group handle, visual
 /// metadata, panel-open state, and `DraggableState` so an in-progress drag
 /// animation continues seamlessly after a handoff.
+#[derive(Clone)]
 pub struct TransferredTab {
     pub pane_group: ViewHandle<PaneGroup>,
     pub color: Option<AnsiColorIdentifier>,
@@ -1103,11 +1120,18 @@ pub struct Workspace {
     reward_modal: ViewHandle<Modal<RewardView>>,
     reward_modal_pending: Option<RewardKind>,
     pub(crate) current_workspace_state: WorkspaceState,
+    docking_tab_drag: Option<DockingTabDrag>,
+    docking_pane_drag: Option<DockingPaneDrag>,
+    layout_history: layout_history::LayoutHistory,
     previous_workspace_state: Option<WorkspaceState>,
     welcome_tips_view_state: WelcomeTipsViewState,
     welcome_tips_view: ViewHandle<TipsView>,
     model_event_sender: Option<mpsc::SyncSender<ModelEvent>>,
     launch_config_save_modal: ModalViewState<LaunchConfigSaveModal>,
+    #[cfg(not(target_family = "wasm"))]
+    pane_layouts_modal: Option<ModalViewState<Modal<pane_layouts_modal::PaneLayoutsView>>>,
+    #[cfg(not(target_family = "wasm"))]
+    pane_navigator_modal: Option<ModalViewState<Modal<pane_navigator::PaneNavigatorView>>>,
     tab_config_params_modal: ModalViewState<Modal<TabConfigParamsModal>>,
     session_config_modal: ModalViewState<Modal<SessionConfigModal>>,
     pending_session_config_replacement: Option<PendingSessionConfigReplacement>,
@@ -3524,9 +3548,16 @@ impl Workspace {
             reward_modal,
             reward_modal_pending: None,
             current_workspace_state: Default::default(),
+            docking_tab_drag: None,
+            docking_pane_drag: None,
+            layout_history: Default::default(),
             previous_workspace_state: None,
             model_event_sender,
             launch_config_save_modal,
+            #[cfg(not(target_family = "wasm"))]
+            pane_layouts_modal: None,
+            #[cfg(not(target_family = "wasm"))]
+            pane_navigator_modal: None,
             tab_config_params_modal,
             session_config_modal,
             pending_session_config_replacement: None,
@@ -4285,6 +4316,7 @@ impl Workspace {
             }
             #[cfg(feature = "local_fs")]
             NewWorkspaceSource::TransferredTab {
+                tab_to_adopt,
                 tab_color,
                 custom_title,
                 left_panel_open,
@@ -4294,15 +4326,7 @@ impl Workspace {
                 ..
             } => {
                 self.set_is_tab_drag_preview(is_tab_drag_preview);
-                self.add_tab_with_pane_layout(
-                    Default::default(),
-                    Arc::new(HashMap::new()),
-                    custom_title,
-                    ctx,
-                );
-                if let (Some(color), Some(tab)) = (tab_color, self.tabs.last_mut()) {
-                    tab.selected_color = SelectedTabColor::Color(color);
-                }
+                self.initialize_transferred_tab(tab_to_adopt, tab_color, custom_title, ctx);
                 if self.left_panel_visibility_across_tabs_enabled(ctx) {
                     self.left_panel_open = left_panel_open;
                 }
@@ -4312,10 +4336,10 @@ impl Workspace {
                     });
                     self.setup_code_review_panel(None, ctx);
                 }
-                self.pending_pane_group_transfer = true;
             }
             #[cfg(not(feature = "local_fs"))]
             NewWorkspaceSource::TransferredTab {
+                tab_to_adopt,
                 tab_color,
                 custom_title,
                 left_panel_open,
@@ -4323,19 +4347,10 @@ impl Workspace {
                 ..
             } => {
                 self.set_is_tab_drag_preview(is_tab_drag_preview);
-                self.add_tab_with_pane_layout(
-                    Default::default(),
-                    Arc::new(HashMap::new()),
-                    custom_title,
-                    ctx,
-                );
-                if let (Some(color), Some(tab)) = (tab_color, self.tabs.last_mut()) {
-                    tab.selected_color = SelectedTabColor::Color(color);
-                }
+                self.initialize_transferred_tab(tab_to_adopt, tab_color, custom_title, ctx);
                 if self.left_panel_visibility_across_tabs_enabled(ctx) {
                     self.left_panel_open = left_panel_open;
                 }
-                self.pending_pane_group_transfer = true;
             }
         };
 
@@ -5638,6 +5653,13 @@ impl Workspace {
             index
         };
 
+        if index != self.active_tab_index
+            && FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && let Some(group) = self.get_pane_group_view(self.active_tab_index)
+            && group.as_ref(ctx).is_previewing_resize()
+        {
+            group.update(ctx, PaneGroup::cancel_resizing);
+        }
         self.active_tab_index = index;
 
         // The range selection's anchor is the active tab, so any change to
@@ -8152,6 +8174,128 @@ impl Workspace {
             == 1
     }
 
+    pub(crate) fn pane_window_move_options(
+        window: WindowId,
+        pane: PaneViewLocator,
+        ctx: &AppContext,
+    ) -> (bool, Vec<(WindowId, String)>) {
+        if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            return Default::default();
+        }
+        let Some(workspace) = WorkspaceRegistry::as_ref(ctx).get(window, ctx) else {
+            return Default::default();
+        };
+        let workspace = workspace.as_ref(ctx);
+        if !workspace.can_offer_window_move_for_pane(pane, ctx) {
+            return Default::default();
+        }
+        let windows = Self::window_move_labels(
+            |window| workspace.window_docking_destination(window, ctx).is_some(),
+            ctx,
+        );
+        (ctx.window_bounds(&window).is_some(), windows)
+    }
+
+    fn window_move_options(
+        &self,
+        source: DockingSource,
+        ctx: &AppContext,
+    ) -> (bool, Vec<(WindowId, String)>) {
+        if !FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            return Default::default();
+        }
+        let can_tear_out = self.can_tear_out_docking_source(source, ctx);
+        let windows = Self::window_move_labels(
+            |window| self.can_move_docking_source_to_window(source, window, ctx),
+            ctx,
+        );
+        (can_tear_out, windows)
+    }
+
+    fn window_move_labels(
+        can_move: impl Fn(WindowId) -> bool,
+        ctx: &AppContext,
+    ) -> Vec<(WindowId, String)> {
+        let mut workspaces = WorkspaceRegistry::as_ref(ctx).all_workspaces(ctx);
+        workspaces.sort_unstable_by_key(|(window, _)| *window);
+        workspaces
+            .into_iter()
+            .enumerate()
+            .filter(|(_, (window, _))| can_move(*window))
+            .map(|(index, (window, workspace))| {
+                let workspace = workspace.as_ref(ctx);
+                let number = index + 1;
+                let title = workspace
+                    .get_pane_group_view(workspace.active_tab_index)
+                    .map(|group| group.as_ref(ctx).display_title(ctx))
+                    .filter(|title| !title.is_empty());
+                let label = match title {
+                    Some(title) => format!(
+                        "window {number} ({})",
+                        truncate_from_end(&title, MAX_WINDOW_TITLE_LENGTH)
+                    ),
+                    None => format!("window {number}"),
+                };
+                (window, label)
+            })
+            .collect()
+    }
+
+    fn append_tab_window_move_items(
+        &self,
+        group: EntityId,
+        items: &mut Vec<MenuItem<WorkspaceAction>>,
+        ctx: &AppContext,
+    ) {
+        let (can_tear_out, windows) = self.window_move_options(DockingSource::Tab(group), ctx);
+        if !can_tear_out && windows.is_empty() {
+            return;
+        }
+        if !items.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+        if can_tear_out {
+            items.push(
+                MenuItemFields::new("Move tab to new window")
+                    .with_on_select_action(WorkspaceAction::MoveTabToWindow {
+                        tab: Some(group),
+                        destination: None,
+                    })
+                    .into_item(),
+            );
+        }
+        items.extend(windows.into_iter().map(|(window, title)| {
+            MenuItemFields::new(format!("Move tab to {title}"))
+                .with_on_select_action(WorkspaceAction::MoveTabToWindow {
+                    tab: Some(group),
+                    destination: Some(window),
+                })
+                .into_item()
+        }));
+    }
+
+    fn move_source_from_window_menu(
+        &mut self,
+        source: DockingSource,
+        destination: Option<WindowId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let moved = match destination {
+            Some(window) => self.move_docking_source_to_window(source, window, None, ctx),
+            None => self.tear_out_docking_source(source, None, ctx),
+        };
+        if !moved {
+            self.toast_stack.update(ctx, |stack, ctx| {
+                stack.add_ephemeral_toast(
+                    DismissibleToast::default(
+                        "This layout cannot be moved to that window.".to_owned(),
+                    ),
+                    ctx,
+                );
+            });
+        }
+    }
+
     pub fn toggle_tab_right_click_menu(
         &mut self,
         tab_index: usize,
@@ -8168,7 +8312,7 @@ impl Workspace {
         let can_move_left = self.can_move_tab(tab_index, TabMovement::Left);
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
-        let menu_items = {
+        let mut menu_items = {
             let tab = &self.tabs[tab_index];
             tab.menu_items(
                 tab_index,
@@ -8180,6 +8324,11 @@ impl Workspace {
                 ctx,
             )
         };
+        self.append_tab_window_move_items(
+            self.tabs[tab_index].pane_group.id(),
+            &mut menu_items,
+            ctx,
+        );
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
         });
@@ -8256,7 +8405,7 @@ impl Workspace {
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
         let tab = &self.tabs[tab_index];
-        let menu_items = tab.menu_items_with_pane_name_target(
+        let mut menu_items = tab.menu_items_with_pane_name_target(
             tab_index,
             self.tabs.len(),
             &self.tab_groups,
@@ -8266,6 +8415,7 @@ impl Workspace {
             Some(pane_name_target),
             ctx,
         );
+        self.append_tab_window_move_items(tab.pane_group.id(), &mut menu_items, ctx);
 
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
@@ -9094,8 +9244,8 @@ impl Workspace {
             // current pane group. Instead, focus the existing pane and jump.
             if let Some(location) = source.location() {
                 let pane_group_id = self.active_tab_pane_group().id();
-                let existing_locator = CodeManager::handle(ctx).read(ctx, |manager, _| {
-                    manager.get_locator_for_location_in_tab(pane_group_id, &location)
+                let existing_locator = CodeManager::handle(ctx).read(ctx, |manager, ctx| {
+                    manager.get_locator_for_location_in_tab(pane_group_id, &location, ctx)
                 });
 
                 if let Some(locator) = existing_locator {
@@ -11693,7 +11843,10 @@ impl Workspace {
     }
 
     /// Returns the pane group with the matching EntityId, or None if it doesn't exist.
-    fn get_pane_group_view_with_id(&self, id: EntityId) -> Option<&ViewHandle<PaneGroup>> {
+    pub(crate) fn get_pane_group_view_with_id(
+        &self,
+        id: EntityId,
+    ) -> Option<&ViewHandle<PaneGroup>> {
         self.tab_views().find(|view| view.id() == id)
     }
 
@@ -12393,6 +12546,17 @@ impl Workspace {
         let tab_data = self.tabs.remove(index);
 
         let removed_pane_group_id = tab_data.pane_group.id();
+        self.cancel_docking_from_removed_group(removed_pane_group_id, ctx);
+        if self
+            .docking_tab_drag
+            .is_some_and(|drag| drag.source == removed_pane_group_id)
+        {
+            tab_data.draggable_state.cancel_drag();
+            tab_data.draggable_state.set_suppress_overlay_paint(false);
+            self.clear_outgoing_docking_preview(ctx);
+            self.docking_tab_drag = None;
+            self.current_workspace_state.is_tab_being_dragged = false;
+        }
         self.tab_mru_order.retain(|id| *id != removed_pane_group_id);
 
         // If the closed tab was a group member, prune the group when it now
@@ -14970,7 +15134,19 @@ impl Workspace {
         self.current_workspace_state.is_ctrl_tab_palette_open = false;
         self.tab_bar_pinned_by_popup = false;
         self.sync_window_button_visibility(ctx);
+        #[cfg(not(target_family = "wasm"))]
+        let pane_modal_open = self
+            .pane_navigator_modal
+            .as_ref()
+            .is_some_and(ModalViewState::is_open)
+            || self
+                .pane_layouts_modal
+                .as_ref()
+                .is_some_and(ModalViewState::is_open);
+        #[cfg(target_family = "wasm")]
+        let pane_modal_open = false;
         if focus_active_tab
+            && !pane_modal_open
             // If the user did not do any action on the command palette (eg. closed via shortcut or clicking away)
             // we always force the focus back onto the terminal input
             // Otherwise we check if any other views are open before moving focus back to terminal input
@@ -16709,6 +16885,9 @@ impl Workspace {
             }
             pane_group::Event::MaximizePaneToggled => {
                 ctx.notify();
+            }
+            pane_group::Event::LayoutResized { before } => {
+                self.record_pane_layout_resize(pane_group.id(), before.clone(), ctx);
             }
             pane_group::Event::FocusPaneGroup => {
                 for (index, tab) in self.tabs.iter().enumerate() {
@@ -22371,19 +22550,42 @@ impl Workspace {
 
     fn render_banner_and_active_tab(
         &self,
-        app: &AppContext,
+        docking_preview: Option<&DockingDestinationPreview>,
         appearance: &Appearance,
+        app: &AppContext,
     ) -> Box<dyn Element> {
-        let active_tab_data = &self.tabs[self.active_tab_index];
-
         let active_content = if FeatureFlag::AgentManagementView.is_enabled()
             && self.current_workspace_state.is_agent_management_view_open
         {
             ChildView::new(&self.agent_management_view).finish()
         } else {
-            ChildView::new(&active_tab_data.pane_group).finish()
+            let pane_group = ChildView::new(self.active_tab_pane_group());
+            if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                let window_id = self.window_id;
+                let source = pane_group
+                    .with_event_filter(move |event, app| {
+                        !docking_overlay::tab_drag_owns_pointer(event, window_id, app)
+                    })
+                    .finish();
+                if let Some(preview) = docking_preview.and_then(|preview| {
+                    Self::render_docking_destination_preview(preview, appearance, app)
+                }) {
+                    Stack::new().with_child(source).with_child(preview).finish()
+                } else {
+                    source
+                }
+            } else {
+                pane_group.finish()
+            }
         };
 
+        let active_content = if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            SavePosition::new(active_content, docking_overlay::DOCKING_SURFACE_POSITION)
+                .for_single_frame()
+                .finish()
+        } else {
+            active_content
+        };
         let terminal_content = match self.maybe_render_workspace_banner(app, appearance) {
             Some(banner_element) => Flex::column()
                 .with_child(banner_element)
@@ -24244,6 +24446,83 @@ impl TypedActionView for Workspace {
             MoveActiveTabRight => self.move_tab(self.active_tab_index, TabMovement::Right, ctx),
             MoveTabLeft(index) => self.move_tab(*index, TabMovement::Left, ctx),
             MoveTabRight(index) => self.move_tab(*index, TabMovement::Right, ctx),
+            MovePaneToNewTab(pane) => self.move_pane_to_new_tab(*pane, ctx),
+            MovePaneToWindow { pane, destination } => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    let pane = pane.unwrap_or_else(|| {
+                        let group = self.active_tab_pane_group();
+                        PaneViewLocator {
+                            pane_group_id: group.id(),
+                            pane_id: group.as_ref(ctx).focused_pane_id(ctx),
+                        }
+                    });
+                    self.move_source_from_window_menu(DockingSource::Pane(pane), *destination, ctx);
+                }
+            }
+            MoveTabToWindow { tab, destination } => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    let group = tab.unwrap_or_else(|| self.active_tab_pane_group().id());
+                    self.move_source_from_window_menu(DockingSource::Tab(group), *destination, ctx);
+                }
+            }
+            SetCloseEmptyWindowsAfterPaneTransfer(close) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    WindowSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(
+                            settings
+                                .close_empty_windows_after_pane_transfer
+                                .set_value(*close, ctx)
+                        );
+                    });
+                    ctx.notify();
+                }
+            }
+            OpenPaneLayouts => {
+                #[cfg(not(target_family = "wasm"))]
+                self.open_pane_layouts(ctx);
+            }
+            OpenPaneNavigator { docking } => {
+                #[cfg(not(target_family = "wasm"))]
+                self.open_pane_navigator(*docking, ctx);
+                #[cfg(target_family = "wasm")]
+                let _ = docking;
+            }
+            SetPaneDragHandleVisibility(visibility) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    PaneSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(
+                            settings
+                                .pane_drag_handle_visibility
+                                .set_value(*visibility, ctx)
+                        );
+                    });
+                    ctx.notify();
+                }
+            }
+            SetFocusMovedDockingPanes(focus) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    PaneSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(settings.focus_moved_docking_panes.set_value(*focus, ctx));
+                    });
+                    ctx.notify();
+                }
+            }
+            SetAnnouncePaneDocking(announce) => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    PaneSettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(settings.announce_pane_docking.set_value(*announce, ctx));
+                    });
+                    ctx.notify();
+                }
+            }
+            UndoPaneLayoutChange => self.undo_layout_change(ctx),
+            RedoPaneLayoutChange => self.redo_layout_change(ctx),
+            BalancePanes => {
+                if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    self.active_tab_pane_group()
+                        .update(ctx, |group, ctx| group.balance_panes(ctx));
+                }
+            }
             RenameTab(index) => self.rename_tab(*index, ctx),
             ResetTabName(index) => self.clear_tab_name(*index, ctx),
             RenamePane(locator) => self.rename_pane(*locator, ctx),
@@ -24962,7 +25241,9 @@ impl TypedActionView for Workspace {
             ToggleMouseReporting => self.toggle_mouse_reporting(ctx),
             ToggleScrollReporting => self.toggle_scroll_reporting(ctx),
             ToggleFocusReporting => self.toggle_focus_reporting(ctx),
-            StartTabDrag => {
+            StartPaneDockingDrag(pane) => self.start_docking_pane_drag(*pane, ctx),
+            StartTabDrag(source) => {
+                self.start_docking_tab_drag(*source, ctx);
                 // Drag supersedes any multi-selection; clear it to avoid stale highlights.
                 self.clear_tab_multi_selection(ctx);
                 // If we are renaming a tab, finish the rename before dragging.
@@ -25386,7 +25667,14 @@ impl TypedActionView for Workspace {
                 tab_index,
                 tab_position,
             } => self.on_tab_drag(*tab_index, *tab_position, ctx),
-            DropTab => {
+            DropTab {
+                source,
+                tab_position,
+                cursor_position,
+            } => {
+                if self.finish_docking_tab_drag(*source, *tab_position, *cursor_position, ctx) {
+                    return;
+                }
                 let is_cross_window = CrossWindowTabDrag::as_ref(ctx).is_active();
                 let handed_off_tab_index =
                     CrossWindowTabDrag::as_ref(ctx)
@@ -26762,9 +27050,27 @@ impl View for Workspace {
     fn keymap_context(&self, app: &AppContext) -> warpui::keymap::Context {
         let mut context = Self::default_keymap_context();
 
+        if FeatureFlag::EnhancedPaneManagement.is_enabled()
+            && *WindowSettings::as_ref(app).close_empty_windows_after_pane_transfer
+        {
+            context
+                .set
+                .insert("Workspace_CloseEmptyWindowsAfterPaneTransfer");
+        }
+
         #[cfg(all(target_os = "macos", feature = "local_tty"))]
         if self.focused_persistent_terminal(app).is_some() {
             context.set.insert("Workspace_PersistentTerminal");
+        }
+
+        if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            let settings = PaneSettings::as_ref(app);
+            if *settings.focus_moved_docking_panes {
+                context.set.insert("Workspace_FocusMovedDockingPanes");
+            }
+            if *settings.announce_pane_docking {
+                context.set.insert("Workspace_AnnouncePaneDocking");
+            }
         }
 
         if NetworkStatus::as_ref(app).is_online() {
@@ -27011,6 +27317,7 @@ impl View for Workspace {
             }
         }
 
+        let docking_preview = self.docking_destination_preview(app);
         let panels = if use_simplified_wasm_tab_bar {
             // For the simplified WASM tab bar, we want to render the tab bar on top of all other content
             // so that content being added/moved around in the workspace (for example the details panel being toggled)
@@ -27019,7 +27326,8 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(app, appearance);
+            let content =
+                self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
@@ -27031,7 +27339,8 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(app, appearance);
+            let content =
+                self.render_banner_and_active_tab(docking_preview.as_ref(), appearance, app);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
             Container::new(outer_column.finish())
@@ -27091,6 +27400,7 @@ impl View for Workspace {
                 .with_uniform_padding(WORKSPACE_PADDING)
                 .finish(),
         );
+        self.render_docking_overlay(&mut stack, docking_preview.as_ref(), appearance, app);
 
         if !use_simplified_wasm_tab_bar
             && FeatureFlag::VerticalTabs.is_enabled()
@@ -27670,6 +27980,23 @@ impl View for Workspace {
 
         if self.launch_config_save_modal.is_open() {
             stack.add_child(self.launch_config_save_modal.render());
+        }
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(modal) = self
+            .pane_layouts_modal
+            .as_ref()
+            .filter(|modal| modal.is_open())
+        {
+            stack.add_child(modal.render());
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(modal) = self
+            .pane_navigator_modal
+            .as_ref()
+            .filter(|modal| modal.is_open())
+        {
+            stack.add_child(modal.render());
         }
 
         if self.tab_config_params_modal.is_open() {
@@ -28330,6 +28657,7 @@ impl View for Workspace {
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
             registry.unregister(window_id);
         });
+        self.clear_closed_window_docking_preview(ctx);
 
         // If this workspace's close was registered as part of a tab-drag
         // handoff, clear the entry now that the workspace is gone from the
@@ -28854,6 +29182,9 @@ impl Workspace {
         position: RectF,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.docking_tab_drag.is_some() {
+            return;
+        }
         const DETACH_SENSITIVITY: f32 = 10.0;
         // `current_index` was captured by the tab's `Draggable` closure at
         // render time. Mid-drag mutations (swaps, hops over collapsed
@@ -29070,6 +29401,15 @@ impl Workspace {
             return;
         }
 
+        self.reorder_tab_in_tab_bar(current_index, position, ctx);
+    }
+
+    fn reorder_tab_in_tab_bar(
+        &mut self,
+        current_index: usize,
+        position: RectF,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let use_vertical_tabs =
             FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
         let groups_enabled = FeatureFlag::GroupedTabs.is_enabled();

@@ -384,6 +384,25 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_focus_panes_on_hover);
 
     register_test!(test_close_tab_with_long_running_process);
+    register_test!(test_dock_tab_preserves_running_processes);
+    #[cfg(unix)]
+    register_test!(benchmark_enhanced_pane_management);
+    register_test!(test_move_split_pane_to_new_tab_from_overflow);
+    register_test!(test_dock_tab_into_nested_split);
+    register_test!(test_dock_entire_tab_layout);
+    register_test!(test_swap_panes_from_header_drag);
+    register_test!(test_dock_pane_across_tabs);
+    register_test!(test_stack_terminal_tabs_and_extract_member);
+    register_test!(test_pane_layout_undo_redo_preserves_processes);
+    register_test!(test_pane_layout_resize_history_preserves_processes);
+    register_test!(test_saved_pane_layout_preserves_processes);
+    register_test!(test_keyboard_docking_groups_live_panes);
+    register_test!(test_keyboard_docking_groups_panes_across_windows);
+    register_test!(test_keyboard_docking_single_pane_actions);
+    register_test!(test_dock_editor_preserves_unsaved_buffer);
+    register_test!(test_keyboard_docking_in_native_fullscreen_preserves_processes);
+    register_test!(test_move_pane_between_windows_preserves_processes);
+    register_test!(test_tear_out_tab_layout_preserves_processes);
     register_test!(test_reorder_tabs_with_drag);
     register_test!(test_detach_tab_to_new_window_with_drag);
     register_test!(test_attach_tab_to_other_window_and_continue_drag);

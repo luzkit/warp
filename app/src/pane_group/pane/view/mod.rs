@@ -23,12 +23,14 @@ use super::{
     BackingView, PaneConfiguration, PaneConfigurationEvent, PaneId, PaneStack, PaneStackEvent,
 };
 use crate::appearance::Appearance;
+use crate::features::FeatureFlag;
 use crate::pane_group::focus_state::{PaneFocusHandle, PaneGroupFocusEvent};
 use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::{Direction, SplitPaneState, TabBarHoverIndex};
 use crate::server::telemetry::SharingDialogSource;
 use crate::settings::{PaneSettings, PaneSettingsChangedEvent};
 use crate::util::bindings::CustomAction;
+use crate::workspace::view::pane_drag_owns_pointer;
 
 const HAS_SHARED_OBJECT_CONTEXT_KEY: &str = "PaneView_HasSharedObject";
 
@@ -139,6 +141,9 @@ impl<P: BackingView> PaneView<P> {
 
     /// Sets the focus handle for this pane view, enabling it to track its split pane state.
     pub fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, ctx: &mut ViewContext<Self>) {
+        if let Some(previous) = &self.focus_handle {
+            ctx.unsubscribe_to_model(previous.focus_state_handle());
+        }
         ctx.subscribe_to_model(focus_handle.focus_state_handle(), |me, _, event, ctx| {
             me.handle_focus_state_event(event, ctx);
         });
@@ -281,7 +286,15 @@ impl<P: BackingView> PaneView<P> {
         match event {
             header::Event::PaneHeaderClicked => ctx.emit(PaneViewEvent::PaneHeaderClicked),
             header::Event::PaneHeaderOverflowMenuToggled(is_open) => {
-                self.child(ctx).update(ctx, |child, ctx| {
+                let child = self.child(ctx);
+                if *is_open && FeatureFlag::EnhancedPaneManagement.is_enabled() {
+                    let items =
+                        child.read(ctx, |view, ctx| view.pane_header_overflow_menu_items(ctx));
+                    self.header.update(ctx, |header, ctx| {
+                        header.set_overflow_menu_items(items, ctx);
+                    });
+                }
+                child.update(ctx, |child, ctx| {
                     child.on_pane_header_overflow_menu_toggled(*is_open, ctx);
                 });
             }
@@ -414,7 +427,16 @@ impl<P: BackingView> View for PaneView<P> {
         }
 
         // Add the underlying pane view.
-        column.add_child(Shrinkable::new(1., ChildView::new(&active_child).finish()).finish());
+        let content = ChildView::new(&active_child);
+        let content = if FeatureFlag::EnhancedPaneManagement.is_enabled() {
+            let window_id = active_child.window_id(app);
+            content
+                .with_event_filter(move |event, app| !pane_drag_owns_pointer(event, window_id, app))
+                .finish()
+        } else {
+            content.finish()
+        };
+        column.add_child(Shrinkable::new(1., content).finish());
 
         let mut container = Container::new(column.finish());
         if pane_configuration.show_accent_border {

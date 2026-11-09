@@ -7,6 +7,7 @@
 use super::integration_tests;
 
 integration_tests! {
+    test_dock_editor_preserves_unsaved_buffer,
     test_add_many_sessions,
     test_child_pill_after_reopening_closed_parent_tab,
     test_ctrl_tab_session_switching,

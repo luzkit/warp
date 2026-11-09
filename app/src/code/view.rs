@@ -642,6 +642,52 @@ impl CodeView {
         self.tab_group.get(index)
     }
 
+    pub(crate) fn open_file_locations(&self) -> impl Iterator<Item = &LocalOrRemotePath> {
+        self.tab_group.iter().filter_map(TabData::location)
+    }
+
+    pub(crate) fn has_open_file_location(&self, location: &LocalOrRemotePath) -> bool {
+        self.open_file_locations().any(|open| open == location)
+    }
+
+    pub(crate) fn docking_restriction(&self) -> Option<&'static str> {
+        match &self.source {
+            CodeSource::AIAction { .. } => {
+                return Some("This editor belongs to an agent conversation.");
+            }
+            CodeSource::ProjectRules { .. } | CodeSource::Skill { .. } => {
+                return Some("This editor is opened for project rules or a skill.");
+            }
+            CodeSource::FileTree { location } | CodeSource::CommandPalette { location }
+                if location.is_remote() =>
+            {
+                return Some("Remote file editors cannot be docked.");
+            }
+            CodeSource::New { .. }
+            | CodeSource::Link { .. }
+            | CodeSource::FileTree { .. }
+            | CodeSource::CommandPalette { .. }
+            | CodeSource::Finder { .. } => {}
+        }
+
+        if self.tab_group.is_empty() {
+            return Some("This editor is closing.");
+        }
+        if self.open_file_locations().any(LocalOrRemotePath::is_remote) {
+            return Some("Remote file editors cannot be docked.");
+        }
+        if self.drag_position.is_some()
+            || self.tab_group.iter().any(|tab| {
+                tab.mouse_state_handles
+                    .tab_draggable_state
+                    .is_tracking_pointer()
+            })
+        {
+            return Some("Finish reordering editor tabs before docking this editor.");
+        }
+        None
+    }
+
     pub fn active_tab_index(&self) -> usize {
         self.active_tab_index
     }

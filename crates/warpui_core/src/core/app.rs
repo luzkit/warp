@@ -589,7 +589,7 @@ pub enum RepaintTrigger {
     AssetLoaded { asset_handle: AssetHandle },
 }
 
-type EventMunger = dyn Fn(&mut Event, &mut AppContext);
+type EventMunger = dyn Fn(&mut Event, WindowId, &mut AppContext) -> bool;
 
 pub type DrawFrameErrorCallback = dyn Fn(&mut AppContext, WindowId);
 
@@ -835,7 +835,7 @@ impl AppContext {
             frame_drawn_callback: None,
             global_shortcuts: Default::default(),
             next_frame_callbacks: Default::default(),
-            event_munger: Box::new(|_evt, _ctx| {}),
+            event_munger: Box::new(|_, _, _| false),
             before_open_url_callback: Box::new(|url, _ctx| url.to_owned()),
             a11y_verbosity: Default::default(),
             platform_modal_data_map: Default::default(),
@@ -1269,10 +1269,10 @@ impl AppContext {
         entry.push(Box::new(callback));
     }
 
-    /// Sets a function which gets to inspect and modify events before they are dispatched.
+    /// Sets a function that can modify or consume events before dispatch.
     pub fn set_event_munger<F>(&mut self, handler: F)
     where
-        F: 'static + Fn(&mut Event, &mut AppContext),
+        F: 'static + Fn(&mut Event, WindowId, &mut AppContext) -> bool,
     {
         self.event_munger = Box::new(handler)
     }
@@ -1484,6 +1484,31 @@ impl AppContext {
             .entry(window_id)
             .or_default()
             .insert(view_id, parent_view_id);
+    }
+
+    /// Records ownership when a view is attached to a different structural parent.
+    pub fn record_structural_view_parent(
+        &mut self,
+        window_id: WindowId,
+        view_id: EntityId,
+        parent_view_id: EntityId,
+    ) {
+        self.record_view_parent(window_id, view_id, parent_view_id);
+        if let Some(previous_parent) = self
+            .structural_child_to_parent
+            .insert(view_id, parent_view_id)
+            && previous_parent != parent_view_id
+            && let Some(children) = self.structural_parent_to_children.get_mut(&previous_parent)
+        {
+            children.remove(&view_id);
+            if children.is_empty() {
+                self.structural_parent_to_children.remove(&previous_parent);
+            }
+        }
+        self.structural_parent_to_children
+            .entry(parent_view_id)
+            .or_default()
+            .insert(view_id);
     }
 
     /// Render-time hook: merges the child-view → parent-view embeddings the
@@ -3126,13 +3151,7 @@ impl AppContext {
 
         // If a parent view ID was provided, add the view as a child of the parent
         if let Some(parent_view_id) = parent_view_id {
-            self.record_view_parent(window_id, view_id, parent_view_id);
-            self.structural_child_to_parent
-                .insert(view_id, parent_view_id);
-            self.structural_parent_to_children
-                .entry(parent_view_id)
-                .or_default()
-                .insert(view_id);
+            self.record_structural_view_parent(window_id, view_id, parent_view_id);
         }
 
         // Register the action handler for this view type (if it hasn't already been added)
@@ -3547,13 +3566,19 @@ impl AppContext {
         window_id: WindowId,
         presenter: Rc<RefCell<Presenter>>,
     ) -> crate::windowing::EventDispatchResult {
-        let mut event_munger: Box<EventMunger> = Box::new(|_, _| {});
+        let mut event_munger: Box<EventMunger> = Box::new(|_, _, _| false);
         std::mem::swap(&mut event_munger, &mut self.event_munger);
         // Give the app a chance to modify the event first. The closure had to be moved out of
         // `self.event_munger` to avoid a double-borrow error, so swapped it into `event_munger`
         // local variable, then swap it back after.
-        event_munger(&mut event, self);
+        let consumed = event_munger(&mut event, window_id, self);
         std::mem::swap(&mut event_munger, &mut self.event_munger);
+        if consumed {
+            return crate::windowing::EventDispatchResult {
+                handled: true,
+                ..Default::default()
+            };
+        }
 
         let mut keystroke_handled = false;
         if self.key_bindings_enabled(window_id) {

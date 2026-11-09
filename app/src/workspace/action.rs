@@ -30,13 +30,14 @@ use crate::auth::auth_manager::LoginGatedFeature;
 use crate::drive::CloudObjectTypeAndId;
 use crate::drive::items::WarpDriveItemId;
 use crate::palette::PaletteMode;
-use crate::pane_group::PaneGroup;
+use crate::pane_group::{PaneGroup, PaneId};
 use crate::prompt::editor_modal::OpenSource as PromptEditorOpenSource;
 use crate::search;
 use crate::server::ids::{ServerId, SyncId};
 use crate::server::telemetry::{
     AddTabWithShellSource, AgentModeEntrypoint, PaletteSource, SharingDialogSource,
 };
+use crate::settings::PaneDragHandleVisibility;
 use crate::settings_view::{SettingsAction as SettingsTabAction, SettingsSection};
 use crate::tab::{NewSessionMenuItem, SelectedTabColor};
 use crate::tab_configs::TabConfig;
@@ -147,6 +148,26 @@ pub enum WorkspaceAction {
     MoveActiveTabRight,
     MoveTabLeft(usize),
     MoveTabRight(usize),
+    MovePaneToNewTab(PaneId),
+    MovePaneToWindow {
+        pane: Option<PaneViewLocator>,
+        destination: Option<WindowId>,
+    },
+    MoveTabToWindow {
+        tab: Option<EntityId>,
+        destination: Option<WindowId>,
+    },
+    SetCloseEmptyWindowsAfterPaneTransfer(bool),
+    UndoPaneLayoutChange,
+    RedoPaneLayoutChange,
+    BalancePanes,
+    OpenPaneLayouts,
+    OpenPaneNavigator {
+        docking: bool,
+    },
+    SetPaneDragHandleVisibility(PaneDragHandleVisibility),
+    SetFocusMovedDockingPanes(bool),
+    SetAnnouncePaneDocking(bool),
     RenameTab(usize),
     ResetTabName(usize),
     RenamePane(PaneViewLocator),
@@ -367,12 +388,17 @@ pub enum WorkspaceAction {
     ToggleMouseReporting,
     ToggleScrollReporting,
     ToggleFocusReporting,
-    StartTabDrag,
+    StartTabDrag(EntityId),
+    StartPaneDockingDrag(PaneId),
     DragTab {
         tab_index: usize,
         tab_position: RectF,
     },
-    DropTab,
+    DropTab {
+        source: EntityId,
+        tab_position: RectF,
+        cursor_position: Vector2F,
+    },
     StartGroupDrag(TabGroupId),
     DragGroup {
         group_id: TabGroupId,
@@ -953,7 +979,19 @@ impl WorkspaceAction {
             | MoveActiveTabRight
             | MoveTabLeft(_)
             | MoveTabRight(_)
-            | DropTab
+            | MovePaneToNewTab(_)
+            | MovePaneToWindow { .. }
+            | MoveTabToWindow { .. }
+            | SetCloseEmptyWindowsAfterPaneTransfer(_)
+            | UndoPaneLayoutChange
+            | RedoPaneLayoutChange
+            | BalancePanes
+            | OpenPaneLayouts
+            | OpenPaneNavigator { .. }
+            | SetPaneDragHandleVisibility(_)
+            | SetFocusMovedDockingPanes(_)
+            | SetAnnouncePaneDocking(_)
+            | DropTab { .. }
             | DropGroup
             | RenameTab(_)
             | ResetTabName(_)
@@ -1096,7 +1134,8 @@ impl WorkspaceAction {
             | CreateTeamAIPrompt
             | OpenInExplorer { .. }
             | DragTab { .. }
-            | StartTabDrag
+            | StartTabDrag(_)
+            | StartPaneDockingDrag(_)
             | DragGroup { .. }
             | StartGroupDrag(_)
             | ToggleLeftPanel

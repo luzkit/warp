@@ -14,6 +14,30 @@ integration_tests! {
     test_single_command,
     // Test shell process terminates when session is closed.
     test_add_and_close_session,
+    // Test existing bash and zsh processes survive docking.
+    test_dock_tab_preserves_running_processes,
+    // Test existing bash and zsh processes survive moving a split pane to a tab.
+    test_move_split_pane_to_new_tab_from_overflow,
+    // Test running shells and commands survive nested docking, Swap, and cross-tab docking.
+    test_dock_tab_into_nested_split,
+    test_dock_entire_tab_layout,
+    test_swap_panes_from_header_drag,
+    test_dock_pane_across_tabs,
+    // Test both members keep running when stacked, selected, and extracted.
+    test_stack_terminal_tabs_and_extract_member,
+    // Test layout undo, redo, and resize preserve running bash and zsh sessions.
+    test_pane_layout_undo_redo_preserves_processes,
+    test_pane_layout_resize_history_preserves_processes,
+    // Test the same bash and zsh processes survive saved layout preview and apply.
+    test_saved_pane_layout_preserves_processes,
+    // Test both live shells survive a keyboard docking group move and undo.
+    test_keyboard_docking_groups_live_panes,
+    test_keyboard_docking_groups_panes_across_windows,
+    // Test the keyboard equivalents of existing single-pane actions.
+    test_keyboard_docking_single_pane_actions,
+    // Test bash and zsh process identity through cross-window moves and tear-out.
+    test_move_pane_between_windows_preserves_processes,
+    test_tear_out_tab_layout_preserves_processes,
     // Test powerlevel10k detection (via bootstrap script logic).
     test_detect_powerlevel10k,
     // Test properties of bootstrap.
